@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -27,21 +28,15 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 add_subdirectory(thread)
-add_subdirectory(warp)
-add_subdirectory(threadblock)
 
 add_custom_target(
   cutlass_test_unit_epilogue
   DEPENDS
   cutlass_test_unit_epilogue_thread
-  cutlass_test_unit_epilogue_warp
-  cutlass_test_unit_epilogue_threadblock
   )
 
 add_custom_target(
   test_unit_epilogue
   DEPENDS
   test_unit_epilogue_thread
-  test_unit_epilogue_warp
-  test_unit_epilogue_threadblock
  )

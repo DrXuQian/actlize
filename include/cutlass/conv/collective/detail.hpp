@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/conv/convnd_problem_shape.hpp"
@@ -41,7 +43,7 @@ namespace cutlass::conv::collective::detail {
 // Construct the stride types for conv collectives based on the dispatch policy, strides 64b by default
 template <class DispatchPolicy>
 constexpr auto
-sm90_dispatch_policy_to_stride_A() {
+ppu_dispatch_policy_to_stride_A() {
   if constexpr (DispatchPolicy::ConvOp == conv::Operator::kFprop) {
     // Maps to modes ((w,n), C)
     if constexpr (DispatchPolicy::NumSpatialDimensions == 1) {
@@ -104,7 +106,7 @@ sm90_dispatch_policy_to_stride_A() {
 // Construct the stirde types for conv collectives based on the dispatch policy, strides 64b by default
 template <class DispatchPolicy>
 constexpr auto
-sm90_dispatch_policy_to_stride_B() {
+ppu_dispatch_policy_to_stride_B() {
   if constexpr (DispatchPolicy::ConvOp == conv::Operator::kFprop) {
     // Maps to modes (k, (C,s))
     if constexpr      (DispatchPolicy::NumSpatialDimensions == 1) {
@@ -247,8 +249,8 @@ compute_lower_srt(ConvProblemShape<ConvOp, NumSpatialDimensions> const& problem_
 }
 
 template <class CopyOp> struct is_im2col_load { static constexpr bool value = false; };
-template <> struct is_im2col_load<SM90_TMA_LOAD_IM2COL          > { static constexpr bool value = true; };
-template <> struct is_im2col_load<SM90_TMA_LOAD_IM2COL_MULTICAST> { static constexpr bool value = true; };
+template <> struct is_im2col_load<PPU_TMA_LOAD_IM2COL          > { static constexpr bool value = true; };
+template <> struct is_im2col_load<PPU_TMA_LOAD_IM2COL_MULTICAST> { static constexpr bool value = true; };
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::conv::collective::detail

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2024 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -474,7 +475,6 @@ struct ConvertibleFromEmpty {
 
 TEST(CuTe_core, PackedTupleConstexprDefaultConstruction) {
   // Make sure that packed_tuple's default constructor is constexpr.
-  // MSVC makes this a bit more challenging than usual.
 
   using pt_test::Empty;
   {

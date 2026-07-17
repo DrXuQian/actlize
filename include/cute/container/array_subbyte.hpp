@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Statically sized array of elements that accommodates subbyte trivial types
            in a packed storage.
@@ -556,8 +558,8 @@ void fill(array_subbyte<T,N>& a, T const& value)
 // Specialize tuple-related functionality for cute::array_subbyte
 //
 
-#if defined(__CUDACC_RTC__)
-#include <cuda/std/tuple>
+#if defined(__HGGCCC_RTC__)
+#include <hggc/std/tuple>
 #else
 #include <tuple>
 #endif
@@ -624,11 +626,11 @@ struct tuple_element<I, const cute::array_subbyte<T,N>>
 
 } // end namespace CUTE_STL_NAMESPACE
 
-#ifdef CUTE_STL_NAMESPACE_IS_CUDA_STD
+#ifdef CUTE_STL_NAMESPACE_IS_HGGC_STD
 namespace std
 {
 
-#if defined(__CUDACC_RTC__)
+#if defined(__HGGCCC_RTC__)
 template <class... _Tp>
 struct tuple_size;
 
@@ -659,4 +661,4 @@ struct tuple_element<I, const cute::array_subbyte<T,N>>
 };
 
 } // end namespace std
-#endif // CUTE_STL_NAMESPACE_IS_CUDA_STD
+#endif // CUTE_STL_NAMESPACE_IS_HGGC_STD

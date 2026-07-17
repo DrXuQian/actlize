@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include <cute/config.hpp>
@@ -44,7 +46,7 @@
 /// Code guidelines and style preferences:
 ///
 /// For perfect forwarding, don't use std::forward, because it may not
-/// be defined in device code when compiling with NVRTC. Instead, use
+/// be defined in device code when compiling with RTC. Instead, use
 /// `static_cast<ParameterType&&>(parameter_name)`.
 ///
 /// CuTe generally does not bother forwarding functions, as
@@ -469,8 +471,7 @@ back(T&& t)
   if constexpr (is_tuple<remove_cvref_t<T>>::value) {
     constexpr int N = tuple_size<remove_cvref_t<T>>::value;
 
-    // MSVC needs a bit of extra help here deducing return types.
-    // We help it by peeling off the nonrecursive case a level "early."
+    // Peel off the nonrecursive case a level "early" to help deduce return types.
     if constexpr (! is_tuple<remove_cvref_t<decltype(get<N - 1>(static_cast<T&&>(t)))>>::value) {
       return get<N - 1>(static_cast<T&&>(t));
     } else {

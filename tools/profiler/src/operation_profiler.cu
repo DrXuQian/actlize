@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Defines a math function
 */
@@ -41,15 +43,11 @@
 
 #ifdef __unix__
 #include <unistd.h>
-#elif defined(_WIN32) || defined(WIN32)
-#include <windows.h>
-#else
-// sleep not supported
 #endif
 
 #include "cutlass/profiler/options.h"
 #include "cutlass/profiler/operation_profiler.h"
-#include "cutlass/profiler/gpu_timer.h"
+#include "cutlass/profiler/ppu_timer.h"
 
 #include "cutlass/trace.h"
 
@@ -72,7 +70,7 @@ OperationProfiler::OperationProfiler(
   kind_(kind), arguments_(arguments) {
 
   ArgumentDescriptionVector tile_description_arguments{
-    {ArgumentTypeID::kEnumerated, {"op_class", "opcode-class"}, "Class of math instruction (simt, tensorop, wmmatensorop, wmma)"},
+    {ArgumentTypeID::kEnumerated, {"op_class", "opcode-class"}, "Class of math instruction (simt, tensorop)"},
     {ArgumentTypeID::kEnumerated, {"accum", "accumulator-type"}, "Math instruction accumulator data type"},
     {ArgumentTypeID::kInteger, {"cta_m", "threadblock-shape::m"}, "Threadblock shape in the M dimension"},
     {ArgumentTypeID::kInteger, {"cta_n", "threadblock-shape::n"}, "Threadblock shape in the N dimension"},
@@ -268,11 +266,11 @@ std::ostream& operator<<(std::ostream& out, library::Provider provider) {
   else if (provider == library::Provider::kReferenceDevice) {
     out << "kReferenceDevice";
   }
-  else if (provider == library::Provider::kCUBLAS) {
-    out << "kCUBLAS";
+  else if (provider == library::Provider::kACBLAS) {
+    out << "kACBLAS";
   }
-  else if (provider == library::Provider::kCUDNN) {
-    out << "kCUDNN";
+  else if (provider == library::Provider::kACDNN) {
+    out << "kACDNN";
   }
   else {
     out << "kInvalid";
@@ -285,29 +283,8 @@ std::ostream& operator<<(std::ostream& out, library::OperationKind provider) {
   if (provider == library::OperationKind::kGemm) {
     out << "kGemm";
   }
-  else if (provider == library::OperationKind::kRankK) {
-    out << "kRankK";
-  }
-  else if (provider == library::OperationKind::kRank2K) {
-    out << "kRank2K";
-  }
-  else if (provider == library::OperationKind::kTrmm) {
-    out << "kTrmm";
-  }
-  else if (provider == library::OperationKind::kSymm) {
-    out << "kSymm";
-  }
-  else if (provider == library::OperationKind::kConv2d) {
-    out << "kConv2d";
-  }
-  else if (provider == library::OperationKind::kConv3d) {
-    out << "kConv3d";
-  }
   else if (provider == library::OperationKind::kEqGemm) {
     out << "kEqGemm";
-  }
-  else if (provider == library::OperationKind::kSparseGemm) {
-    out << "kSparseGemm";
   }
   else if (provider == library::OperationKind::kReduction) {
     out << "kReduction";
@@ -432,8 +409,8 @@ int OperationProfiler::profile_all(
 
         if (status == Status::kErrorInternal) {
 
-          // If there was an internal error, consume the CUDA error and move to the next operation.
-          (void)cudaGetLastError();
+          // If there was an internal error, consume the device error and move to the next operation.
+          (void)hggcGetLastError();
 
           report.append_result(model_result_);
           continue;
@@ -461,8 +438,8 @@ int OperationProfiler::profile_all(
 
           if (status == Status::kErrorInternal) {
 
-            // If there was an internal error, consume the CUDA error and move to the next operation.
-            (void)cudaGetLastError();
+            // If there was an internal error, consume the device error and move to the next operation.
+            (void)hggcGetLastError();
 
             report.append_results(results_);
             continue;
@@ -570,10 +547,6 @@ void OperationProfiler::sleep(int sleep_duration) {
   if (sleep_duration) {
     #ifdef __unix__
     usleep(sleep_duration * 1000);
-    #elif defined(_WIN32) || defined(WIN32)
-    SleepEx(sleep_duration, false);
-    #else
-    // sleep not supported
     #endif
   }
 }
@@ -665,7 +638,7 @@ Status OperationProfiler::profile_cutlass_(
   void *host_workspace,
   void *device_workspace) {
 
-  GpuTimer timer;
+  PpuTimer timer;
 
   //
   // Optional sleep to limit power consumption and thermals
@@ -692,7 +665,7 @@ Status OperationProfiler::profile_cutlass_(
   }
 
   //
-  // Initialize GPU timer
+  // Initialize PPU timer
   //
 
   timer.start();

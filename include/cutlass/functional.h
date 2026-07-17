@@ -1,4 +1,5 @@
-  /***************************************************************************************************
+/***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Define basic numeric operators
 
@@ -38,20 +40,14 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/platform/platform.h"
-#if defined(__CUDACC_RTC__)
-#include "cutlass/floating_point_nvrtc.h"
+#if defined(__HGGCCC_RTC__)
+#include "cutlass/floating_point_hgrtc.h"
 #endif
 
-#include <cuda_runtime.h>
+#ifndef __HGGCCC_RTC__
+#include <hggc_runtime.h>
+#endif
 
-#if defined(CUTLASS_ARCH_WMMA_ENABLED)
-#include <mma.h>
-#endif // defined(CUTLASS_ARCH_WMMA_ENABLED)
-
-#ifdef _MSC_VER
-// Provides support for alternate operators such as 'and', 'or', ...
-#include <ciso646>
-#endif // _MSC_VER
 
 namespace cutlass {
 
@@ -112,8 +108,8 @@ struct scale {
   }
 };
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 530
-/// Partial specializations needed when __CUDA_NO_HALF2_OPERATORS__ is set
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
+/// Partial specializations needed when __HGGC_NO_HALF2_OPERATORS__ is set
 template<>
 struct plus<__half2> {
   CUTLASS_HOST_DEVICE
@@ -138,7 +134,7 @@ struct multiplies<__half2> {
   }
 };
 
-/// Partial specializations needed when __CUDA_NO_HALF_OPERATORS__ is set
+/// Partial specializations needed when __HGGC_NO_HALF_OPERATORS__ is set
 template<>
 struct plus<__half> {
   CUTLASS_HOST_DEVICE
@@ -162,7 +158,7 @@ struct multiplies<__half> {
     return __hmul(lhs, rhs);
   }
 };
-#endif // defined(__CUDA_ARCH__)
+#endif // defined(__HGGC_ARCH__)
 
 
 /// Squares with optional conversion
@@ -221,7 +217,7 @@ template <>
 struct inverse_square_root<float> {
   CUTLASS_HOST_DEVICE
   float operator()(float const &lhs) const {
-#if defined(__CUDA_ARCH__)
+#if defined(__HGGC_ARCH__)
     return rsqrtf(lhs);
 #else
     return 1.f / std::sqrt(lhs);
@@ -233,7 +229,7 @@ template <>
 struct inverse_square_root<half_t> {
   CUTLASS_HOST_DEVICE
   half_t operator()(half_t const &lhs) const {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 520)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100)
     auto result = hrsqrt(reinterpret_cast<__half const &>(lhs));
     return reinterpret_cast<half_t const &>(result);
 #else
@@ -266,8 +262,8 @@ struct reciprocal_approximate <float> {
   CUTLASS_HOST_DEVICE
   float operator()(float lhs) const {
     float ret;
-    #if defined(__CUDA_ARCH__)
-      asm volatile ("rcp.approx.f32 %0, %1;\n" : "=f"(ret) : "f"(lhs));
+    #if defined(__HGGC_ARCH__)
+      asm volatile ("ppu.rcp.approx.f32 %0, %1;\n" : "=f"(ret) : "f"(lhs));
     #else
       ret = 1.0f / lhs;
     #endif
@@ -285,8 +281,8 @@ struct reciprocal_approximate_ftz <float> {
   CUTLASS_HOST_DEVICE
   float operator()(float lhs) const {
     float ret;
-    #if defined(__CUDA_ARCH__)
-      asm volatile ("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(ret) : "f"(lhs));
+    #if defined(__HGGC_ARCH__)
+      asm volatile ("ppu.rcp.approx.ftz.f32 %0, %1;\n" : "=f"(ret) : "f"(lhs));
     #else
       if (std::fpclassify(lhs) == FP_SUBNORMAL) {
         lhs = 0.0f;
@@ -386,9 +382,9 @@ template <>
 struct maximum<float, true> {
   CUTLASS_HOST_DEVICE
   float operator()(float lhs, float rhs) const {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100)
     float res;
-    asm volatile("max.NaN.f32 %0, %1, %2;\n" : "=f"(res) : "f"(lhs), "f"(rhs));
+    asm volatile("ppu.max.NaN.f32 %0, %1, %2;\n" : "=f"(res) : "f"(lhs), "f"(rhs));
     return res;
 #else
     using CUTLASS_CMATH_NAMESPACE :: isnan;
@@ -439,9 +435,9 @@ template <>
 struct minimum<float, true> {
   CUTLASS_HOST_DEVICE
   float operator()(float lhs, float rhs) const {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100)
     float res;
-    asm volatile("min.NaN.f32 %0, %1, %2;\n" : "=f"(res) : "f"(lhs), "f"(rhs));
+    asm volatile("ppu.min.NaN.f32 %0, %1, %2;\n" : "=f"(res) : "f"(lhs), "f"(rhs));
     return res;
 #else
     // No need for ADL; call std::isnan(float) on host and ::isnan(float) on device.
@@ -533,9 +529,9 @@ template <>
 struct guarded_multiply_add<half_t, half_t, half_t> {
   CUTLASS_HOST_DEVICE
   half_t operator()(half_t const &a, half_t const &b, half_t const &c) const {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
     half_t result;
-    asm ("fma.rn.oob.f16 %0, %1, %2, %3;\n"
+    asm ("ppu.fma.rtte.oob.f16 %0, %1, %2, %3;\n"
       : "=h"(*reinterpret_cast<uint16_t*>(&result))
       : "h"(*reinterpret_cast<uint16_t const*>(&a)), "h"(*reinterpret_cast<uint16_t const*>(&b)), "h"(*reinterpret_cast<uint16_t const*>(&c)));
     return result;
@@ -570,9 +566,9 @@ template <>
 struct guarded_multiply_add_relu0<half_t, half_t, half_t> {
   CUTLASS_HOST_DEVICE
   half_t operator()(half_t const &a, half_t const &b, half_t const &c) const {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
     half_t result;
-    asm ("fma.rn.oob.relu.f16 %0, %1, %2, %3;\n"
+    asm ("ppu.fma.rtte.oob.relu.f16 %0, %1, %2, %3;\n"
       : "=h"(*reinterpret_cast<uint16_t*>(&result))
       : "h"(*reinterpret_cast<uint16_t const*>(&a)), "h"(*reinterpret_cast<uint16_t const*>(&b)), "h"(*reinterpret_cast<uint16_t const*>(&c)));
     return result;
@@ -672,7 +668,7 @@ constexpr bool has_cutlass_conj_v = has_cutlass_conj<T>::value;
 // "conjugate transpose" means the same thing as "transpose" for a
 // matrix of noncomplex numbers.
 //
-// Case (2) covers std::complex, cuda::std::complex, and non-Standard
+// Case (2) covers std::complex, hggc::std::complex, and non-Standard
 // (including user-defined) complex number types (for which "conj(z)"
 // is findable via argument-dependent lookup).  cutlass::conj has a
 // totally generic overload, but a more type-specific overload in any
@@ -782,7 +778,7 @@ struct atomic_add
   CUTLASS_DEVICE
   void operator()(T *ptr, const T &data)
   {
-#if defined(__CUDA_ARCH__)
+#if defined(__HGGC_ARCH__)
     atomicAdd(ptr, data);
 #else
     CUTLASS_UNUSED(ptr);
@@ -798,11 +794,11 @@ struct atomic_add<double>
   CUTLASS_DEVICE
   void operator()(double *ptr, const double &data)
   {
-#if !defined(__CUDA_ARCH__)
+#if !defined(__HGGC_ARCH__)
     CUTLASS_UNUSED(ptr);
     CUTLASS_UNUSED(data);
     CUTLASS_NOT_IMPLEMENTED();
-#elif (__CUDA_ARCH__ >= 600)
+#elif (__HGGC_ARCH__ >= 100)
     atomicAdd(ptr, data);
 #else
     // Use CAS loop
@@ -815,7 +811,7 @@ struct atomic_add<double>
       assumed_int = old_int;
       old_int = atomicCAS(ptr_int, assumed_int, __double_as_longlong(update));
     } while (assumed_int != old_int);
-#endif // (__CUDA_ARCH__ >= 600)
+#endif // (__HGGC_ARCH__ >= 100)
   }
 };
 
@@ -825,15 +821,14 @@ struct atomic_add<half2>
   CUTLASS_DEVICE
   void operator()(half2 *ptr, const half2 &data)
   {
-#if !defined(__CUDA_ARCH__) || (defined(__CUDA_ARCH__)  && (__CUDA_ARCH__ < 600))
+#if !defined(__HGGC_ARCH__)
       CUTLASS_UNUSED(ptr);
       CUTLASS_UNUSED(data);
       CUTLASS_NOT_IMPLEMENTED();
 #else
-    // Vector-2 atomic reduction requires .target sm_60 or higher
     uint32_t word = reinterpret_cast<const uint32_t&>(data);
-    asm volatile ("red.gpu.global.add.noftz.f16x2 [%0], %1;\n" : : "l"(ptr), "r"(word));
-#endif // (__CUDA_ARCH__ >= 600)
+    asm volatile ("ppu.atom.gpu.global.add.noftz.f16x2 _, [%0], %1;\n" : : "l"(ptr), "r"(word));
+#endif // (__HGGC_ARCH__ >= 100)
   }
 };
 
@@ -844,7 +839,7 @@ template <typename T>
 struct atomic_maximum {
   CUTLASS_DEVICE
   T operator()(T *ptr, T value) const {
-#if defined(__CUDA_ARCH__)
+#if defined(__HGGC_ARCH__)
     return atomicMax(ptr, value);
 #else
     CUTLASS_UNUSED(ptr);
@@ -859,11 +854,11 @@ template <>
 struct atomic_maximum<float> {
   CUTLASS_DEVICE
   float operator()(float *ptr, float value) const {
-#if defined(__CUDA_ARCH__)
+#if defined(__HGGC_ARCH__)
     // In device code, make sure that we do NOT try to use
-    // std::signbit, as that won't work if building with NVRTC.
+    // std::signbit, as that won't work if building with RTC.
     // Instead, prefix "::" to call signbit from the global namespace,
-    // which CUDA guarantees to work in device code without including
+    // which device guarantees to work in device code without including
     // any headers.
     //
     return ! ::signbit(value) ?
@@ -885,42 +880,6 @@ template <class T>
 struct is_atomic<atomic_add<T>> : platform::true_type {};
 template <class T>
 struct is_atomic<atomic_maximum<T>> : platform::true_type {};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// Partial specializations for nvcuda::wmma::fragment<Use, m, n, k, T, Layout>
-//
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-#if defined(CUTLASS_ARCH_WMMA_ENABLED)
-
-template<typename Use, int m, int n, int k, typename T, typename Layout>
-struct plus<nvcuda::wmma::fragment<Use, m, n, k, T, Layout>>
-{
-  using Fragment = nvcuda::wmma::fragment<Use, m, n, k, T, Layout>;
-  using ElementType = typename Fragment::element_type;
-
-  CUTLASS_HOST_DEVICE
-  Fragment operator()(Fragment const &lhs, Fragment const &rhs) const
-  {
-    Fragment result;
-    plus<ElementType> scalar_op;
-
-    ElementType *result_elts = reinterpret_cast<ElementType*>(&result);
-    const ElementType *lhs_elts = reinterpret_cast<const ElementType*>(&lhs);
-    const ElementType *rhs_elts = reinterpret_cast<const ElementType*>(&rhs);
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < Fragment::num_elements; i++) {
-      result_elts[i] = scalar_op(lhs_elts[i], rhs_elts[i]);
-    }
-
-    return result;
-  }
-};
-
-#endif // defined(CUTLASS_ARCH_WMMA_ENABLED)
-
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

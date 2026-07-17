@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Execution environment
 */
@@ -291,7 +293,7 @@ DeviceAllocation::DeviceAllocation():
   pointer_(nullptr),
   layout_(library::LayoutTypeID::kUnknown),
   batch_count_(1) {
-  cudaGetDevice(&device_);
+  hggcGetDevice(&device_);
 }
 
 DeviceAllocation::DeviceAllocation(
@@ -302,9 +304,9 @@ DeviceAllocation::DeviceAllocation(
   type_(type), batch_stride_(capacity), capacity_(capacity), pointer_(nullptr),
   layout_(library::LayoutTypeID::kUnknown), batch_count_(1), device_(device) {
 
-  cudaError_t result = this->malloc((void **)&pointer_, bytes(type, capacity));
+  hggcError_t result = this->malloc((void **)&pointer_, bytes(type, capacity));
 
-  if (result != cudaSuccess) {
+  if (result != hggcSuccess) {
     type_ = library::NumericTypeID::kInvalid;
     capacity_ = 0;
     pointer_ = nullptr;
@@ -329,15 +331,15 @@ DeviceAllocation::DeviceAllocation(
 DeviceAllocation::~DeviceAllocation() {
   if (pointer_) {
     int current_device;
-    cudaGetDevice(&current_device);
+    hggcGetDevice(&current_device);
 
     if (current_device != device_) {
-      cudaSetDevice(device_);
+      hggcSetDevice(device_);
     }
-    cudaFree(pointer_);
+    hggcFree(pointer_);
 
     if (current_device != device_) {
-      cudaSetDevice(current_device);
+      hggcSetDevice(current_device);
     }
   }
 }
@@ -345,15 +347,15 @@ DeviceAllocation::~DeviceAllocation() {
 DeviceAllocation &DeviceAllocation::reset() {
   if (pointer_) {
     int current_device;
-    cudaGetDevice(&current_device);
+    hggcGetDevice(&current_device);
 
     if (current_device != device_) {
-      cudaSetDevice(device_);
+      hggcSetDevice(device_);
     }
-    cudaFree(pointer_);
+    hggcFree(pointer_);
 
     if (current_device != device_) {
-      cudaSetDevice(current_device);
+      hggcSetDevice(current_device);
     }
   }
 
@@ -378,8 +380,8 @@ DeviceAllocation &DeviceAllocation::reset(library::NumericTypeID type, size_t ca
   batch_stride_ = capacity;
   capacity_ = capacity;
 
-  cudaError_t result = this->malloc((void **)&pointer_, bytes(type_, capacity_));
-  if (result != cudaSuccess) {
+  hggcError_t result = this->malloc((void **)&pointer_, bytes(type_, capacity_));
+  if (result != hggcSuccess) {
     throw std::bad_alloc();
   }
 
@@ -421,8 +423,8 @@ DeviceAllocation &DeviceAllocation::reset(
 
   capacity_ = batch_stride_ * batch_count_;
 
-  cudaError_t result = this->malloc((void **)&pointer_, bytes(type, capacity_));
-  if (result != cudaSuccess) {
+  hggcError_t result = this->malloc((void **)&pointer_, bytes(type, capacity_));
+  if (result != hggcSuccess) {
     throw std::bad_alloc();
   }
 
@@ -492,8 +494,8 @@ void DeviceAllocation::copy_from_device(void const *ptr) {
     return;
   }
 
-  cudaError_t result = cudaMemcpy(data(), ptr, bytes(), cudaMemcpyDeviceToDevice);
-  if (result != cudaSuccess) {
+  hggcError_t result = hggcMemcpy(data(), ptr, bytes(), hggcMemcpyDeviceToDevice);
+  if (result != hggcSuccess) {
     throw std::runtime_error("Failed device-to-device copy");
   }
 }
@@ -507,8 +509,8 @@ void DeviceAllocation::copy_from_host(void const *ptr) {
     return;
   }
 
-  cudaError_t result = cudaMemcpy(data(), ptr, bytes(), cudaMemcpyHostToDevice);
-  if (result != cudaSuccess) {
+  hggcError_t result = hggcMemcpy(data(), ptr, bytes(), hggcMemcpyHostToDevice);
+  if (result != hggcSuccess) {
     throw std::runtime_error("Failed host-to-device copy");
   }
 }
@@ -522,8 +524,8 @@ void DeviceAllocation::copy_to_host(void *ptr) {
     return;
   }
 
-  cudaError_t result = cudaMemcpy(ptr, data(), bytes(), cudaMemcpyDeviceToHost);
-  if (result != cudaSuccess) {
+  hggcError_t result = hggcMemcpy(ptr, data(), bytes(), hggcMemcpyDeviceToHost);
+  if (result != hggcSuccess) {
     throw std::runtime_error("Failed device-to-host copy");
   }
 }
@@ -540,8 +542,8 @@ void DeviceAllocation::initialize_random_device(int seed, Distribution dist) {
     throw std::runtime_error("Attempting to initialize invalid allocation.");
   }
 
-  // Instantiate calls to CURAND here. This file takes a long time to compile for
-  // this reason.
+  // Instantiate calls to the host-side random fill helpers here. This file takes
+  // a long time to compile for this reason.
 
   switch (type_) {
   case library::NumericTypeID::kF16:
@@ -1415,81 +1417,6 @@ void DeviceAllocation::initialize_sequential_host(Distribution dist) {
     );
     break;
   default: break;
-  }
-
-  copy_from_host(host_data.data());
-}
-
-void DeviceAllocation::initialize_random_sparsemeta_device(int seed, int MetaSizeInBits) {
-  if (!bytes()) {
-#ifndef NDEBUG
-    std::cout << "Skipping initialization of size 0 allocation\n";
-#endif
-    return;
-  }
-
-  if (!data()) {
-    throw std::runtime_error("Attempting to initialize invalid allocation.");
-  }
-
-  // Instantiate calls to CURAND here. This file takes a long time to compile for
-  // this reason.
-
-  switch (type_) {
-  case library::NumericTypeID::kU16:
-    cutlass::reference::device::BlockFillRandomSparseMeta<uint16_t>(
-      reinterpret_cast<uint16_t *>(pointer_),
-      capacity_,
-      seed,
-      MetaSizeInBits
-    );
-    break;
-  case library::NumericTypeID::kU32:
-    cutlass::reference::device::BlockFillRandomSparseMeta<uint32_t>(
-      reinterpret_cast<uint32_t *>(pointer_),
-      capacity_,
-      seed,
-      MetaSizeInBits
-    );
-    break;
-  default:
-    break;
-  }
-}
-
-void DeviceAllocation::initialize_random_sparsemeta_host(int seed, int MetaSizeInBits) {
-  if (!bytes()) {
-#ifndef NDEBUG
-    std::cout << "Skipping initialization of size 0 allocation\n";
-#endif
-    return;
-  }
-
-  if (!data()) {
-    throw std::runtime_error("Attempting to initialize invalid allocation.");
-  }
-
-  std::vector<uint8_t> host_data(bytes());
-
-  switch (type_) {
-  case library::NumericTypeID::kS16:
-    cutlass::reference::host::BlockFillRandomSparseMeta<uint16_t>(
-      reinterpret_cast<uint16_t *>(host_data.data()),
-      capacity_,
-      seed,
-      MetaSizeInBits
-    );
-    break;
-  case library::NumericTypeID::kS32:
-    cutlass::reference::host::BlockFillRandomSparseMeta<uint32_t>(
-      reinterpret_cast<uint32_t *>(host_data.data()),
-      capacity_,
-      seed,
-      MetaSizeInBits
-    );
-    break;
-  default:
-    break;
   }
 
   copy_from_host(host_data.data());
@@ -2455,26 +2382,26 @@ void DeviceAllocation::fill_host(double val = 0.0) {
   copy_from_host(host_data.data());
 }
 
-cudaError_t DeviceAllocation::malloc(void** ptr, size_t size) {
-  cudaError_t result;
+hggcError_t DeviceAllocation::malloc(void** ptr, size_t size) {
+  hggcError_t result;
   int current_device;
-  cudaGetDevice(&current_device);
+  hggcGetDevice(&current_device);
 
   if (current_device != device_) {
-    cudaSetDevice(device_);
+    hggcSetDevice(device_);
   }
 
-  // This performs the cudaMalloc
-  result = cudaMalloc(ptr, size);
-  if (result != cudaSuccess) {
+  // This performs the hggcMalloc
+  result = hggcMalloc(ptr, size);
+  if (result != hggcSuccess) {
     return result;
   }
 
   if (current_device != device_) {
-    cudaSetDevice(current_device);
+    hggcSetDevice(current_device);
   }
 
-  return cudaSuccess;
+  return hggcSuccess;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

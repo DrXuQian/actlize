@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -41,10 +42,9 @@ target_link_libraries(
   PUBLIC
   CUTLASS
   cutlass_tools_util_includes
-  $<$<BOOL:${CUTLASS_ENABLE_CUBLAS}>:nvidia::cublas>
   GTest::gtest
-  cudart
-  cuda_driver
+  ppu_runtime
+  ppu_driver
   )
 
 cutlass_add_library(
@@ -63,12 +63,18 @@ set(CUTLASS_TEST_UNIT_RESULTS_CACHE_DIR ${CMAKE_CURRENT_LIST_DIR}/data/hashes)
 
 function(cutlass_test_unit_add_executable NAME)
 
-  set(options WITHOUT_CUDA DO_NOT_LOWERCASE_TEST_NAME)
+  set(options WITHOUT_DEVICE DO_NOT_LOWERCASE_TEST_NAME)
   set(oneValueArgs)
   set(multiValueArgs TEST_SETS_SUPPORTED EXTRA_INCLUDE_DIRS)
   cmake_parse_arguments(_ "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-  cutlass_add_executable(${NAME} ${__UNPARSED_ARGUMENTS} BATCH_SOURCES OFF)
+  # Pass CUTLASS_TARGET_NAME as a device compile flag so that .cu files
+  # compiled via hgcc (add_custom_command) can also see the macro.
+  # NOTE: DEV_COMPILE_FLAGS must come LAST so cmake_parse_arguments does not
+  # accidentally consume the source files as its values.
+  cutlass_add_executable(${NAME}
+    ${__UNPARSED_ARGUMENTS}
+    DEV_COMPILE_FLAGS "-DCUTLASS_TARGET_NAME=\"${NAME}\"")
 
   target_compile_definitions(${NAME} PUBLIC CUTLASS_TARGET_NAME="${NAME}")
 
@@ -78,9 +84,9 @@ function(cutlass_test_unit_add_executable NAME)
     ${CUTLASS_UNIT_TEST_COMMON_DIR}
     ${__EXTRA_INCLUDE_DIRS}
   )
-  if (__WITHOUT_CUDA)
-    # Avoid CUDA dependencies for host-only unit tests that provide the
-    # WITHOUT_CUDA argument.
+  if (__WITHOUT_DEVICE)
+    # Avoid device-runtime dependencies for host-only unit tests that provide the
+    # WITHOUT_DEVICE argument.
     target_link_libraries(
       ${NAME}
       PUBLIC
@@ -129,31 +135,15 @@ add_custom_target(cutlass_test_unit)
 add_custom_target(test_unit)
 
 set(SUBDIRS
+  gemm_ppu
   core
   cute
-  gemm
   conv
   layout
-  transform
   epilogue
-  reduction
   util
-  pipeline
   substrate
-  cluster_launch
   )
-
-if(TARGET nvidia::nvrtc AND TARGET nvidia::cuda_driver)
-  set(CUTLASS_NVRTC_ENABLE_INIT ON)
-else()
-  set(CUTLASS_NVRTC_ENABLE_INIT OFF)
-endif()  
-
-set(CUTLASS_NVRTC_ENABLE ${CUTLASS_NVRTC_ENABLE_INIT} CACHE BOOL "Enable NVRTC support")
-
-if (CUTLASS_NVRTC_ENABLE)
-  list(APPEND SUBDIRS nvrtc)
-endif()
 
 foreach(SUBDIR ${SUBDIRS})
 

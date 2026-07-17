@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Command line options for performance test program
 */
@@ -57,10 +59,10 @@ static char const *end_of_line = "\n                                            
 Options::Device::Device(cutlass::CommandLine const &cmdline) {
 
   // Gets the number of devices for future validation
-  cudaError_t result;
-  result = cudaGetDeviceCount(&num_devices);
-  if (result != cudaSuccess) {
-    throw std::runtime_error("cudaGetNumDevices() failed");
+  hggcError_t result;
+  result = hggcGetDeviceCount(&num_devices);
+  if (result != hggcSuccess) {
+    throw std::runtime_error("hggcGetNumDevices() failed");
   }
 
   // Gets the devices specified by the user
@@ -93,10 +95,10 @@ Options::Device::Device(cutlass::CommandLine const &cmdline) {
   for (size_t device_index = 0; device_index < devices.size(); device_index++) {
     int device = devices[device_index];
 
-    result = cudaGetDeviceProperties(&properties[device_index], device);
+    result = hggcGetDeviceProperties(&properties[device_index], device);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProperties() failed for given device");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProperties() failed for given device");
     }
 
     // Check that all devices are the same
@@ -112,13 +114,13 @@ Options::Device::Device(cutlass::CommandLine const &cmdline) {
       }
       if (properties[device_index].multiProcessorCount != properties[0].multiProcessorCount) {
         throw std::runtime_error("All selected devices must have the same "
-                                 "SM count");
+                                 "CU count");
       }
     }
 
-    result = cudaSetDevice(device);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaSetDevice() failed for given device.");
+    result = hggcSetDevice(device);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcSetDevice() failed for given device.");
     }
 
     // Permit overriding the compute capability
@@ -146,27 +148,27 @@ void Options::Device::print_usage(std::ostream &out) const {
 
   out << "Device:\n"
     << "  --devices=<int>,<int>,...                      "
-    << "    CUDA Device IDs\n\n";
+    << "   Device IDs\n\n";
 
   int device_count = 0;
-  cudaError_t result = cudaGetDeviceCount(&device_count);
+  hggcError_t result = hggcGetDeviceCount(&device_count);
 
-  if (result != cudaSuccess) {
-    out << "      <could not query for CUDA devices>\n";
+  if (result != hggcSuccess) {
+    out << "      <could not query for devices>\n";
   }
   else {
 
     for (int idx = 0; idx < device_count; ++idx) {
-      cudaDeviceProp prop;
-      result = cudaGetDeviceProperties(&prop, idx);
-      if (result != cudaSuccess) {
+      hggcDeviceProp prop;
+      result = hggcGetDeviceProperties(&prop, idx);
+      if (result != hggcSuccess) {
         out << "      <could not obtain device properties for device " << idx << ">" << std::endl;
         break;
       }
       else {
         out << "    [" << idx << "] - "
-          << prop.name << " - SM " << prop.major << "." << prop.minor << ", "
-          << prop.multiProcessorCount << " SMs @ " << (prop.clockRate / 1000.0) << " MHz, "
+          << prop.name << " - CU " << prop.major << "." << prop.minor << ", "
+          << prop.multiProcessorCount << " CUs @ " << (prop.clockRate / 1000.0) << " MHz, "
           << "L2 cache: " << (prop.l2CacheSize >> 20) << " MB, Global Memory: " << (prop.totalGlobalMem >> 30) << " GB"
           << std::endl;
       }
@@ -186,20 +188,20 @@ void Options::Device::print_usage(std::ostream &out) const {
 }
 
 void Options::Device::print_device_info(std::ostream &out) const {
-  cudaDeviceProp props;
-  cudaError_t result;
+  hggcDeviceProp props;
+  hggcError_t result;
 
-  out << "Device Name,SM,CUDA Device ID,Phy Device ID" << std::endl;
+  out << "Device Name,CU,Device ID,Phy Device ID" << std::endl;
 
   for (int device = 0; device < num_devices; device++) {
-    result = cudaSetDevice(device);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaSetDevice() failed for device");
+    result = hggcSetDevice(device);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcSetDevice() failed for device");
     }
 
-    result = cudaGetDeviceProperties(&props, device);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProperties failed for device");
+    result = hggcGetDeviceProperties(&props, device);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProperties failed for device");
     }
 
     out << props.name << "," << props.major << props.minor << ","
@@ -442,7 +444,7 @@ void Options::Library::print_usage(std::ostream &out) const {
   out << "Library:\n"
 
     << "  --library-algo-mode=<mode>                   "
-    << "    Indicates algorithm mode used to call libraries such as cuBLAS and cuDNN.\n"
+    << "    Indicates algorithm mode used to call libraries such as acBLAS and acDNN.\n"
     << "                                               "
     << "    mode={default*,matching,best}\n\n"
 
@@ -488,8 +490,8 @@ Options::Profiling::Profiling(cutlass::CommandLine const &cmdline) {
   }
   else {
     providers.push_back(library::Provider::kCUTLASS);
-    providers.push_back(library::Provider::kCUBLAS);
-    providers.push_back(library::Provider::kCUDNN);
+    providers.push_back(library::Provider::kACBLAS);
+    providers.push_back(library::Provider::kACDNN);
   }
 }
 
@@ -587,9 +589,9 @@ Options::Verification::Verification(cutlass::CommandLine const &cmdline) {
     }
   }
   else {
-    providers.push_back(library::Provider::kCUBLAS);
+    providers.push_back(library::Provider::kACBLAS);
     providers.push_back(library::Provider::kReferenceDevice);
-    providers.push_back(library::Provider::kCUDNN);
+    providers.push_back(library::Provider::kACDNN);
   }
 }
 
@@ -616,8 +618,7 @@ void Options::Verification::print_usage(std::ostream &out) const {
 
     << "  --verification-providers=<providers>         "
     << "    List of providers used to verify result. (default: '*')" << end_of_line
-    << "      Gemm verification-providers {cublas*}" << end_of_line
-    << "      Conv2d verification-providers {cudnn*, device*, host}"
+    << "      Gemm verification-providers {acblas*}" << end_of_line
     << "\n\n";
 }
 
@@ -834,7 +835,7 @@ void Options::print_usage(std::ostream &out) const {
     << "                          no other kernel launches\n\n"
 
     << "  --device-info                                "
-    << "    Prints information on all GPUs present in the system\n\n"
+    << "    Prints information on all PPUs present in the system\n\n"
 
     << "  --operation=<operation_kind>                 "
     << "    CUTLASS operation to profile.\n\n"

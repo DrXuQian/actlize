@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Execution environment
 */
@@ -39,12 +41,11 @@
 #include <vector>
 
 #include "cutlass/core_io.h"
-#include <cuda_runtime_api.h>
-#include <cuda/atomic>
+#include <hggc_runtime_api.h>
+#include <hggc/atomic>
 
-#include "cutlass/profiler/cublas_helpers.h"
 #include "cutlass/profiler/gemm_operation_profiler.h"
-#include "cutlass/profiler/gpu_timer.h"
+#include "cutlass/profiler/ppu_timer.h"
 #include "cutlass/library/singleton.h"
 #include "cutlass/library/library.h"
 #include "cutlass/library/handle.h"
@@ -78,7 +79,7 @@ GemmOperationProfiler::GemmOperationProfiler(Options const &options):
       {ArgumentTypeID::kEnumerated, {"raster_order", "raster-order"}, "Raster order (heuristic, along_n, along_m)"},
       {ArgumentTypeID::kInteger, {"swizzle_size", "swizzle-size"}, "Size to swizzle"},
     },
-    { library::Provider::kCUBLAS}
+    { library::Provider::kACBLAS}
   ) {
 
   description_ = "      General matrix-matrix product. D = alpha * A*B + beta * C";
@@ -157,18 +158,18 @@ Status GemmOperationProfiler::GemmProblem::parse(
   this->mode = library::GemmUniversalMode::kGemm;
 
   if (!arg_as_int(this->m, "m", problem_space, problem)) {
-    // default value
-    this->m = 1024;
+    // default profiler value
+    this->m = 4096;
   }
 
   if (!arg_as_int(this->n, "n", problem_space, problem)) {
-    // default value
-    this->n = 1024;
+    // default profiler value
+    this->n = 4096;
   }
 
   if (!arg_as_int(this->k, "k", problem_space, problem)) {
-    // default value
-    this->k = 1024;
+    // default profiler value
+    this->k = 4096;
   }
 
   if (!arg_as_SplitKModeID(this->split_k_mode, "split_k_mode", problem_space, problem)) {
@@ -374,9 +375,9 @@ Status GemmOperationProfiler::initialize_configuration(
   gemm_workspace_.clear();
 
   for (size_t i = 0; i < device_count; ++i) {
-    cudaSetDevice(options.device.device_id(i));
+    hggcSetDevice(options.device.device_id(i));
     gemm_workspace_.emplace_back();
-    cudaStreamCreateWithFlags(&gemm_workspace_[i].stream, cudaStreamNonBlocking);
+    hggcStreamCreateWithFlags(&gemm_workspace_[i].stream, hggcStreamNonBlocking);
     gemm_workspace_[i].configuration.mode = problem_.mode;
     gemm_workspace_[i].configuration.problem_size.m() = int(problem_.m);
     gemm_workspace_[i].configuration.problem_size.n() = int(problem_.n);
@@ -502,10 +503,10 @@ Status GemmOperationProfiler::initialize_workspace(
   ProblemSpace const &problem_space,
   ProblemSpace::Problem const &problem) {
 
-  cudaError_t result;
-  result = cudaSetDevice(options.device.device_id(0));
-  if (result != cudaSuccess) {
-    throw std::runtime_error("cudaSetDevice() failed.");
+  hggcError_t result;
+  result = hggcSetDevice(options.device.device_id(0));
+  if (result != hggcSuccess) {
+    throw std::runtime_error("hggcSetDevice() failed.");
   }
 
   library::Operation const* underlying_operation = operation;
@@ -519,10 +520,8 @@ Status GemmOperationProfiler::initialize_workspace(
   library::GemmDescription const &operation_desc =
     static_cast<library::GemmDescription const &>(operation->description());
 
-  bool is_sparse = operation_desc.tile_description.math_instruction.opcode_class == cutlass::library::OpcodeClassID::kSparseTensorOp;
-
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
+    hggcSetDevice(options.device.device_id(i));
 
     // Compute the number of copies of the problem to avoid L2 camping.
     if (!options.profiling.workspace_count) {
@@ -614,8 +613,8 @@ Status GemmOperationProfiler::initialize_workspace(
       gemm_workspace_[i].arguments.batch_stride_C = gemm_workspace_[i].C->batch_stride();
       gemm_workspace_[i].arguments.batch_stride_D = gemm_workspace_[i].Computed->batch_stride();
 
-      /* Query device SM count to pass onto the kernel as an argument, where needed */
-      gemm_workspace_[i].arguments.sm_count = options.device.properties[0].multiProcessorCount;
+      /* Query device CU count to pass onto the kernel as an argument, where needed */
+      gemm_workspace_[i].arguments.cu_count = options.device.properties[0].multiProcessorCount;
       gemm_workspace_[i].arguments.device_index = static_cast<int>(i);
     }
   }
@@ -629,41 +628,19 @@ Status GemmOperationProfiler::initialize_workspace(
 
     if (options.execution_mode != ExecutionMode::kDryRun) {
       for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-        cudaSetDevice(options.device.device_id(i));
+        hggcSetDevice(options.device.device_id(i));
         uint64_t workspace_size = underlying_operation->get_host_workspace_size(&gemm_workspace_[i].configuration);
         gemm_workspace_[i].host_workspace.resize(workspace_size, 0);
 
         workspace_size = underlying_operation->get_device_workspace_size(&gemm_workspace_[i].configuration,
                                                               &gemm_workspace_[i].arguments);
-        if (is_sparse) {
-          // sparse gemm get_device_workspace_size() only return device workspace size per iteration
-          // Needs to multiply it w/ number of iteration
-          workspace_size *= gemm_workspace_[i].problem_count;
-        }
         gemm_workspace_[i].device_workspace.reset(library::NumericTypeID::kU8, workspace_size);
 
-        // Convert to structure sparse contents here.
-        if (is_sparse) {
-          uint8_t* profiler_workspaces[1];
-          profiler_workspaces[0] = reinterpret_cast<uint8_t*>(gemm_workspace_[i].A->data());
-          // Sparse operations have a different initialize interface.
-          // initialize_with_profiler_workspace converts mxk tensorA to compressed mxk/sp tensorA and the tensorE
-          auto modifiable_underlying_op = const_cast<library::Operation*>(underlying_operation);
-          status = modifiable_underlying_op->initialize_with_profiler_workspace(
-            &gemm_workspace_[i].configuration,
-            gemm_workspace_[i].host_workspace.data(),
-            gemm_workspace_[i].device_workspace.data(),
-            profiler_workspaces,
-            gemm_workspace_[i].problem_count,
-            gemm_workspace_[i].stream);
-        }
-        else {
-          status = underlying_operation->initialize(
-            &gemm_workspace_[i].configuration,
-            gemm_workspace_[i].host_workspace.data(),
-            gemm_workspace_[i].device_workspace.data(),
-            gemm_workspace_[i].stream);
-        }
+        status = underlying_operation->initialize(
+          &gemm_workspace_[i].configuration,
+          gemm_workspace_[i].host_workspace.data(),
+          gemm_workspace_[i].device_workspace.data(),
+          gemm_workspace_[i].stream);
 
         if (status != Status::kSuccess) {
           return status;
@@ -687,8 +664,8 @@ Status GemmOperationProfiler::initialize_workspace(
     }
 
     for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-      cudaSetDevice(options.device.device_id(i));
-      cudaDeviceSynchronize();
+      hggcSetDevice(options.device.device_id(i));
+      hggcDeviceSynchronize();
     }
 
     //
@@ -768,7 +745,7 @@ bool GemmOperationProfiler::verify_cutlass(
   }
 
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
+    hggcSetDevice(options.device.device_id(i));
 
     results_.back().status = underlying_operation->run(
      &gemm_workspace_[i].arguments,
@@ -796,8 +773,8 @@ bool GemmOperationProfiler::verify_cutlass(
     }
   }
 
-  cudaError_t result = cudaDeviceSynchronize();
-  if (result != cudaSuccess) {
+  hggcError_t result = hggcDeviceSynchronize();
+  if (result != hggcSuccess) {
     results_.back().disposition = Disposition::kFailed;
     return false;
   }
@@ -810,35 +787,6 @@ bool GemmOperationProfiler::verify_cutlass(
   //
 
   if (options.verification.enabled) {
-
-#if CUTLASS_ENABLE_CUBLAS
-    if (options.verification.provider_enabled(library::Provider::kCUBLAS)) {
-
-      // Guard against unsupported cases
-      auto const & gemm_desc = static_cast<library::GemmDescription const &>(operation->description());
-
-      if (cublas_satisfies(gemm_desc) == Status::kSuccess) {
-
-        // call cublas verification if supported
-        for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-          cudaSetDevice(options.device.device_id(i));
-          verify_with_cublas_(
-           options,
-           report,
-           device_context,
-           operation,
-           problem_space,
-           problem,
-           gemm_workspace_[i]);
-        }
-        }
-
-      else {
-        // set verification map for cublas to not supported
-        results_.back().verification_map[library::Provider::kCUBLAS] = Disposition::kNotSupported;
-      }
-    }
-#endif // #if CUTLASS_ENABLE_CUBLAS
 
     library::GemmDescription const &gemm_desc =
       static_cast<library::GemmDescription const &>(operation->description());
@@ -886,7 +834,7 @@ bool GemmOperationProfiler::verify_cutlass(
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Verifies CUTLASS against references
-bool GemmOperationProfiler::verify_with_cublas_(
+bool GemmOperationProfiler::verify_with_acblas_(
   Options const &options,
   PerformanceReport &report,
   DeviceContext &device_context,
@@ -894,104 +842,6 @@ bool GemmOperationProfiler::verify_with_cublas_(
   ProblemSpace const &problem_space,
   ProblemSpace::Problem const &problem,
   GemmWorkspace &gemm_workspace_) {
-
-#if CUTLASS_ENABLE_CUBLAS
-
-  library::GemmDescription const &gemm_desc =
-    static_cast<library::GemmDescription const &>(operation->description());
-
-  //
-  // Construct cuBLAS operators
-  //
-
-  CublasLtCreate handle;
-  cublasStatus_t status = handle.get_cublaslt_create_status();
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    results_.back().verification_map[library::Provider::kCUBLAS] = get_cutlass_disposition(status);
-    return true;
-  }
-
-
-  //
-  // Initialize state
-  //
-
-  try {
-
-    //
-    // Construct dispatcher to cublasGemmEx()
-    //
-
-    // Initialize structure containing GEMM arguments
-    gemm_workspace_.arguments.A = gemm_workspace_.A->data();
-    gemm_workspace_.arguments.batch_stride_A = gemm_workspace_.A->batch_stride();
-    gemm_workspace_.arguments.B = gemm_workspace_.B->data();
-    gemm_workspace_.arguments.batch_stride_B = gemm_workspace_.B->batch_stride();
-    gemm_workspace_.arguments.C = gemm_workspace_.Reference->data();
-    gemm_workspace_.arguments.batch_stride_C = gemm_workspace_.Reference->batch_stride();
-    gemm_workspace_.arguments.D = gemm_workspace_.Reference->data();
-    gemm_workspace_.arguments.batch_stride_D = gemm_workspace_.Reference->batch_stride();
-    gemm_workspace_.arguments.alpha = problem_.alpha.data();
-    gemm_workspace_.arguments.beta = problem_.beta.data();
-    gemm_workspace_.arguments.pointer_mode = library::ScalarPointerMode::kHost;
-
-    detail::cublasLtGemmExDispatcher gemm_op(
-      gemm_desc,
-      gemm_workspace_.configuration,
-      gemm_workspace_.arguments
-    );
-
-    gemm_op.initialize_cublaslt();
-
-    if(!gemm_op.get_cublaslt_algo(handle, AlgorithmMode::kDefault)){
-      return true;
-    }
-
-    if (gemm_op.status != Status::kSuccess) {
-      results_.back().verification_map[library::Provider::kCUBLAS] = Disposition::kNotRun;
-      return true;
-    }
-
-    status = gemm_op(handle);
-
-    // Handle errors
-    if (status != CUBLAS_STATUS_SUCCESS) {
-      std::cerr << "cublasLt Verification run failed with status : " << cublasLtGetStatusName(status) << "\n";
-      results_.back().verification_map[library::Provider::kCUBLAS] = get_cutlass_disposition(status);
-      return true;
-    }
-
-    results_.back().status = Status::kSuccess;
-
-    //
-    // Verify results
-    //
-
-    results_.back().verification_map[library::Provider::kCUBLAS] = compare_tensors(
-      options,
-      *gemm_workspace_.Computed,
-      *gemm_workspace_.Reference,
-      gemm_workspace_.Computed->batch_stride()
-    );
-
-    // Save workspace if incorrect
-    if (options.verification.save_workspace == SaveWorkspace::kIncorrect &&
-      results_.back().verification_map[library::Provider::kCUBLAS] == Disposition::kIncorrect) {
-
-      save_workspace(
-        device_context,
-        options,
-        gemm_desc,
-        library::Provider::kCUTLASS,
-        library::Provider::kCUBLAS);
-    }
-  }
-  catch (...) {
-    results_.back().verification_map[library::Provider::kCUBLAS] = Disposition::kFailed;
-  }
-
-#endif
 
   // Return true means continue profiling
   return true;
@@ -1025,7 +875,7 @@ bool GemmOperationProfiler::verify_with_reference_(
     }
 
     for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-      cudaSetDevice(options.device.device_id(i));
+      hggcSetDevice(options.device.device_id(i));
 
       void *ptr_A = gemm_workspace_[i].A->data();
       void *ptr_B = gemm_workspace_[i].B->data();
@@ -1147,9 +997,9 @@ bool GemmOperationProfiler::verify_with_reference_(
 
 namespace {
 extern "C" {
-  __global__ void delay(cuda::atomic<bool> const* release) {
-    while (release->load(cuda::memory_order_acquire) != true) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+  __global__ void delay(hggc::atomic<bool> const* release) {
+    while (release->load(hggc::memory_order_acquire) != true) {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100)
       __nanosleep(100);
 #endif
     }
@@ -1219,13 +1069,13 @@ Status GemmOperationProfiler::profile_cutlass_(
   void *,
   void *) {
 
-  cuda::atomic<bool> *release;
-  cudaHostAlloc(&release, sizeof(*release), cudaHostAllocPortable);
-  release->store(false, cuda::memory_order_release);
+  hggc::atomic<bool> *release;
+  hggcHostAlloc(&release, sizeof(*release), hggcHostAllocPortable);
+  release->store(false, hggc::memory_order_release);
 
-  std::vector<GpuTimer> timer;
+  std::vector<PpuTimer> timer;
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
+    hggcSetDevice(options.device.device_id(i));
     timer.emplace_back();
   }
   // initialize gemm underlying operation to handle parallel reduction
@@ -1249,16 +1099,16 @@ Status GemmOperationProfiler::profile_cutlass_(
 
   Status status;
 
-  std::vector<cudaGraph_t> graphs;
+  std::vector<hggcGraph_t> graphs;
   graphs.resize(gemm_workspace_.size());
-  std::vector<cudaGraphExec_t> graphExecs;
+  std::vector<hggcGraphExec_t> graphExecs;
   graphExecs.resize(gemm_workspace_.size());
 
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
-    cudaStreamBeginCapture(gemm_workspace_[i].stream, cudaStreamCaptureModeGlobal);
-    // Halt execution until all GPUs are ready to precede.
-    // It allows the CPU to trigger the GPUs all start at the same time.
+    hggcSetDevice(options.device.device_id(i));
+    hggcStreamBeginCapture(gemm_workspace_[i].stream, hggcStreamCaptureModeGlobal);
+    // Halt execution until all PPUs are ready to precede.
+    // It allows the CPU to trigger the PPUs all start at the same time.
     delay<<<1, 1, 0, gemm_workspace_[i].stream>>>(release);
     for (int iteration = 0; iteration < options.profiling.warmup_iterations; ++iteration) {
       int problem_idx = (iteration % gemm_workspace_[i].problem_count) * problem_.batch_count;
@@ -1302,10 +1152,10 @@ Status GemmOperationProfiler::profile_cutlass_(
     }
 
     //
-    // Initialize GPU timer
+    // Initialize PPU timer
     //
 
-    timer[i].start(gemm_workspace_[i].stream, cudaEventRecordExternal);
+    timer[i].start(gemm_workspace_[i].stream, hggcEventRecordExternal);
 
     //
     // Profiling loop
@@ -1356,25 +1206,25 @@ Status GemmOperationProfiler::profile_cutlass_(
         }
       }
     }
-    timer[i].stop(gemm_workspace_[i].stream, cudaEventRecordExternal);
-    cudaStreamEndCapture(gemm_workspace_[i].stream, &graphs[i]);
-    cudaGraphInstantiate(&graphExecs[i], graphs[i], nullptr, nullptr, 0);
+    timer[i].stop(gemm_workspace_[i].stream, hggcEventRecordExternal);
+    hggcStreamEndCapture(gemm_workspace_[i].stream, &graphs[i]);
+    hggcGraphInstantiate(&graphExecs[i], graphs[i], nullptr, nullptr, 0);
   }
 
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
-    cudaGraphLaunch(graphExecs[i], gemm_workspace_[i].stream);
+    hggcSetDevice(options.device.device_id(i));
+    hggcGraphLaunch(graphExecs[i], gemm_workspace_[i].stream);
   }
 
   //
   // Wait for completion
   //
 
-  release->store(true, cuda::memory_order_release);
+  release->store(true, hggc::memory_order_release);
 
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
-    cudaStreamSynchronize(gemm_workspace_[i].stream);
+    hggcSetDevice(options.device.device_id(i));
+    hggcStreamSynchronize(gemm_workspace_[i].stream);
   }
   //
   // Update performance result
@@ -1383,22 +1233,22 @@ Status GemmOperationProfiler::profile_cutlass_(
 
   result.runtime = 0;
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
+    hggcSetDevice(options.device.device_id(i));
     result.runtime_vector[i] = timer[i].duration(options.profiling.iterations);
     result.runtime += result.runtime_vector[i];
   }
   result.runtime /= static_cast<double>(gemm_workspace_.size());
 
-  cudaFreeHost(release);
+  hggcFreeHost(release);
 
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(i));
-    cudaGraphExecDestroy(graphExecs[i]);
-    cudaGraphDestroy(graphs[i]);
+    hggcSetDevice(options.device.device_id(i));
+    hggcGraphExecDestroy(graphExecs[i]);
+    hggcGraphDestroy(graphs[i]);
   }
 
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
-    cudaSetDevice(options.device.device_id(gemm_workspace_.size() - i - 1));
+    hggcSetDevice(options.device.device_id(gemm_workspace_.size() - i - 1));
     timer.pop_back();
   }
 

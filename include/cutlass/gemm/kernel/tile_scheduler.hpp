@@ -1,5 +1,6 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
+ * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -31,15 +32,9 @@
 
 #pragma once
 
-/*! \file
-    \brief Utilities for selecting default tile schedulers
-*/
-
-#include "cutlass/arch/arch.h"
-#include "cutlass/detail/dependent_false.hpp"
-
-////////////////////////////////////////////////////////////////////////////////
-
+#include "cutlass/gemm/kernel/ppu0015_tile_scheduler.hpp"
+#include "cutlass/gemm/kernel/ppu_tile_scheduler_stream_k.hpp"
+#include "cutlass/gemm/kernel/ppu_tile_scheduler_group.hpp"
 namespace cutlass::gemm {
 
 //
@@ -47,24 +42,18 @@ namespace cutlass::gemm {
 //
 
 struct PersistentScheduler { };
-
 struct StreamKScheduler { };
-
 struct GroupScheduler { }; // Only used for Grouped GEMMs
 
-} // namespace cutlass::gemm
-////////////////////////////////////////////////////////////////////////////////
+struct SplitKSerialScheduler { };
+struct PersistentSchedulerPPU0015 { };
+struct DynamicPersistentSchedulerPPU0015 { };
 
-#include "cutlass/gemm/kernel/sm90_tile_scheduler.hpp"
-#include "cutlass/gemm/kernel/sm90_tile_scheduler_stream_k.hpp"
-#include "cutlass/gemm/kernel/sm90_tile_scheduler_group.hpp"
+} // namespace cutlass::gemm
+
 ////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel::detail {
-
-//
-// Selectors mapping tile scheduler tag and arch tag to a tile scheduler class
-//
 
 template <
   class TileSchedulerTag,
@@ -78,21 +67,7 @@ struct TileSchedulerSelector {
       "Could not select a tile scheduler for given parameters.");
 };
 
-template <
-  class ArchTag,
-  class TileShape,
-  class ClusterShape
->
-struct TileSchedulerSelector<
-    PersistentScheduler,
-    ArchTag,
-    TileShape,
-    ClusterShape
-  > {
-  using Scheduler = PersistentTileSchedulerSm90;
-};
-
-// Default (void) for Sm90 maps to PersistentTileSchedulerSm90
+// Default (void) for PPU maps to PersistentTileSchedulerPPU
 template <
   class ArchTag,
   class TileShape,
@@ -113,35 +88,94 @@ struct TileSchedulerSelector<
 };
 
 template <
+  typename Arch,
   class TileShape,
   class ClusterShape
 >
 struct TileSchedulerSelector<
-    StreamKScheduler,
-    arch::Sm90,
-    TileShape,
-    ClusterShape
+  StreamKScheduler,
+  Arch,
+  TileShape,
+  ClusterShape
   > {
-  using Scheduler = PersistentTileSchedulerSm90StreamK<TileShape, ClusterShape>;
+  using Scheduler = PersistentTileSchedulerPPUStreamK<TileShape, ClusterShape>;
 };
 
 template <
+  typename Arch,
   class TileShape,
   class ClusterShape
   , class GroupProblemShape
 >
 struct TileSchedulerSelector<
-    GroupScheduler,
-    arch::Sm90,
-    TileShape,
-    ClusterShape
-    , GroupProblemShape
+  GroupScheduler,
+  Arch,
+  TileShape,
+  ClusterShape
+  , GroupProblemShape
   > {
-  using Scheduler = PersistentTileSchedulerSm90Group<GroupProblemShape>;
+  using Scheduler = PersistentTileSchedulerPPUGroup<GroupProblemShape>;
 };
 
-////////////////////////////////////////////////////////////////////////////////
+template <
+  typename Arch,
+  class TileShape,
+  class ClusterShape
+>
+struct TileSchedulerSelector<
+  cutlass::gemm::PersistentSchedulerPPU0015,
+  Arch,
+  TileShape,
+  ClusterShape
+  > {
+#ifdef USE_PAD_BLOCK
+  // would evaluate for batch-gemm later on
+  using Scheduler = StaticPersistentTileSchedulerPadPPU0015;
+#else  
+  using Scheduler = StaticPersistentTileSchedulerPPU0015;
+#endif  
+};
+
+template <
+  typename Arch,
+  class TileShape,
+  class ClusterShape
+>
+struct TileSchedulerSelector<
+  cutlass::gemm::DynamicPersistentSchedulerPPU0015,
+  Arch,
+  TileShape,
+  ClusterShape
+  > {
+  using Scheduler = DynamicPersistentTileSchedulerPPU0015;
+};
+
+template <
+  typename Arch,
+  class TileShape,
+  class ClusterShape
+>
+struct TileSchedulerSelector<
+  PersistentScheduler,
+  Arch,
+  TileShape,
+  ClusterShape
+  > {
+  using Scheduler = PersistentTileSchedulerPPU;
+};
+
+template <
+  typename Arch,
+  class TileShape,
+  class ClusterShape
+>
+struct TileSchedulerSelector<
+  cutlass::gemm::SplitKSerialScheduler,
+  Arch,
+  TileShape,
+  ClusterShape
+  > {
+ using Scheduler = PersistentTileSchedulerPPU;
+};
 
 } // namespace cutlass::gemm::kernel::detail
-
-////////////////////////////////////////////////////////////////////////////////

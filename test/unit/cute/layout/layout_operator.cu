@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -100,40 +101,3 @@ TEST(GenericLayout, RowMajor) {
 }
 //////////////////////////////////////////////////////////////////////////
 
-
-/// Swizzle Shared Memory layouts
-
-TEST(GenericLayout, RowMajorTensorOpMultiplicandCrosswise) {
-
-  using GenericLayout = decltype(
-        composition(
-          Swizzle<3,3,3>{},
-          Layout<Shape<_128, _64>, Stride<_64, _1>>{})
-  );
-
-  using Layout = cutlass::layout::RowMajorTensorOpMultiplicandCrosswise<
-      cutlass::sizeof_bits<cutlass::half_t>::value, 64>;
-
-  test::layout::Testbed<GenericLayout, Layout> testbed;
-
-  EXPECT_TRUE(testbed.run());
-}
-//////////////////////////////////////////////////////////////////////////
-
-TEST(GenericLayout, ColumnMajorTensorOpMultiplicandCongruous) {
-
-  using GenericLayout = decltype(
-        composition(
-          Swizzle<3,3,4>{},
-          Layout<Shape<_128, _64>>{})
-  );
-
-  using Layout = cutlass::layout::ColumnMajorTensorOpMultiplicandCongruous<
-    cutlass::sizeof_bits<cutlass::half_t>::value, 64>;
-
-
-  test::layout::Testbed<GenericLayout, Layout> testbed;
-
-  EXPECT_TRUE(testbed.run());
-}
-//////////////////////////////////////////////////////////////////////////

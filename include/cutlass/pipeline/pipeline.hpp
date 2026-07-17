@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,9 +29,20 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "cutlass/pipeline/sm90_pipeline.hpp"
+#include "cute/layout.hpp"
+#include "cute/layout_composed.hpp"  // cute::composition
+#include "cute/swizzle.hpp"             // cute::Swizzle
+#include "cute/swizzle_layout.hpp"      // cute::composition
+#include "cute/util/type_traits.hpp"
+#include "cute/container/array.hpp"
+#include "cute/numeric/integral_constant.hpp"
+
+#include "cutlass/cutlass.h"
+#include "cutlass/arch/barrier.h"
+#include "cutlass/detail/dependent_false.hpp"
 ////////////////////////////////////////////////////////////////////////////////////////////////////

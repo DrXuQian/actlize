@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Command line options for performance test program
 */
@@ -38,7 +40,7 @@
 #include <vector>
 #include <map>
 
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
@@ -55,7 +57,7 @@ namespace profiler {
 class Options {
 public:
 
-  /// Cublas and cuDNN options
+  /// acBLAS and acDNN options
   struct Library {
 
     //
@@ -88,8 +90,8 @@ public:
     /// This is not set by the user, it is set by automatically
     int num_devices;
 
-    /// CUDA Device properties
-    std::vector<cudaDeviceProp> properties;
+    /// Device properties
+    std::vector<hggcDeviceProp> properties;
 
     /// Total memory allocation on each device
     size_t maximum_capacity;

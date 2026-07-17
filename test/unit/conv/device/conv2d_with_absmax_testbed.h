@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -423,7 +424,7 @@ struct TestbedConv2dWithAbsMax {
     return compare_reference(problem_size, alpha, beta);
   }
 
-  /// Returns true if the CUDA device is sufficient to execute the kernel.
+  /// Returns true if the device is sufficient to execute the kernel.
   bool sufficient() const {
     //
     // Determine SMEM requirements and waive if not satisfied
@@ -431,18 +432,18 @@ struct TestbedConv2dWithAbsMax {
 
     size_t smem_size = sizeof(typename Conv::UnderlyingKernel::SharedStorage);
 
-    cudaDeviceProp properties;
+    hggcDeviceProp properties;
     int device_idx;
-    cudaError_t result = cudaGetDevice(&device_idx);
+    hggcError_t result = hggcGetDevice(&device_idx);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDevice() API call failed.");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDevice() API call failed.");
     }
 
-    result = cudaGetDeviceProperties(&properties, device_idx);
+    result = hggcGetDeviceProperties(&properties, device_idx);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProperties() failed");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProperties() failed");
     }
 
     if (properties.sharedMemPerBlockOptin < smem_size) {
@@ -459,10 +460,10 @@ struct TestbedConv2dWithAbsMax {
     ElementCompute beta = ElementCompute(0))
   {
 
-    // Waive test if insufficient CUDA device
+    // Waive test if insufficient device
     if (!sufficient()) {
       if (CUTLASS_TEST_UNIT_ENABLE_WARNINGS) {
-        std::cerr << "Test waived due to insufficient CUDA device." << std::endl;
+        std::cerr << "Test waived due to insufficient device." << std::endl;
       }
       return true;
     }
@@ -517,8 +518,8 @@ struct TestbedConv2dWithAbsMax {
 
     EXPECT_TRUE(status == cutlass::Status::kSuccess) << to_string(status);
 
-    cudaError_t cuda_error = cudaDeviceSynchronize();
-    EXPECT_TRUE(cuda_error == cudaSuccess) << cudaGetErrorString(cuda_error);
+    hggcError_t device_error = hggcDeviceSynchronize();
+    EXPECT_TRUE(device_error == hggcSuccess) << hggcGetErrorString(device_error);
 
     //
     // Verify
@@ -561,7 +562,7 @@ bool TestAllConv2dWithAbsmax(bool scaleA=true, bool scaleB=true, bool scaleC=tru
 
   Conv2dProblemVector const *problem_vectors[] = {
     &conv_test_sizes,                               // run user specified sizes
-    &conv_problems.conv2d_default_sizes,            // run default and cudnn bug sizes
+    &conv_problems.conv2d_default_sizes,            // run default and acdnn bug sizes
     &conv_problems.conv2d_resnet50_sizes,           // run resnet50 sizes
 #if CUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED 
     &conv_problems.conv2d_rigorous_sizes,           // run large and rigorous sizes if enabled

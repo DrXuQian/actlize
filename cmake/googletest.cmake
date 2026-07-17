@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -45,8 +46,5 @@ FetchContent_GetProperties(googletest)
 
 if(NOT googletest_POPULATED)
   FetchContent_Populate(googletest)
-  if (MSVC)
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  endif()
   add_subdirectory(${googletest_SOURCE_DIR} ${googletest_BINARY_DIR} EXCLUDE_FROM_ALL)
 endif()

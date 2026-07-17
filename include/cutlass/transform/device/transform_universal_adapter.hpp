@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
   \brief Transform Kernel Universal adapter
 */
@@ -40,13 +42,12 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/detail/layout.hpp"
 #include "cutlass/detail/mma.hpp"
-#include "cutlass/cuda_host_adapter.hpp"
+#include "cutlass/ppu_host_adapter.hpp"
 
 #include "cutlass/kernel_launch.h"
-#if !defined(__CUDACC_RTC__)
-#include "cutlass/cluster_launch.hpp"
+#if !defined(__HGGCCC_RTC__)
 #include "cutlass/trace.h"
-#endif // !defined(__CUDACC_RTC__)
+#endif // !defined(__HGGCCC_RTC__)
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -62,7 +63,7 @@ public:
   using TransformKernel = GetUnderlyingKernel_t<TransformKernel_>;
   using Arguments = typename TransformKernel::Arguments;
   using Params = typename TransformKernel::Params;
-  static bool const kEnableCudaHostAdapter = CUTLASS_ENABLE_CUDA_HOST_ADAPTER;
+  static bool const kEnableHostAdapter = CUTLASS_ENABLE_HOST_ADAPTER;
 
 
 private:
@@ -113,23 +114,23 @@ public:
   initialize(
     Arguments const& args,
     void* workspace = nullptr,
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter* cuda_adapter = nullptr) {
+    hggcStream_t stream = nullptr,
+    HostAdapter* host_adapter = nullptr) {
 
     CUTLASS_TRACE_HOST("TransformUniversalAdapter::initialize() - workspace "
       << workspace << ", stream: " << (stream ? "non-null" : "null")
-      << ", EnableCudaHostAdapter: " << (kEnableCudaHostAdapter ? "True" : "false"));
+      << ", EnableHostAdapter: " << (kEnableHostAdapter ? "True" : "false"));
 
     // Initialize the workspace
-    Status status = TransformKernel::initialize_workspace(args, workspace, stream, cuda_adapter);
+    Status status = TransformKernel::initialize_workspace(args, workspace, stream, host_adapter);
     if (status != Status::kSuccess) {
       return status;
     }
     // Initialize the Params structure
     params_ = TransformKernel::to_underlying_arguments(args, workspace);
-    // Don't set the function attributes - require the CudaHostAdapter to set it.
-    if constexpr (kEnableCudaHostAdapter) {
-      CUTLASS_ASSERT(cuda_adapter);
+    // Don't set the function attributes - require the HostAdapter to set it.
+    if constexpr (kEnableHostAdapter) {
+      CUTLASS_ASSERT(host_adapter);
       return Status::kSuccess;
     }
     else {
@@ -138,17 +139,17 @@ public:
       //
       int smem_size = TransformKernel::SharedStorageSize;
 
-      CUTLASS_ASSERT(cuda_adapter == nullptr);
+      CUTLASS_ASSERT(host_adapter == nullptr);
 
       if (smem_size >= (48 << 10)) {
         CUTLASS_TRACE_HOST("  Setting smem size to " << smem_size);
-        cudaError_t result = cudaFuncSetAttribute(
+        hggcError_t result = hggcFuncSetAttribute(
             device_kernel<TransformKernel>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            hggcFuncAttributeMaxDynamicSharedMemorySize,
             smem_size);
-        if (cudaSuccess != result) {
-          result = cudaGetLastError(); // to clear the error bit
-          CUTLASS_TRACE_HOST("  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result));
+        if (hggcSuccess != result) {
+          result = hggcGetLastError(); // to clear the error bit
+          CUTLASS_TRACE_HOST("  hggcFuncSetAttribute() returned error: " << hggcGetErrorString(result));
           return Status::kErrorInternal;
         }
       }
@@ -158,8 +159,8 @@ public:
 
   static Status
   run(Params& params,
-      cudaStream_t stream = nullptr,
-      CudaHostAdapter *cuda_adapter = nullptr,
+      hggcStream_t stream = nullptr,
+      HostAdapter *host_adapter = nullptr,
       int32_t kernel_index = 0,
       bool launch_with_pdl = false) {
     CUTLASS_TRACE_HOST("TransformUniversalAdapter::run()");
@@ -176,19 +177,19 @@ public:
       dim3 const cluster = {1,1,1};
       void* kernel_params[] = {&params};
 
-      if constexpr (kEnableCudaHostAdapter) {
+      if constexpr (kEnableHostAdapter) {
         //
-        // Use the cuda host adapter
+        // Use the device host adapter
         //
-        CUTLASS_ASSERT(cuda_adapter);
-        if (cuda_adapter) {
+        CUTLASS_ASSERT(host_adapter);
+        if (host_adapter) {
 
           if (launch_with_pdl) {
             CUTLASS_TRACE_HOST(
-              "TransformUniversalAdapter::run() does not support launching with PDL and a custom cuda adapter.");
+              "TransformUniversalAdapter::run() does not support launching with PDL and a custom device adapter.");
             return Status::kErrorInternal;
           }
-          launch_result = cuda_adapter->launch(grid,
+          launch_result = host_adapter->launch(grid,
                                                cluster,
                                                block,
                                                smem_size,
@@ -202,7 +203,7 @@ public:
         }
       }
       else {
-        CUTLASS_ASSERT(cuda_adapter == nullptr);
+        CUTLASS_ASSERT(host_adapter == nullptr);
         void const* kernel = (void const*) device_kernel<TransformKernel>;
         if constexpr (TransformKernel::ArchTag::kMinComputeCapability == 90) {
           launch_result = ClusterLauncher::launch(
@@ -214,12 +215,12 @@ public:
       launch_result = Status::kSuccess;
       cutlass::arch::synclog_setup();
 
-      if constexpr (kEnableCudaHostAdapter) {
-        CUTLASS_ASSERT(cuda_adapter);
-        if (cuda_adapter) {
+      if constexpr (kEnableHostAdapter) {
+        CUTLASS_ASSERT(host_adapter);
+        if (host_adapter) {
           void* kernel_params[] = {&params};
 
-          launch_result = cuda_adapter->launch(
+          launch_result = host_adapter->launch(
             grid, block, smem_size, stream, kernel_params, 0
           );
 
@@ -229,17 +230,17 @@ public:
         }
       }
       else {
-        CUTLASS_ASSERT(cuda_adapter == nullptr);
+        CUTLASS_ASSERT(host_adapter == nullptr);
         cutlass::kernel_launch<TransformKernel>(grid, block, smem_size, stream, params, launch_with_pdl);
       }
     }
 
-    cudaError_t result = cudaGetLastError();
-    if (cudaSuccess == result && Status::kSuccess == launch_result) {
+    hggcError_t result = hggcGetLastError();
+    if (hggcSuccess == result && Status::kSuccess == launch_result) {
       return Status::kSuccess;
     }
-    else if (cudaSuccess != result) {
-      CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << cudaGetErrorString(result));
+    else if (hggcSuccess != result) {
+      CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << hggcGetErrorString(result));
     }
     else if (Status::kSuccess != launch_result) {
       CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << cutlassGetStatusString(launch_result));
@@ -256,15 +257,15 @@ public:
   run(
     Arguments const& args,
     void* workspace = nullptr,
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr,
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr,
     int32_t kernel_index = 0,
     bool launch_with_pdl = false
   ) {
-    Status status = initialize(args, workspace, stream, cuda_adapter);
+    Status status = initialize(args, workspace, stream, host_adapter);
 
     if (Status::kSuccess == status) {
-      status = run(params_, stream, cuda_adapter, kernel_index, launch_with_pdl);
+      status = run(params_, stream, host_adapter, kernel_index, launch_with_pdl);
     }
     return status;
   }
@@ -274,25 +275,25 @@ public:
   operator()(
     Arguments const& args,
     void* workspace = nullptr,
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr,
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr,
     bool launch_with_pdl = false) {
-    return run(args, workspace, stream, cuda_adapter, 0 /*kernel_index*/, launch_with_pdl);
+    return run(args, workspace, stream, host_adapter, 0 /*kernel_index*/, launch_with_pdl);
   }
 
   /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
   Status
   run(
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr,
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr,
     bool launch_with_pdl = false) {
-    return run(params_, stream, cuda_adapter, 0 /*kernel_index*/, launch_with_pdl);
+    return run(params_, stream, host_adapter, 0 /*kernel_index*/, launch_with_pdl);
   }
 
   /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
   Status
-  operator()(cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, bool launch_with_pdl = false) {
-    return run(params_, stream, cuda_adapter, 0 /*kernel_index*/, launch_with_pdl);
+  operator()(hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, bool launch_with_pdl = false) {
+    return run(params_, stream, host_adapter, 0 /*kernel_index*/, launch_with_pdl);
   }
 };
 

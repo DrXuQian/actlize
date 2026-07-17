@@ -1,5 +1,7 @@
 #################################################################################################
 #
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
+# Copyright (c) 2024, PTG Group Holding Limited. All rights reserved.
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -46,21 +48,9 @@ try:
     raise ImportError("Disabling attempt to import cutlass_library")
   from cutlass_library.library import *
   from cutlass_library.gemm_operation import *
-  from cutlass_library.rank_k_operation import *
-  from cutlass_library.rank_2k_operation import *
-  from cutlass_library.trmm_operation import *
-  from cutlass_library.symm_operation import *
-  from cutlass_library.conv2d_operation import *
-  from cutlass_library.conv3d_operation import *
 except ImportError:
   from library import *
   from gemm_operation import *
-  from rank_k_operation import *
-  from rank_2k_operation import *
-  from trmm_operation import *
-  from symm_operation import *
-  from conv2d_operation import *
-  from conv3d_operation import *
 
 ###################################################################################################
 _LOGGER = logging.getLogger(__name__)
@@ -179,19 +169,19 @@ class EmitOperationKindLibrary:
   """
   Emit the CUTLASS library initialization code for each OperationKind.
   The code is generated in the directory
-  {generated_path}/{operation_kind}/{min_cc}
+  {generated_path}/{operation_kind}/{ppu_arch}
   (e.g., tools/library/generated/gemm/90 in the build directory,
-  for min_cc=90 and OperationKind=Gemm), in the file
-  all_sm{min_cc}_{operation_kind}_operations.cu
-  (e.g., all_sm90_gemm_operations.cu for min_cc=90 and OperationKind=Gemm).
-  The min_cc variable here indicates the minimum GPU architecture version
+  for ppu_arch=ppu0015 and OperationKind=Gemm), in the file
+  all_{ppu_arch}_{operation_kind}_operations.cu
+  (e.g., all_ppu0015_gemm_operations.cu for ppu_arch=ppu0015 and OperationKind=Gemm).
+  The ppu_arch variable here indicates the minimum PPU architecture version
   that the things to be initialized require.
-  For example, min_cc=90 indicates sm90.
+  For example, ppu_arch=ppu0015 indicates PPU1.5.
 
   That file declares several functions in namespace cutlass::library.
   The functions all have this form,
 
-  void initialize_all_sm{min_cc}_{subclass_name}_{extended_name}_operations(Manifest& manifest);
+  void initialize_all_{ppu_arch}_{subclass_name}_{extended_name}_operations(Manifest& manifest);
 
   where extended_name is operation.extended_name() for all the operations
   given to the emit method (which see below).  (All operations for a given
@@ -199,7 +189,7 @@ class EmitOperationKindLibrary:
 
   The file also _defines_ the following function in that namespace.
 
-  void initialize_all_sm{min_cc}__{operation_kind}_operations(Manifest& manifest);
+  void initialize_all_{ppu_arch}__{operation_kind}_operations(Manifest& manifest);
 
   That function calls all of the functions declared in this file.
   Those functions are defined in subdirectories.
@@ -207,19 +197,14 @@ class EmitOperationKindLibrary:
   of what happens in each of those subdirectories.
   """
 
-  def __init__(self, generated_path, min_cc, kind, args):
+  def __init__(self, generated_path, min_cc, ppu_arch, kind, args):
     self.generated_path = generated_path
     self.min_cc = min_cc
+    self.ppu_arch = ppu_arch
     self.kind = kind
     self.args = args
     self.emitters = {
       OperationKind.Gemm: EmitGemmConfigurationLibrary,
-      OperationKind.Conv2d: EmitConv2dConfigurationLibrary,
-      OperationKind.Conv3d: EmitConv3dConfigurationLibrary,
-      OperationKind.RankK: EmitRankKConfigurationLibrary,
-      OperationKind.Rank2K: EmitRank2KConfigurationLibrary,
-      OperationKind.Trmm: EmitTrmmConfigurationLibrary,
-      OperationKind.Symm: EmitSymmConfigurationLibrary
     }
 
     self.header_template ="""
@@ -242,12 +227,12 @@ namespace library {
 //
 // Entry point to construct operations
 //
-void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Manifest &manifest) {
+void initialize_all_${ppu_arch}_${subclass_name}_${operation_name}_operations(Manifest &manifest) {
 """
     self.configuration_prototype_template = "void initialize_${configuration_name}(Manifest &manifest);\n"
     self.configuration_template = "  initialize_${configuration_name}(manifest);\n"
-    self.subclass_call_template = "  initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(manifest);\n"
-    self.subclass_prototype_template = "void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Manifest &manifest);\n"
+    self.subclass_call_template = "  initialize_all_${ppu_arch}_${subclass_name}_${operation_name}_operations(manifest);\n"
+    self.subclass_prototype_template = "void initialize_all_${ppu_arch}_${subclass_name}_${operation_name}_operations(Manifest &manifest);\n"
     self.epilogue_template ="""}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -263,12 +248,13 @@ void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Ma
     _LOGGER.debug(f"***   generated_path: {str(self.generated_path)}")
     _LOGGER.debug(f"***   OperationKindNames[kind]: {OperationKindNames[self.kind]}")
     _LOGGER.debug(f"***   min_cc: {self.min_cc}")
+    _LOGGER.debug(f"***   ppu_arch: {self.ppu_arch}")
 
-    self.operation_path = os.path.join(self.generated_path, OperationKindNames[self.kind], str(self.min_cc))
+    self.operation_path = os.path.join(self.generated_path, OperationKindNames[self.kind], str(self.ppu_arch))
     _LOGGER.debug(f"***   operation_path (directory to make): {str(self.operation_path)}")
     os.makedirs(self.operation_path)
 
-    self.top_level_path = os.path.join(self.operation_path, f"all_sm{self.min_cc}_{OperationKindNames[self.kind]}_operations.cu")
+    self.top_level_path = os.path.join(self.operation_path, f"all_{self.ppu_arch}_{OperationKindNames[self.kind]}_operations.cu")
     _LOGGER.debug(f"***   top_level_path (file to write): {str(self.top_level_path)}")
 
     self.top_level_file = open(self.top_level_path, "w")
@@ -309,8 +295,8 @@ void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Ma
 
       # Open a new top-level file for this sub class
       subclass_top_level_path = os.path.join(
-        subclass_path, f"all_sm{self.min_cc}_{extended_name}_{OperationKindNames[self.kind]}_operations.cu")
-      _LOGGER.debug('***     subclass_top_level_path (min_cc, extended_name, ' +
+        subclass_path, f"all_{self.ppu_arch}_{extended_name}_{OperationKindNames[self.kind]}_operations.cu")
+      _LOGGER.debug('***     subclass_top_level_path (ppu_arch, extended_name, ' +
                     'OperationKind): ' + str(subclass_top_level_path))
 
       self.subclass_files[extended_name] = open(subclass_top_level_path, "w")
@@ -337,7 +323,7 @@ void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Ma
     _LOGGER.debug("*** EmitOperationKindLibrary::__exit__")    
     for subclass_name, subclass_file in sorted(self.subclass_files.items()):
       subclass_cfg = {
-        'min_cc': str(self.min_cc),
+        'ppu_arch': str(self.ppu_arch),
         'subclass_name': subclass_name,
         'operation_name': OperationKindNames[self.kind]
       }
@@ -345,7 +331,7 @@ void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Ma
 
     self.top_level_file.write(
       SubstituteTemplate(self.entry_template, {
-        'min_cc': str(self.min_cc),
+        'ppu_arch': str(self.ppu_arch),
         'subclass_name': '',
         'operation_name': OperationKindNames[self.kind]
       }))
@@ -353,7 +339,7 @@ void initialize_all_sm${min_cc}_${subclass_name}_${operation_name}_operations(Ma
     # Finish and close all subclass files
     for subclass_name, subclass_file in sorted(self.subclass_files.items()):
       subclass_cfg = {
-        'min_cc': str(self.min_cc),
+        'ppu_arch': str(self.ppu_arch),
         'subclass_name': subclass_name,
         'operation_name': OperationKindNames[self.kind]
       }
@@ -503,11 +489,12 @@ class Manifest:
     self.kernel_filter = ''
     self.kernel_filter_list = []
     self.kernel_names = []
-    self.operations_enabled = []
+    # todo: support more PPU native OPs
+    self.operations_enabled = [ OperationKind.Gemm ]
     self.selected_kernels = []
     self.ignore_kernel_names = []
     self.exclude_kernel_names = []
-    self.compute_capabilities = [50,]
+    self.compute_capabilities = [80,]
     self.curr_build_dir = '.'
     self.filter_by_cc = True
 
@@ -517,11 +504,23 @@ class Manifest:
 
       # A common user error is to use commas instead of semicolons.
       if ',' in args.architectures:
-        raise RuntimeError("The list of architectures (CMake option CUTLASS_NVCC_ARCHS) must be semicolon-delimited.\nDon't use commas to separate the architectures; use semicolons.\nYou specified the list as: " + args.architectures)
-      architectures = args.architectures.split(';') if len(args.architectures) else ['50',]
+        raise RuntimeError("The list of architectures (CMake option CUTLASS_PPU_ARCHS) must be semicolon-delimited.\nDon't use commas to separate the architectures; use semicolons.\nYou specified the list as: " + args.architectures)
+      architectures = args.architectures.split(';') if len(args.architectures) else ['80',]
 
+      # The build-side surface uses PPU-neutral identifiers ('ppu0010',
+      # 'ppu0015'). The CMake layer maps those to the legacy numeric
+      # compute_capability strings that the upstream Python kernel template
+      # selection logic still keys on internally (see
+      # CUTLASS_LIBRARY_GENERATOR_ARCHS in the top-level CMakeLists.txt),
+      # so by the time this generator is invoked the value of
+      # args.architectures is already in the numeric form expected below.
+      # We also accept the legacy form directly so out-of-tree consumers
+      # that still feed the old strings keep working. Any 'a' suffix is
+      # stripped to get the numeric compute capability used by template
+      # selection.
       arch_conditional_cc = [
-        '90a', 
+          # legacy arch-conditional identifiers
+          '80a',
       ]
       architectures = [x if x not in arch_conditional_cc else x.split('a')[0] for x in architectures]
 
@@ -531,15 +530,10 @@ class Manifest:
         self.filter_by_cc = False
 
     if args.operations == 'all':
-      self.operations_enabled = []
+      self.operations_enabled = [ OperationKind.Gemm ]
     else:
       operations_list = [
         OperationKind.Gemm
-        , OperationKind.Conv2d
-        , OperationKind.Conv3d
-          , OperationKind.RankK
-          , OperationKind.Trmm
-          , OperationKind.Symm
       ]
       self.operations_enabled = [x for x in operations_list if OperationKindNames[x] in args.operations.split(',')]
 
@@ -561,10 +555,9 @@ class Manifest:
 
     self.operation_count = 0
     self.operations_by_name = {}
-    self.disable_full_archs_compilation = args.disable_full_archs_compilation
     self.is_kernel_filter_set_to_all = args.instantiation_level == "max" and args.kernels != ''
 
-  def get_sm90_instantiation_level(self, pruned_level=0, default_level=111, exhaustive_level=9999):
+  def get_ppu_instantiation_level(self, pruned_level=0, default_level=111, exhaustive_level=9999):
     # Non-negative integer which determines how many kernels are instantiated.
     # 0 = 0000 generates the fewest kernels, 9999 generates all possible combinations.
     # increasing first digit reduces schedule / mixed type pruning,
@@ -617,8 +610,7 @@ class Manifest:
     for cc in self.compute_capabilities:
 
       if cc >= operation.tile_description.minimum_compute_capability and \
-         cc <= operation.tile_description.maximum_compute_capability and \
-         (cc not in SharedMemPerCC or SharedMemPerCC[cc] >= CalculateSmemUsage(operation)):
+         cc <= operation.tile_description.maximum_compute_capability:
 
         enabled = True
         break
@@ -699,7 +691,7 @@ class Manifest:
       # add the configuration
       configuration_name = operation.configuration_name()
 
-      # Split operations by minimum CC
+      # imply ppu arch
       min_cc = operation.arch
 
       if operation.operation_kind not in self.operations.keys():
@@ -731,68 +723,25 @@ class Manifest:
         manifest_file.write(f"    {all_kind_file}\n")
       manifest_file.write(')\n\n')
 
+      if 89 in self.compute_capabilities:
+        ppu_arch = 'ppu0015'
+      elif 80 in self.compute_capabilities:
+        ppu_arch = 'ppu0010'
+      else:
+        ppu_arch = 'ppuxxxx'
+
       for kind in self.operations.keys():
         for min_cc in sorted(self.operations[kind].keys()):
           for subclass in sorted(source_files[kind][min_cc].keys()):
             target_text = SubstituteTemplate("""cutlass_add_cutlass_library(
-      SUFFIX ${kind}_sm${min_cc}_${subclass}
-""", { 'min_cc': str(min_cc), 'kind': OperationKindNames[kind], 'subclass': subclass })
+      SUFFIX ${kind}_${ppu_arch}_${subclass}
+""", { 'ppu_arch': ppu_arch, 'kind': OperationKindNames[kind], 'subclass': subclass })
             manifest_file.write(target_text + '\n\n')
 
             for source_file in source_files[kind][min_cc][subclass]:
               manifest_file.write("    %s\n" % str(source_file.replace('\\', '/')))
 
             manifest_file.write(")\n")
-
-          if self.disable_full_archs_compilation:
-            self.emit_disable_full_archs_compilation(manifest_file, source_files)
-
-  def emit_disable_full_archs_compilation(manifest_file, source_files):
-      def for_hopper(name):
-          pass
-
-      def for_ampere(name):
-          return "16816" in name or \
-                  "16832" in name or \
-                  "16864" in name or \
-                  ("1688" in name and "tf32" in name)
-
-      def for_turing(name):
-          return ("1688" in name and "tf32" not in name) or \
-                  "8816" in name
-
-      def for_volta(name):
-          return "884" in name
-
-      def is_cpp(name):
-          return name.endswith(".cpp")
-
-      def get_src_archs_str_given_requested_cuda_archs(archs, source_file):
-          intersected_archs = archs & set(self.compute_capabilities)
-          if intersected_archs == set():
-              raise RuntimeError(
-                    """
-                    Empty archs set for file {} after taking
-                    the intersection of {} (global requested archs) and
-                    {} (per file requested archs)
-                    """.format(source_file, set(self.compute_capabilities), archs))
-          else:
-              return " ".join(map(str, intersected_archs))
-
-      for min_cc in sorted(source_files.keys()):
-        for source_file in source_files[min_cc]:
-            if is_cpp(source_file):
-                continue # skip because source is cpp
-            elif for_ampere(source_file):
-                archs_str = get_src_archs_str_given_requested_cuda_archs({80, 87, 90}, source_file)
-            elif for_turing(source_file):
-                archs_str = get_src_archs_str_given_requested_cuda_archs({75}, source_file)
-            elif for_volta(source_file):
-                archs_str = get_src_archs_str_given_requested_cuda_archs({70, 72}, source_file)
-            else:
-                raise RuntimeError("Per file archs are not set {}, as there is no rule specified for this file pattern".format(source_file))
-
-            manifest_file.write("cutlass_apply_cuda_gencode_flags({} SM_ARCHS {})\n".format(str(source_file.replace('\\', '/')), archs_str))
 
   #
   def emit(self, target = GeneratorTarget.Library):
@@ -801,7 +750,7 @@ class Manifest:
       GeneratorTarget.Library: EmitOperationKindLibrary
     }
 
-    # Emitters for all operations that fall under a particular kind (e.g., GEMM, Conv2d)
+    # Emitters for all operations that fall under a particular kind (e.g., GEMM)
     kind_emitters = {
       GeneratorTarget.Library: EmitOperationKindAll
     }
@@ -829,9 +778,15 @@ class Manifest:
       for min_cc in self.operations[kind].keys():
         source_files[kind][min_cc] = {}
 
+    if 89 in self.compute_capabilities:
+      ppu_arch = 'ppu0015'
+    elif 80 in self.compute_capabilities:
+      ppu_arch = 'ppu0010'
+    else:
+      ppu_arch = 'ppuxxxx'
     for operation_kind, ops in self.operations.items():
       for min_cc, configurations in sorted(ops.items()):
-        with operation_emitters[target](generated_path, min_cc, operation_kind, self.args) as operation_kind_emitter:
+        with operation_emitters[target](generated_path, min_cc, ppu_arch, operation_kind, self.args) as operation_kind_emitter:
           for configuration_name, operations in configurations.items():
             _LOGGER.info(f"Emitting {configuration_name} with {len(operations)} operation{'' if len(operations) == 1 else 's'}.")
             operation_kind_emitter.emit(configuration_name, operations)
@@ -841,7 +796,7 @@ class Manifest:
               source_files[operation_kind][min_cc][subclass] = []
             source_files[operation_kind][min_cc][subclass].extend(operation_kind_emitter.source_files[subclass])
 
-      # Emit top level all_{gemm, conv2d, ...}_operations.cu files
+      # Emit top level all_{gemm, ...}_operations.cu files
       with kind_emitters[target](generated_path, operation_kind, self.args) as operation_kind_emitter:
         operation_kind_emitter.emit(ops)
 

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,13 +29,20 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
-  \brief Defines structures and helpers to launch CUDA kernels within CUTLASS.
+  \brief Defines structures and helpers to launch device kernels within CUTLASS.
 */
 
 #pragma once
 
-#include <cuda_runtime_api.h>
+// cutlass3 change: the upstream device runtime API header pulls in many
+// internal headers that conflict with hggc_runtime.h, which the PPU compiler
+// implicitly embeds at rtc time
+#if !defined(__HGGCCC__) || !defined(__HGGCCC_RTC__)
+#include <hggc_runtime_api.h>
+#endif
+
 #include "cutlass/cutlass.h"
 #include "cutlass/trace.h"
 #include "cutlass/device_kernel.h" // cutlass::device_kernel
@@ -43,13 +51,13 @@ namespace cutlass {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Structure containing the basic launch configuration of a CUDA kernel.
+/// Structure containing the basic launch configuration of a device kernel.
 struct KernelLaunchConfiguration {
 
-  /// CUDA grid dimensions
+  /// device grid dimensions
   dim3 grid;
 
-  /// CUDA threablock dimensions
+  /// device threablock dimensions
   dim3 block;
 
   /// Bytes of dynamically allocated SMEM in addition to static SMEM
@@ -77,7 +85,7 @@ Status kernel_launch(
     dim3 const grid_dims,
     dim3 const block_dims,
     size_t const smem_size,
-    cudaStream_t cuda_stream,
+    hggcStream_t device_stream,
     const Params &kernel_params,
     bool launch_with_pdl) {
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
@@ -88,46 +96,46 @@ Status kernel_launch(
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
     CUTLASS_TRACE_HOST("cutlass::kernel_launch: No PDL");
 #endif
-    device_kernel<GemmKernel><<<grid_dims, block_dims, smem_size, cuda_stream>>>(kernel_params);
+    device_kernel<GemmKernel><<<grid_dims, block_dims, smem_size, device_stream>>>(kernel_params);
   }
   else {
-#if ((__CUDACC_VER_MAJOR__ >= 12) || ((__CUDACC_VER_MAJOR__ == 11) && (__CUDACC_VER_MINOR__ >= 8)))
+#if ((__HGGCCC_VER_MAJOR__ >= 12) || ((__HGGCCC_VER_MAJOR__ == 11) && (__HGGCCC_VER_MINOR__ >= 8)))
     if constexpr (GemmKernel::ArchTag::kMinComputeCapability < 90) {
-      CUTLASS_TRACE_HOST("  Programmatic dependent launch (PDL) is only supported for SM90.");
+      CUTLASS_TRACE_HOST("  Programmatic dependent launch (PDL) is only supported for PPU0015.");
       return Status::kInvalid;
     }
 
-    cudaLaunchConfig_t config;
-    cudaLaunchAttribute attrs[1];
+    hggcLaunchConfig_t config;
+    hggcLaunchAttribute attrs[1];
 
     config.gridDim = grid_dims;
     config.blockDim = block_dims;
     config.dynamicSmemBytes = smem_size;
-    config.stream = cuda_stream;
+    config.stream = device_stream;
 
     config.attrs = attrs;
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
     config.numAttrs = 1;
 
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
-    CUTLASS_TRACE_HOST("cutlass::kernel_launch: Calling cudaLaunchKernelEx");
+    CUTLASS_TRACE_HOST("cutlass::kernel_launch: Calling hggcLaunchKernelEx");
 #endif
-    cudaError_t launch_result = cudaLaunchKernelEx(&config, &device_kernel<GemmKernel>, kernel_params);
-    if (cudaSuccess != launch_result) {
-      CUTLASS_TRACE_HOST("cutlass::kernel_launch: cudaLaunchKernelEx failed with error: " << cudaGetErrorString(launch_result));
+    hggcError_t launch_result = hggcLaunchKernelEx(&config, &device_kernel<GemmKernel>, kernel_params);
+    if (hggcSuccess != launch_result) {
+      CUTLASS_TRACE_HOST("cutlass::kernel_launch: hggcLaunchKernelEx failed with error: " << hggcGetErrorString(launch_result));
       return Status::kErrorInternal;
     }
 #else
-    CUTLASS_TRACE_HOST("  Programmatic dependent launch (PDL) is only supported starting CUDA 11.8.");
+    CUTLASS_TRACE_HOST("  Programmatic dependent launch (PDL) is only supported starting device 11.8.");
     return Status::kInvalid;
 #endif
   }
 
-  cudaError_t result = cudaGetLastError();
-  if (cudaSuccess == result) {
+  hggcError_t result = hggcGetLastError();
+  if (hggcSuccess == result) {
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
-    CUTLASS_TRACE_HOST("cutlass::kernel_launch: cudaGetLastError reports success");
+    CUTLASS_TRACE_HOST("cutlass::kernel_launch: hggcGetLastError reports success");
 #endif
     return Status::kSuccess;
   }

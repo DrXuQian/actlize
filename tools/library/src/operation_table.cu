@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*
   \file
   \brief Defines a data structure in which a set of functionally equivalent library::Operation
@@ -80,35 +82,6 @@ void OperationTable::append(Manifest const &manifest) {
       GemmPreferenceKey preference_key(cc, alignment);
 
       gemm_operations[functional_key][preference_key].push_back(op);
-    }
-
-    // insert all conv2d or conv3d operation into operation table
-    if (desc.kind == OperationKind::kConv2d || desc.kind == OperationKind::kConv3d) {
-      auto &conv_desc = static_cast<library::ConvDescription const &>(desc);
-
-      ConvFunctionalKey functional_key(
-        conv_desc.provider,
-        conv_desc.conv_kind,
-        conv_desc.A.element,
-        conv_desc.A.layout,
-        conv_desc.B.element,
-        conv_desc.B.layout,
-        conv_desc.C.element,
-        conv_desc.C.layout,
-        conv_desc.tile_description.math_instruction.element_accumulator, 
-        conv_desc.element_epilogue
-      );
-
-      Operation const *op = operation.get();
-
-      int cc = conv_desc.tile_description.minimum_compute_capability;
-
-      ConvPreferenceKey preference_key(cc, conv_desc.iterator_algorithm);
-
-      // insert conv operation to conv2d_operations or conv3d_operations map
-      (desc.kind == OperationKind::kConv2d) ?
-        conv2d_operations[functional_key][preference_key].push_back(op) : 
-        conv3d_operations[functional_key][preference_key].push_back(op);
     }
 
     // insert all reduction operation into operation table

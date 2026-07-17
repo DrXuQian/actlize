@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Template for GEMM performing a reduction over K partitions in parallel.
 */
@@ -78,10 +80,10 @@ template <
     typename ElementAccumulator_ = ElementC_,
     /// Operator class tag
     typename OperatorClass_ = arch::OpClassSimt,
-    /// Tag indicating architecture to tune for.  This is the minimum SM that
+    /// Tag indicating architecture to tune for.  This is the minimum CU that
       /// supports the intended feature. The device kernel can be built
-      /// targeting any SM larger than this number.
-    typename ArchTag_ = arch::Sm70,
+      /// targeting any CU larger than this number.
+    typename ArchTag_ = arch::PPU0010,
     /// Threadblock-level tile size (concept: GemmShape)
     typename ThreadblockShape_ = typename DefaultGemmConfiguration<
         OperatorClass_, ArchTag_, ElementA_, ElementB_, ElementC_,
@@ -331,7 +333,7 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(cudaStream_t stream = nullptr) {
+  Status run(hggcStream_t stream = nullptr) {
 
     //
     // Launch GEMM kernel
@@ -342,17 +344,17 @@ public:
     dim3 grid = threadblock_swizzle.get_grid_shape(gemm_params_.grid_tiled_shape);
     dim3 block(GemmKernel::kThreadCount, 1, 1);
 
-    cudaError_t result;
+    hggcError_t result;
 
     int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
     if (smem_size >= (48 << 10)) {
 
-      result = cudaFuncSetAttribute(
+      result = hggcFuncSetAttribute(
         Kernel<GemmKernel>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        hggcFuncAttributeMaxDynamicSharedMemorySize,
         smem_size);
 
-      if (result != cudaSuccess) {
+      if (result != hggcSuccess) {
         return Status::kErrorInternal;
       }
     }
@@ -360,9 +362,9 @@ public:
     cutlass::arch::synclog_setup();
     Kernel<GemmKernel><<<grid, block, smem_size, stream>>>(gemm_params_);
 
-    result = cudaGetLastError();
+    result = hggcGetLastError();
 
-    if (result != cudaSuccess) {
+    if (result != hggcSuccess) {
       return Status::kErrorInternal;
     }
 
@@ -375,17 +377,17 @@ public:
 
     Kernel<ReductionKernel><<< grid, block, 0, stream >>>(reduction_params_);
 
-    result = cudaGetLastError();
+    result = hggcGetLastError();
 
-    if (result != cudaSuccess) {
+    if (result != hggcSuccess) {
       return Status::kErrorInternal;
     }
 
-    return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
+    return result == hggcSuccess ? Status::kSuccess : Status::kErrorInternal;
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(cudaStream_t stream = nullptr) {
+  Status operator()(hggcStream_t stream = nullptr) {
     return run(stream);
   }
 
@@ -393,7 +395,7 @@ public:
   Status operator()(
     Arguments const &args, 
     void *workspace = nullptr, 
-    cudaStream_t stream = nullptr) {
+    hggcStream_t stream = nullptr) {
     
     Status status = initialize(args, workspace);
     
@@ -423,9 +425,9 @@ template <
     typename ElementAccumulator_,
     /// Operator class tag
     typename OperatorClass_,
-    /// Tag indicating architecture to tune for.  This is the minimum SM that
+    /// Tag indicating architecture to tune for.  This is the minimum CU that
       /// supports the intended feature. The device kernel can be built
-      /// targeting any SM larger than this number.
+      /// targeting any CU larger than this number.
     typename ArchTag_,
     /// Threadblock-level tile size (concept: GemmShape)
     typename ThreadblockShape_,
@@ -601,13 +603,13 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(cudaStream_t stream = nullptr) {
+  Status run(hggcStream_t stream = nullptr) {
 
     return underlying_operator_.run(stream);
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(cudaStream_t stream = nullptr) {
+  Status operator()(hggcStream_t stream = nullptr) {
     return run(stream);
   }
 
@@ -615,7 +617,7 @@ public:
   Status operator()(
     Arguments const &args, 
     void *workspace = nullptr, 
-    cudaStream_t stream = nullptr) {
+    hggcStream_t stream = nullptr) {
     
     Status status = initialize(args, workspace, stream);
     

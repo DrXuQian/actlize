@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*!
   \file
 
@@ -51,7 +53,7 @@
 #include <string>
 #include <cstdint>
 #include <stdexcept>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/library/types.h"
@@ -62,9 +64,6 @@
 #include "cutlass/blas3.h"
 
 #include "cutlass/gemm/gemm.h"
-#include "cutlass/conv/convolution.h"
-#include "cutlass/conv/conv2d_problem_size.h"
-#include "cutlass/conv/conv3d_problem_size.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -101,7 +100,7 @@ public:
     void const *configuration,
     void *host_workspace,
     void *device_workspace = nullptr,
-    cudaStream_t stream = nullptr) const = 0;
+    hggcStream_t stream = nullptr) const = 0;
 
   virtual Status initialize_with_profiler_workspace(
     void const *configuration,
@@ -109,7 +108,7 @@ public:
     void *device_workspace,
     uint8_t **profiler_workspace_ptrs,
     int problem_count,
-    cudaStream_t stream = nullptr) {
+    hggcStream_t stream = nullptr) {
     return Status::kErrorNotSupported;
   }
 
@@ -117,7 +116,7 @@ public:
     void const *arguments,
     void *host_workspace,
     void *device_workspace = nullptr,
-    cudaStream_t stream = nullptr,
+    hggcStream_t stream = nullptr,
     bool launch_with_pdl = false) const = 0;
 
 };
@@ -302,7 +301,7 @@ struct GemmUniversalArguments {
   int64_t batch_stride_D{0};
 
   // Needed for some 3.x kernels
-  int sm_count{0};
+  int cu_count{0};
   library::RasterOrder raster_order{};
   int swizzle_size{1};
 
@@ -426,327 +425,6 @@ struct GemmGroupedArguments {
   void const *beta{nullptr};
   ScalarPointerMode pointer_mode{};
 };
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// OperationKind: kSparseGemm
-//
-
-/// Computes GEMM assuming one of the inputs has 2:4 structured sparsity.
-struct SparseGemmConfiguration {
-
-  GemmUniversalMode mode{GemmUniversalMode::kGemm};
-  gemm::GemmCoord problem_size{};
-  int batch_count{1};         /// number of sparse matrix products in batch
-  int64_t lda{0};             /// leading dimension of A operand
-  int64_t ldb{0};             /// leading dimension of B operand
-  int64_t ldc{0};             /// leading dimension of C operand
-  int64_t ldd{0};             /// leading dimension of D operand
-  int64_t lde{0};             /// leading dimension of E operand (metadata matrix)
-  int64_t batch_stride_A{0};  // stride between matrices
-  int64_t batch_stride_B{0};  // stride between matrices
-  int64_t batch_stride_C{0};  // stride between matrices
-  int64_t batch_stride_D{0};  // stride between matrices
-  int64_t batch_stride_E{0};  // stride between matrices
-};
-
-/// Arguments for sparse GEMMs
-struct SparseGemmArguments {
-  void const *A{nullptr};          /// pointer to A matrix
-  void const *B{nullptr};          /// pointer to B matrix
-  void const *C{nullptr};          /// pointer to C matrix
-  void *D{nullptr};                  /// pointer to D matrix
-  void const *E{nullptr};          /// pointer to E matrix (metadata)
-  void const *alpha{nullptr};      /// pointer to alpha scalar
-  void const *beta{nullptr};       /// pointer to beta scalar
-  ScalarPointerMode pointer_mode{}; /// enumerant indicating whether alpha/beta pointers are host
-                                    ///   or device pointers.
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Configuration for basic Rank K update operations
-//
-// OperationKind: (Syrk, Herk, Syr2k, Her2k)
-// RankKKind:      Universal
-//
-struct RankKConfiguration {
-
-  /// SYRK problem size
-  gemm::GemmCoord problem_size{};
-
-  /// Leading dimension of A matrix
-  int64_t lda{0};
-
-  /// Leading dimension of B matrix
-  int64_t ldb{0};
-
-  /// Leading dimension of C matrix
-  int64_t ldc{0};
-
-  /// Leading dimension of D matrix
-  int64_t ldd{0};
-
-  /// Batch Count
-  int batch_count{1};
-};
-
-/// Arguments for (Syrk, Herk, Syr2k, Her2k)
-struct RankKArguments {
-
-  /// Pointer to A matrix
-  void const *A{nullptr};
-
-  /// Pointer to B matrix (used only for Syr2k and Her2k)
-  void const *B{nullptr};
-
-  /// Pointer to C matrix
-  void const *C{nullptr};
-
-  /// Pointer to D matrix
-  void *D{nullptr};
-
-  /// Host or device pointer to alpha scalar
-  void const *alpha{nullptr};
-
-  /// Host or device pointer to beta scalar
-  void const *beta{nullptr};
-
-  /// Enumerant indicating whether alpha/beta point to host or device memory
-  ScalarPointerMode pointer_mode{};
-
-  int64_t batch_stride_A{0};
-  int64_t batch_stride_B{0};
-  int64_t batch_stride_C{0};
-  int64_t batch_stride_D{0};
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Configuration for basic TRMM operations
-//
-// OperationKind: Trmm
-// TrmmKind:      Universal
-//
-struct TrmmConfiguration {
-
-  /// TRMM problem size
-  gemm::GemmCoord problem_size{};
-
-  /// Leading dimension of A matrix
-  int64_t lda{0};
-
-  /// Leading dimension of B matrix
-  int64_t ldb{0};
-
-  /// Leading dimension of D matrix
-  int64_t ldd{0};
-
-  /// Batch Count
-  int batch_count{1};
-};
-
-/// Arguments for TRMM
-struct TrmmArguments {
-
-  /// Pointer to A matrix
-  void const *A{nullptr};
-
-  /// Pointer to B matrix
-  void const *B{nullptr};
-
-  /// Pointer to D matrix
-  void *D{nullptr};
-
-  /// Host or device pointer to alpha scalar
-  void const *alpha{nullptr};
-
-  /// Host or device pointer to beta scalar
-  void const *beta{nullptr};
-
-  /// Enumerant indicating whether alpha/beta point to host or device memory
-  ScalarPointerMode pointer_mode{};
-
-  int64_t batch_stride_A{0};
-  int64_t batch_stride_B{0};
-  int64_t batch_stride_D{0};
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Configuration for basic SYMM/HEMM update operations
-//
-// OperationKind: (Symm, Hemm)
-// SymmKind:      Universal
-//
-struct SymmConfiguration {
-
-  /// SYMM/HEMM problem size
-  gemm::GemmCoord problem_size{};
-
-  /// Leading dimension of A matrix
-  int64_t lda{0};
-
-  /// Leading dimension of B matrix
-  int64_t ldb{0};
-
-  /// Leading dimension of C matrix
-  int64_t ldc{0};
-
-  /// Leading dimension of D matrix
-  int64_t ldd{0};
-
-  /// Batch Count
-  int batch_count{1};
-};
-
-/// Arguments for (Symm, Hemm)
-struct SymmArguments {
-
-  /// Pointer to A matrix
-  void const *A{nullptr};
-
-  /// Pointer to B matrix
-  void const *B{nullptr};
-
-  /// Pointer to C matrix
-  void const *C{nullptr};
-
-  /// Pointer to D matrix
-  void *D{nullptr};
-
-  /// Host or device pointer to alpha scalar
-  void const *alpha{nullptr};
-
-  /// Host or device pointer to beta scalar
-  void const *beta{nullptr};
-
-  /// Enumerant indicating whether alpha/beta point to host or device memory
-  ScalarPointerMode pointer_mode{};
-
-  int64_t batch_stride_A{0};
-  int64_t batch_stride_B{0};
-  int64_t batch_stride_C{0};
-  int64_t batch_stride_D{0};
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Two dimensional convolution
-//
-// OperationKind: Conv2d
-//
-struct Conv2dConfiguration {
-
-  conv::SplitKMode split_k_mode;
-
-  /// Conv2d problem size
-  //  contains strictly conv2d size (N,H,W,C,K,R,S,P,Q,padding,stride,dilation,mode)
-  //  also includes (split_k_slices, groups)
-  conv::Conv2dProblemSize problem_size{};
-
-  // stride of operand A
-  std::vector<int64_t> stride_a{};
-
-  // stride of operand B
-  std::vector<int64_t> stride_b{};
-
-  // stride of operand C
-  std::vector<int64_t> stride_c{};
-};
-
-
-/// Three dimensional convolution
-//
-// OperationKind: Conv3d
-//
-struct Conv3dConfiguration {
-
-  conv::SplitKMode split_k_mode{};
-
-  /// Conv2d problem size
-  //  contains strictly conv2d size (N,D,H,W,C,K,T,R,S,Z,P,Q,padding,stride,dilation,mode)
-  //  also includes (split_k_slices, groups)
-  conv::Conv3dProblemSize problem_size{};
-
-  /// Layout object for activations tensor
-  layout::TensorNDHWC layout_activations{};
-
-  /// Layout object for filters tensor
-  layout::TensorNDHWC layout_filters{};
-
-  /// Layout object for source tensor
-  layout::TensorNDHWC layout_source{};
-
-  /// Layout object for output tensor
-  layout::TensorNDHWC layout_output{};
-
-  //
-  // Methods
-  //
-
-  // Mapping functions (A,B,C -> activation,filter,output)
-  layout::TensorNDHWC layout_a(library::ConvKind const &conv_kind) const {
-    switch (conv_kind) {
-      case library::ConvKind::kFprop: return layout_activations;
-      case library::ConvKind::kDgrad: return layout_output;
-      case library::ConvKind::kWgrad: return layout_output;
-      default : throw std::runtime_error("Invalid Conv Operator (fprop, dgrad, wgrad)");
-    }
-  }
-
-  layout::TensorNDHWC layout_b(library::ConvKind const &conv_kind) const {
-    switch (conv_kind) {
-      case library::ConvKind::kFprop: return layout_filters;
-      case library::ConvKind::kDgrad: return layout_filters;
-      case library::ConvKind::kWgrad: return layout_activations;
-      default : throw std::runtime_error("Invalid Conv Operator (fprop, dgrad, wgrad)");
-    }
-  }
-
-  layout::TensorNDHWC layout_c(library::ConvKind const &conv_kind) const {
-    switch (conv_kind) {
-      case library::ConvKind::kFprop: return layout_output;
-      case library::ConvKind::kDgrad: return layout_activations;
-      case library::ConvKind::kWgrad: return layout_filters;
-      default : throw std::runtime_error("Invalid Conv Operator (fprop, dgrad, wgrad)");
-    }
-  }
-};
-
-/// Arguments for CONV
-struct ConvArguments {
-
-  /////////////////////////////////////////////////////////
-  /// ImplicitGemm matrices A, B, C, D
-  /////////////////////////////////////////////////////////
-  /// pointer to implicit gemm matrix A
-  void const *A{nullptr};
-
-  /// pointer to implicit gemm matrix B
-  void const *B{nullptr};
-
-  /// pointer to reordered matrix B
-  void const *reordered_B{nullptr};
-
-  /// pointer to implicit gemm matrix C
-  void const *C{nullptr};
-
-  /// pointer to implicit gemm destination matrix D
-  void *D{nullptr};
-
-  /// Host or device pointer to alpha scalar
-  void const *alpha{nullptr};
-
-  /// Host or device pointer to beta scalar
-  void const *beta{nullptr};
-
-  /// Enumerant indicating whether alpha/beta point to host or device memory
-  ScalarPointerMode pointer_mode{};
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Configuration for Reduction operations
 //

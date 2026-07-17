@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/detail/dependent_false.hpp"
@@ -57,7 +59,6 @@ struct StageCountAutoCarveout {
 };
 
 // Used to automatically let the builder pick the kernel schedule.
-// Can be overridden with kernel schedule tags in cutlass/conv/dispatch_policy.hpp
 struct KernelScheduleAuto {};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -88,6 +89,4 @@ struct CollectiveBuilder {
 } // namespace cutlass::conv::collective
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-
-#include "builders/sm90_gmma_builder.inl"
 /////////////////////////////////////////////////////////////////////////////////////////////////

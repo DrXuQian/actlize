@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,11 +29,15 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include <cute/config.hpp>          // CUTE_HOST_DEVICE
 #include <cute/numeric/math.hpp>    // cute::max, cute::min
 #include <cute/numeric/complex.hpp> // cute::conj
+
+#include <cute/util/type_traits.hpp>
+#include <cutlass/tfloat32.h>
 
 /** C++14 <functional> extensions */
 
@@ -286,5 +291,38 @@ auto
 bind(Fn const& fn, Arg const& arg) {
   return bound_fn<Fn,Arg>{fn, arg};
 }
+
+//-----------------------------------------------------------------------------
+// PPU convert
+//-----------------------------------------------------------------------------
+
+CUTLASS_HOST_DEVICE
+static tfloat32_t fp32_to_tf32(uint32_t x) {
+
+  #if defined(__HGGC_ARCH__)
+    asm volatile("ppu.cvt.rtte.tf32.f32 %0, %1;" : "=r"(x) : "r"(x));
+  #else
+    float s = *(reinterpret_cast<float*>(&x));
+    if (std::isfinite(s)) {
+      x += 0x1000u;
+    }
+  #endif
+
+  return tfloat32_t::bitcast(x);
+}
+
+// cutlass3 use unary op for dtype convert, only now mma type
+// gemm config will use this converter to convert to tf32 when input is fp32
+template <class T>
+struct convert;
+
+template <>
+struct convert<cutlass::tfloat32_t> {
+  CUTE_HOST_DEVICE
+  decltype(auto) operator()(cutlass::tfloat32_t &arg) const {
+    arg = fp32_to_tf32(arg.storage);
+    return arg;
+  }
+};
 
 } // end namespace cute

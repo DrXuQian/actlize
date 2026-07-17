@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*
   \file
   \brief Defines a data structure in which a set of functionally equivalent library::Operation
@@ -243,164 +245,6 @@ using GemmOperationFunctionalMap = std::unordered_map<
   GemmFunctionalKeyHasher
 >;
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-//                          Data Structures for Conv Functional Maps
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Tuple uniquely identifying conv2d functional behavior
-struct ConvFunctionalKey {
-  library::Provider provider;
-  library::ConvKind conv_kind;
-  library::NumericTypeID element_A;
-  library::LayoutTypeID layout_A;
-  library::NumericTypeID element_B;
-  library::LayoutTypeID layout_B;
-  library::NumericTypeID element_C;
-  library::LayoutTypeID layout_C;
-  library::NumericTypeID element_accumulator;
-  library::NumericTypeID element_compute;
-
-
-  //
-  // Methods
-  //
-
-  inline
-  ConvFunctionalKey(
-    library::Provider provider = library::Provider::kInvalid,
-    library::ConvKind conv_kind = library::ConvKind::kFprop,
-    library::NumericTypeID element_A = library::NumericTypeID::kF16,
-    library::LayoutTypeID layout_A = library::LayoutTypeID::kTensorNHWC,
-    library::NumericTypeID element_B = library::NumericTypeID::kF16,
-    library::LayoutTypeID layout_B = library::LayoutTypeID::kTensorNHWC,
-    library::NumericTypeID element_C = library::NumericTypeID::kF16,
-    library::LayoutTypeID layout_C = library::LayoutTypeID::kTensorNHWC,
-    library::NumericTypeID element_accumulator = library::NumericTypeID::kF32,
-    library::NumericTypeID element_compute = library::NumericTypeID::kF32
-  ):
-    provider(provider),
-    conv_kind(conv_kind),
-    element_A(element_A),
-    layout_A(layout_A),
-    element_B(element_B),
-    layout_B(layout_B),
-    element_C(element_C),
-    layout_C(layout_C),
-    element_accumulator(element_accumulator),
-    element_compute(element_compute)
-  { }
-
-  inline
-  bool operator==(ConvFunctionalKey const &rhs) const {
-    return
-      (provider == rhs.provider) &&
-      (conv_kind == rhs.conv_kind) &&
-      (element_A == rhs.element_A) &&
-      (layout_A == rhs.layout_A) &&
-      (element_B == rhs.element_B) &&
-      (layout_B == rhs.layout_B) &&
-      (element_C == rhs.element_C) &&
-      (layout_C == rhs.layout_C) &&
-      (element_accumulator == rhs.element_accumulator) &&
-      (element_compute == rhs.element_compute);
-  }
-
-  inline
-  bool operator!=(ConvFunctionalKey const &rhs) const {
-    return !(*this == rhs);
-  }
-};
-/////////////////////////////////////////////////////////////////////////////////////////////////
-inline
-std::ostream& operator<< (std::ostream& out, const cutlass::library::ConvFunctionalKey& key) {
-    out << "{\n"
-      << "provider: " << to_string(key.provider) << std::endl
-      << "conv_kind: " << to_string(key.conv_kind) << std::endl
-      << "element_A: " << to_string(key.element_A) << std::endl
-      << "layout_A: " << to_string(key.layout_A) << std::endl
-      << "element_B: " << to_string(key.element_B) << std::endl
-      << "layout_B: " << to_string(key.layout_B) << std::endl
-      << "element_C: " << to_string(key.element_C) << std::endl
-      << "layout_C: " << to_string(key.layout_C) << std::endl
-      << "element_accumulator: " << to_string(key.element_accumulator) << std::endl
-      << "element_compute: " << to_string(key.element_compute) << std::endl
-      << "}";
-
-  return out;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-struct ConvFunctionalKeyHasher {
-  using IntHash = std::hash<int>;
-
-  inline
-  static size_t rotl(size_t key, int shl) {
-    return (key << shl) | (key >> (sizeof(key)*8u - static_cast<size_t>(shl)));
-  }
-
-  inline
-  size_t operator()(ConvFunctionalKey const &key) const {
-    IntHash hash;
-
-    return
-      rotl(hash(int(key.provider)), 1) ^
-      rotl(hash(int(key.conv_kind)), 2) ^
-      rotl(hash(int(key.element_A)), 3) ^
-      rotl(hash(int(key.layout_A)), 4) ^
-      rotl(hash(int(key.element_B)), 5) ^
-      rotl(hash(int(key.layout_B)), 6) ^
-      rotl(hash(int(key.element_C)), 7) ^
-      rotl(hash(int(key.layout_C)), 8) ^
-      rotl(hash(int(key.element_accumulator)), 9) ^
-      rotl(hash(int(key.element_compute)), 10);
-  }
-};
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Establishes a partial ordering to search for Conv2d operators
-struct ConvPreferenceKey {
-
-  int compute_capability;
-  IteratorAlgorithmID iterator_algorithm;
-
-
-  //
-  // Methods
-  //
-
-  ConvPreferenceKey(): compute_capability(), iterator_algorithm() { }
-
-  ConvPreferenceKey(int cc, IteratorAlgorithmID iterator_algorithm):
-    compute_capability(cc), iterator_algorithm(iterator_algorithm) { }
-
-  bool operator<(ConvPreferenceKey const &rhs) const {
-    return (compute_capability < rhs.compute_capability) ||
-      ((compute_capability == rhs.compute_capability) && (iterator_algorithm < rhs.iterator_algorithm));
-  }
-
-  bool operator==(ConvPreferenceKey const &rhs) const {
-    return (compute_capability == rhs.compute_capability) &&
-          (iterator_algorithm == rhs.iterator_algorithm);
-  }
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Maps minimum compute capability onto a vector of possible operations
-using ConvOperationVectorMap = std::map<
-  ConvPreferenceKey,
-  std::vector<Operation const *>
->;
-
-/// Maps a GemmFunctionalKey onto a vector of Operation * objects expected to be of kind kGemm
-using ConvOperationFunctionalMap = std::unordered_map<
-  ConvFunctionalKey,
-  ConvOperationVectorMap,
-  ConvFunctionalKeyHasher
->;
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-
 /// Tuple uniquely identifying conv2d functional behavior
 struct ReductionFunctionalKey {
   library::Provider provider;
@@ -508,14 +352,6 @@ public:
   /// Map of all operations of type kGemm
   // provider (kCUTLASS)
   GemmOperationFunctionalMap gemm_operations;
-
-  /// Map of all operations of type kConv2d
-  // provider (kCUTLASS, kReferenceHost, kReferenceDevice)
-  ConvOperationFunctionalMap conv2d_operations;
-
-  /// Map of all operations of type kConv3d
-  // provider (kCUTLASS, kReferenceHost, kReferenceDevice)
-  ConvOperationFunctionalMap conv3d_operations;
 
   /// Map of all operations of type kConv2d
   // provider (kCUTLASS)

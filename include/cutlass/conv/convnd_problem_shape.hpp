@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief This file contains definitions and utility functions for describing convolution problem shapes.
 */
@@ -39,7 +41,7 @@
 
 #include "cute/container/array.hpp"
 
-#if ! defined(__CUDACC_RTC__)
+#if ! defined(__HGGCCC_RTC__)
 #include <initializer_list>
 #endif
 
@@ -182,7 +184,7 @@ struct ConvProblemShape {
         groups) {
     }
 
-#if ! defined(__CUDACC_RTC__)
+#if ! defined(__HGGCCC_RTC__)
   // Constructor accepts user facing arguments and computes to stores the corners as its internal state
   ConvProblemShape(
       conv::Mode                     mode,
@@ -310,7 +312,7 @@ struct ConvProblemShape {
     auto [shape_xformed_act, stride_xformed_act] = calculate_xformed_act(shape_act, shape_flt);
     set_shape_stride_ABC(shape_act, stride_act, shape_flt, stride_flt, shape_xformed_act, stride_xformed_act);
   }
-#endif // not defined(__CUDACC_RTC__)
+#endif // not defined(__HGGCCC_RTC__)
 
   // Set shape and stride of tensor A/B/C according to following table:
   // |              | Fprop  | Dgrad  | Wgrad |

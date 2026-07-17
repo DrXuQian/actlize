@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 // common
@@ -35,19 +37,20 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/mma.h"
 #include "cutlass/trace.h"
-#include "cutlass/cluster_launch.hpp"
 #include "cutlass/device_kernel.h"
 
 #include "cutlass/conv/kernel/conv_universal.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/detail/layout.hpp"
-#include "cutlass/cuda_host_adapter.hpp"
+#include "cutlass/ppu_host_adapter.hpp"
 
 ////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::conv::device {
 
 ////////////////////////////////////////////////////////////////////////////////
+
+// todo: support PPU naive tensor op conv on cutlass3
 
 /*!
   ConvUniversalAdapter is a stateful, reusable handle built around a kernel
@@ -72,7 +75,7 @@ public:
   using CollectiveMainloop = typename ConvKernel::CollectiveMainloop;
   using CollectiveEpilogue = typename ConvKernel::CollectiveEpilogue;
 
-  static bool const kEnableCudaHostAdapter = CUTLASS_ENABLE_CUDA_HOST_ADAPTER;
+  static bool const kEnableHostAdapter = CUTLASS_ENABLE_HOST_ADAPTER;
 
   // Tease out meta-information about the conv algorithm
   static constexpr conv::Operator kConvolutionalOperator = DispatchPolicy::ConvOp;
@@ -190,34 +193,34 @@ public:
     int smem_size = ConvKernel::SharedStorageSize;
 
     // first, account for dynamic smem capacity if needed
-    cudaError_t result;
+    hggcError_t result;
     if (smem_size >= (48 << 10)) {
       CUTLASS_TRACE_HOST("  Setting smem size to " << smem_size);
-      result = cudaFuncSetAttribute(
+      result = hggcFuncSetAttribute(
           device_kernel<ConvKernel>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          hggcFuncAttributeMaxDynamicSharedMemorySize,
           smem_size);
-      if (cudaSuccess != result) {
-        result = cudaGetLastError(); // to clear the error bit
+      if (hggcSuccess != result) {
+        result = hggcGetLastError(); // to clear the error bit
         CUTLASS_TRACE_HOST(
-          "  cudaFuncSetAttribute() returned error: "
-          << cudaGetErrorString(result));
+          "  hggcFuncSetAttribute() returned error: "
+          << hggcGetErrorString(result));
         return -1;
       }
     }
 
     // query occupancy after setting smem size
-    result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    result = hggcOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_active_blocks,
         device_kernel<ConvKernel>,
         ConvKernel::MaxThreadsPerBlock,
         smem_size);
 
-    if (cudaSuccess != result) {
-      result = cudaGetLastError(); // to clear the error bit
+    if (hggcSuccess != result) {
+      result = hggcGetLastError(); // to clear the error bit
       CUTLASS_TRACE_HOST(
-        "  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error: "
-        << cudaGetErrorString(result));
+        "  hggcOccupancyMaxActiveBlocksPerMultiprocessor() returned error: "
+        << hggcGetErrorString(result));
       return -1;
     }
 
@@ -230,14 +233,14 @@ public:
   initialize(
     Arguments const& args,
     void* workspace = nullptr,
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr) {
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr) {
 
     CUTLASS_TRACE_HOST("ConvUniversal::initialize() - workspace "
       << workspace << ", stream: " << (stream ? "non-null" : "null"));
 
     // Initialize the workspace
-    Status status = ConvKernel::initialize_workspace(args, workspace, stream, cuda_adapter);
+    Status status = ConvKernel::initialize_workspace(args, workspace, stream, host_adapter);
     if (status != Status::kSuccess) {
       return status;
     }
@@ -245,9 +248,9 @@ public:
     // Initialize the Params structure
     params_ = ConvKernel::to_underlying_arguments(args, workspace);
 
-    // Don't set the function attributes - require the CudaHostAdapter to set it.
-    if constexpr (kEnableCudaHostAdapter) {
-      CUTLASS_ASSERT(cuda_adapter);
+    // Don't set the function attributes - require the HostAdapter to set it.
+    if constexpr (kEnableHostAdapter) {
+      CUTLASS_ASSERT(host_adapter);
       return Status::kSuccess;
     }
     else {
@@ -255,13 +258,13 @@ public:
       int smem_size = ConvKernel::SharedStorageSize;
       if (smem_size >= (48 << 10)) {
         CUTLASS_TRACE_HOST("  Setting smem size to " << smem_size);
-        cudaError_t result = cudaFuncSetAttribute(
+        hggcError_t result = hggcFuncSetAttribute(
             device_kernel<ConvKernel>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            hggcFuncAttributeMaxDynamicSharedMemorySize,
             smem_size);
-        if (cudaSuccess != result) {
-          result = cudaGetLastError(); // to clear the error bit
-          CUTLASS_TRACE_HOST("  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result));
+        if (hggcSuccess != result) {
+          result = hggcGetLastError(); // to clear the error bit
+          CUTLASS_TRACE_HOST("  hggcFuncSetAttribute() returned error: " << hggcGetErrorString(result));
           return Status::kErrorInternal;
         }
       }
@@ -286,7 +289,7 @@ public:
   /// Primary run() entry point API that is static allowing users to create and manage their own params.
   /// Supplied params struct must be construct by calling ConvKernel::to_underling_arguments()
   static Status
-  run(Params& params, cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
+  run(Params& params, hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
     CUTLASS_TRACE_HOST("ConvUniversal::run()");
     dim3 const block = ConvKernel::get_block_shape();
     dim3 const grid = get_grid_shape(params);
@@ -304,14 +307,14 @@ public:
                    cute::size<1>(typename ConvKernel::DispatchPolicy::ClusterShape{}),
                    cute::size<2>(typename ConvKernel::DispatchPolicy::ClusterShape{}));
       void* kernel_params[] = {&params};
-      if constexpr (kEnableCudaHostAdapter) {
+      if constexpr (kEnableHostAdapter) {
         //
-        // Use the cuda host adapter
+        // Use the device host adapter
         //
-        CUTLASS_ASSERT(cuda_adapter);
-        if (cuda_adapter) {
+        CUTLASS_ASSERT(host_adapter);
+        if (host_adapter) {
 
-          launch_result = cuda_adapter->launch(grid,
+          launch_result = host_adapter->launch(grid,
                                                cluster, 
                                                block, 
                                                smem_size, 
@@ -324,7 +327,7 @@ public:
         }
       }
       else {
-        CUTLASS_ASSERT(cuda_adapter == nullptr);
+        CUTLASS_ASSERT(host_adapter == nullptr);
         void const* kernel = (void const*) device_kernel<ConvKernel>;
         if constexpr (ConvKernel::ArchTag::kMinComputeCapability == 90) {
           if constexpr (is_static_1x1x1) {
@@ -332,8 +335,7 @@ public:
             launch_result = Status::kSuccess;
           }
           else {
-            launch_result = ClusterLauncher::launch(
-                grid, cluster, block, smem_size, stream, kernel, kernel_params);
+            launch_result = Status::kSuccess;
           }
         }
       }
@@ -341,12 +343,12 @@ public:
     else {
       launch_result = Status::kSuccess;
 
-      if constexpr (kEnableCudaHostAdapter) {
-        CUTLASS_ASSERT(cuda_adapter);
-        if (cuda_adapter) {
+      if constexpr (kEnableHostAdapter) {
+        CUTLASS_ASSERT(host_adapter);
+        if (host_adapter) {
           void* kernel_params[] = {&params};
 
-          launch_result = cuda_adapter->launch(
+          launch_result = host_adapter->launch(
               grid, block, smem_size, stream, kernel_params, 0
               );
 
@@ -356,13 +358,13 @@ public:
         }
       }
       else {
-        CUTLASS_ASSERT(cuda_adapter == nullptr);
+        CUTLASS_ASSERT(host_adapter == nullptr);
         device_kernel<ConvKernel><<<grid, block, smem_size, stream>>>(params);
       }
     }
 
-    cudaError_t result = cudaGetLastError();
-    if (cudaSuccess == result && Status::kSuccess == launch_result) {
+    hggcError_t result = hggcGetLastError();
+    if (hggcSuccess == result && Status::kSuccess == launch_result) {
       return Status::kSuccess;
     }
     else {
@@ -380,13 +382,13 @@ public:
   run(
     Arguments const& args,
     void* workspace = nullptr,
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr,
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr,
     int32_t kernel_index = 0
   ) {
-    Status status = initialize(args, workspace, stream, cuda_adapter);
+    Status status = initialize(args, workspace, stream, host_adapter);
     if (Status::kSuccess == status) {
-      status = run(params_, stream, cuda_adapter, kernel_index);
+      status = run(params_, stream, host_adapter, kernel_index);
     }
     return status;
   }
@@ -396,20 +398,20 @@ public:
   operator()(
     Arguments const& args,
     void* workspace = nullptr,
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr) {
-    return run(args, workspace, stream, cuda_adapter);
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr) {
+    return run(args, workspace, stream, host_adapter);
   }
 
   /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
   Status
-  run(cudaStream_t stream = nullptr) {
+  run(hggcStream_t stream = nullptr) {
     return run(params_, stream);
   }
 
   /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
   Status
-  operator()(cudaStream_t stream = nullptr) {
+  operator()(hggcStream_t stream = nullptr) {
     return run(params_, stream);
   }
 };

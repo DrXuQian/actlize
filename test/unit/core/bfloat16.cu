@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Statically sized array of elements that accommodates all CUTLASS-supported numeric types
            and is safe to use in a union.
@@ -88,7 +90,7 @@ TEST(bfloat16_t, device_conversion) {
 
   convert_bf16_f32<<< dim3(1,1), dim3(N, 1) >>>(destination.device_data(), source.device_data(), N);
 
-  ASSERT_EQ(cudaGetLastError(), cudaSuccess) << "Kernel launch error.";
+  ASSERT_EQ(hggcGetLastError(), hggcSuccess) << "Kernel launch error.";
 
   destination.sync_host();
 
@@ -111,7 +113,7 @@ TEST(bfloat16_t, device_conversion) {
   
   convert_and_pack_bf16<<< dim3(1,1), dim3(N, 1) >>>(destination.device_data(), source.device_data(), N);
   
-  ASSERT_EQ(cudaGetLastError(), cudaSuccess) << "Kernel launch error.";
+  ASSERT_EQ(hggcGetLastError(), hggcSuccess) << "Kernel launch error.";
   
   destination.sync_host();
 

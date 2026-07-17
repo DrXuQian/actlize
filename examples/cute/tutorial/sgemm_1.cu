@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,18 +29,23 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #include <cstdlib>
 #include <cstdio>
 #include <cassert>
 
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
+#include <vector>
+// NOTE: this header used to depend on thrust::host_vector / thrust::device_vector,
+// but the device toolchain ships an incomplete thrust port. Switch to std::vector
+// for host buffers and cutlass::DeviceAllocation (RAII over the device runtime
+// alloc/free/memcpy entry points) for device buffers.
+#include "cutlass/util/device_memory.h"
 
 #include <cute/tensor.hpp>
 
 #include "cutlass/util/print_error.hpp"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/helper_cuda.hpp"
+#include "cutlass/util/PPU_Clock.hpp"
+#include "cutlass/util/helper_hggc.hpp"
 
 template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class AThreadLayout,
@@ -254,7 +260,7 @@ gemm_nt(int m, int n, int k,
         TB const* B, int ldB,
         Beta beta,
         TC      * C, int ldC,
-        cudaStream_t stream = 0)
+        hggcStream_t stream = 0)
 {
   using namespace cute;
 
@@ -307,7 +313,7 @@ gemm_tn(int m, int n, int k,
         TB const* B, int ldB,
         Beta beta,
         TC      * C, int ldC,
-        cudaStream_t stream = 0)
+        hggcStream_t stream = 0)
 {
   using namespace cute;
 
@@ -358,7 +364,7 @@ gemm(char transA, char transB, int m, int n, int k,
      TB const* B, int ldB,
      Beta beta,
      TC      * C, int ldC,
-     cudaStream_t stream = 0)
+     hggcStream_t stream = 0)
 {
   if (transA == 'N' && transB == 'T') {
     return gemm_nt(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
@@ -407,22 +413,25 @@ int main(int argc, char** argv)
 
   cute::device_init(0);
 
-  thrust::host_vector<TA> h_A(m*k);
-  thrust::host_vector<TB> h_B(n*k);
-  thrust::host_vector<TC> h_C(m*n);
+  std::vector<TA> h_A(m*k);
+  std::vector<TB> h_B(n*k);
+  std::vector<TC> h_C(m*n);
 
   for (int j = 0; j < m*k; ++j) h_A[j] = static_cast<TA>( 2*(rand() / double(RAND_MAX)) - 1 );
   for (int j = 0; j < n*k; ++j) h_B[j] = static_cast<TB>( 2*(rand() / double(RAND_MAX)) - 1 );
   for (int j = 0; j < m*n; ++j) h_C[j] = static_cast<TC>(-1);
 
-  thrust::device_vector<TA> d_A = h_A;
-  thrust::device_vector<TB> d_B = h_B;
-  thrust::device_vector<TC> d_C = h_C;
+  cutlass::DeviceAllocation<TA> d_A(m*k);
+  cutlass::DeviceAllocation<TB> d_B(n*k);
+  cutlass::DeviceAllocation<TC> d_C(m*n);
+  d_A.copy_from_host(h_A.data(), h_A.size());
+  d_B.copy_from_host(h_B.data(), h_B.size());
+  d_C.copy_from_host(h_C.data(), h_C.size());
 
   double gflops = (2.0*m*n*k) * 1e-9;
 
   const int timing_iterations = 100;
-  GPU_Clock timer;
+  PPU_Clock timer;
 
   int ldA = 0, ldB = 0, ldC = m;
 
@@ -442,25 +451,26 @@ int main(int argc, char** argv)
     assert(false);
   }
   // Run once
-  d_C = h_C;
+  d_C.copy_from_host(h_C.data(), h_C.size());
   gemm(transA, transB, m, n, k,
        alpha,
-       d_A.data().get(), ldA,
-       d_B.data().get(), ldB,
+       d_A.get(), ldA,
+       d_B.get(), ldB,
        beta,
-       d_C.data().get(), ldC);
+       d_C.get(), ldC);
   CUTE_CHECK_LAST();
-  thrust::host_vector<TC> cute_result = d_C;
+  std::vector<TC> cute_result(m*n);
+  d_C.copy_to_host(cute_result.data(), cute_result.size());
 
   // Timing iterations
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
     gemm(transA, transB, m, n, k,
          alpha,
-         d_A.data().get(), ldA,
-         d_B.data().get(), ldB,
+         d_A.get(), ldA,
+         d_B.get(), ldB,
          beta,
-         d_C.data().get(), ldC);
+         d_C.get(), ldC);
   }
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();

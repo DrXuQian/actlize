@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Defines profiling functionality for reduction operation
 
@@ -52,9 +54,7 @@
 #include "operation_profiler.h"
 #include "performance_result.h"
 #include "problem_space.h"
-#if CUTLASS_ENABLE_CUDNN
-#include "cudnn_helpers.h"
-#endif //#if CUTLASS_ENABLE_CUDNN
+//todo: need linking acdnn for profiling?
 #include "debug.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
   \brief Helper to construct cached name for
 */
@@ -38,6 +40,7 @@
 #include <list>
 #include <utility>
 #include <sstream>
+#include <vector>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/layout/matrix.h"
@@ -47,8 +50,6 @@
 #include "cutlass/conv/conv3d_problem_size.h"
 #include "cutlass/core_io.h"
 #include "cutlass/util/tensor_view_io.h"
-
-#include "thrust/universal_vector.h"
 
 #ifndef CUTLASS_TEST_ENABLE_CACHED_RESULTS
 #define CUTLASS_TEST_ENABLE_CACHED_RESULTS false
@@ -548,12 +549,12 @@ uint32_t TensorHash(
 
 template <typename Element>
 uint32_t TensorHash(
-  thrust::universal_vector<Element>& tensor,
+  std::vector<Element>& tensor,
   CRC32 const &hash = CRC32(), 
   uint32_t crc = uint32_t()
 ) {
 
-  return hash(tensor.data().get(), tensor.size() * cutlass::sizeof_bits<Element>::value / 8, crc);
+  return hash(tensor.data(), tensor.size() * cutlass::sizeof_bits<Element>::value / 8, crc);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -864,9 +865,9 @@ inline CachedTestKey CreateCachedConvNd3xTestKey(
   ProblemShape const& problem_shape,
   double alpha,
   double beta,
-  thrust::universal_vector<ElementA> A,
-  thrust::universal_vector<ElementB> B,
-  thrust::universal_vector<ElementC> C
+  std::vector<ElementA> A,
+  std::vector<ElementB> B,
+  std::vector<ElementC> C
 ) {
 
   CachedTestKey key;

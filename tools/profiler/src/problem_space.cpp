@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief 
 */
@@ -1002,46 +1004,6 @@ bool arg_as_SplitKModeID(
 }
 
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
-bool arg_as_ConvModeID(
-  library::ConvModeID &conv_mode,
-  KernelArgument::Value const *value_ptr) {
-
-  if (value_ptr->not_null) {
-    if (value_ptr->argument->description->type == ArgumentTypeID::kEnumerated) {
-
-      conv_mode = library::from_string<library::ConvModeID>(
-        static_cast<EnumeratedTypeArgument::EnumeratedTypeValue const *>(value_ptr)->element);
-
-      if (conv_mode == library::ConvModeID::kInvalid) {
-        throw std::runtime_error(
-          "arg_as_ConvModeID() - illegal cast.");
-      }
-    }
-    else {
-
-      throw std::runtime_error(
-        "arg_as_ConvModeID() - illegal cast.");
-    }
-    return true;
-  }
-  return false;
-}
-
-/// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
-bool arg_as_ConvModeID(
-  library::ConvModeID &conv_mode,
-  char const *name,
-  ProblemSpace const &problem_space, 
-  ProblemSpace::Problem const &problem) {
-
-  size_t idx = problem_space.argument_index(name);
-  KernelArgument::Value const *value_ptr = problem.at(idx).get();
-
-  return arg_as_ConvModeID(conv_mode, value_ptr);
-}
-
 /// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
 bool arg_as_ProviderID(
   library::Provider &provider,
@@ -1162,49 +1124,6 @@ bool tensor_description_satisfies(
     return tensor_description_satisfies(
       tensor_desc, 
       static_cast<TensorArgument::TensorValue const *>(value_ptr));
-  }
-  else {
-    throw std::runtime_error("Kernel argument mismatch");
-  }
-
-  return false;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Returns true if conv_kind satisfies the value
-bool conv_kind_satisfies(
-  library::ConvKind const &conv_kind,
-  EnumeratedTypeArgument::EnumeratedTypeValue const *value_ptr) {
-
-  if (value_ptr->not_null) {
-    library::ConvKind conv_kind_cmd_line = 
-      library::from_string<library::ConvKind>(value_ptr->element);
-
-    if (conv_kind_cmd_line != library::ConvKind::kUnknown && 
-      conv_kind_cmd_line != conv_kind) {
-
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/// Returns true if conv_kind satisfies the value
-bool conv_kind_satisfies(
-  library::ConvKind const &conv_kind,
-  char const *name, 
-  ProblemSpace const &problem_space, 
-  ProblemSpace::Problem const &problem) {
-
-  size_t idx = problem_space.argument_index(name);
-  KernelArgument::Value const *value_ptr = problem.at(idx).get();
-
-  if (value_ptr->argument->description->type == ArgumentTypeID::kEnumerated) {
-    return conv_kind_satisfies(
-      conv_kind, 
-      static_cast<EnumeratedTypeArgument::EnumeratedTypeValue const *>(value_ptr));
   }
   else {
     throw std::runtime_error("Kernel argument mismatch");

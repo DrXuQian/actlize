@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -29,43 +30,43 @@
  *
  **************************************************************************************************/
 
-#include <cuda_runtime_api.h>
+#include <hggc_runtime.h>
 
 #include "cutlass_unit_test.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Gets a CUDA device
-cudaDeviceProp GetCudaDevice() {
+/// Gets a device
+hggcDeviceProp GetHggcDevice() {
 
-  cudaError_t err;
+  hggcError_t err;
 
-  int cudaDeviceId;
-  err = cudaGetDevice(&cudaDeviceId);
-  if (cudaSuccess != err) {
-    std::cerr << "*** Error: Could not detect active GPU device ID"
-              << " [" << cudaGetErrorString(err) << "]" << std::endl;
+  int hggcDeviceId;
+  err = hggcGetDevice(&hggcDeviceId);
+  if (hggcSuccess != err) {
+    std::cerr << "*** Error: Could not detect active PPU device ID"
+              << " [" << hggcGetErrorString(err) << "]" << std::endl;
     exit(1);
   }
 
-  cudaDeviceProp deviceProperties;
-  err = cudaGetDeviceProperties(&deviceProperties, cudaDeviceId);
+  hggcDeviceProp deviceProperties;
+  err = hggcGetDeviceProperties(&deviceProperties, hggcDeviceId);
 
   return deviceProperties;
 }
 
 /// Prints device properties
-std::ostream &operator<<(std::ostream &out, cudaDeviceProp const &deviceProperties) {
+std::ostream &operator<<(std::ostream &out, hggcDeviceProp const &deviceProperties) {
 
   int deviceMajorMinor = deviceProperties.major * 10 + deviceProperties.minor;
   if (deviceMajorMinor) {
     int32_t clock_MHz = deviceProperties.clockRate / 1000;
-    out << "GPU(compute_"
+    out << "PPU(compute_"
       << deviceMajorMinor << ", "
-      << deviceProperties.multiProcessorCount << " SMs @ " << clock_MHz << " MHz)";
+      << deviceProperties.multiProcessorCount << " CUs @ " << clock_MHz << " MHz)";
   }
   else {
-    out << "No CUDA device.";
+    out << "No device.";
   }
 
   return out;
@@ -78,20 +79,20 @@ void FilterArchitecture() {
 
   int const kMaxDevice = 999;
 
-  cudaError_t err;
+  hggcError_t err;
 
-  int cudaDeviceId;
-  err = cudaGetDevice(&cudaDeviceId);
-  if (cudaSuccess != err) {
-    std::cerr << "*** Error: Could not detect active GPU device ID"
-              << " [" << cudaGetErrorString(err) << "]" << std::endl;
+  int hggcDeviceId;
+  err = hggcGetDevice(&hggcDeviceId);
+  if (hggcSuccess != err) {
+    std::cerr << "*** Error: Could not detect active PPU device ID"
+              << " [" << hggcGetErrorString(err) << "]" << std::endl;
     exit(1);
   }
-  cudaDeviceProp deviceProperties;
-  err = cudaGetDeviceProperties(&deviceProperties, cudaDeviceId);
-  if (cudaSuccess != err) {
-    std::cerr << "*** Error: Could not get device properties for GPU " << cudaDeviceId << " ["
-              << cudaGetErrorString(err) << "]" << std::endl;
+  hggcDeviceProp deviceProperties;
+  err = hggcGetDeviceProperties(&deviceProperties, hggcDeviceId);
+  if (hggcSuccess != err) {
+    std::cerr << "*** Error: Could not get device properties for PPU " << hggcDeviceId << " ["
+              << hggcGetErrorString(err) << "]" << std::endl;
     exit(1);
   }
 
@@ -110,14 +111,10 @@ void FilterArchitecture() {
     int max_compute_capability;
   } 
   test_filters[] = {
-    { "SM50*",                      50, kMaxDevice},
-    { "SM60*",                      60, kMaxDevice},
-    { "SM61*",                      61, kMaxDevice},
-    { "SM70*",                      70, 75},
-    { "SM75*",                      75, kMaxDevice},
-    { "SM80*",                      80, kMaxDevice},
-    { "SM89*",                      89, 89},
-    { "SM90*",                      90, 90},
+    // distinguish between PPU 1.0/1.5
+    { "PPU0010*",                   80, 80},
+    { "PPU0015*",                   89, 89},
+    { "PPU001x*",                   80, 89},
     { 0, 0, false }
   };
 

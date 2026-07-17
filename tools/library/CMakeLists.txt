@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -38,8 +39,9 @@ set(CUTLASS_BUILD_MONO_LIBRARY OFF CACHE BOOL
 ################################################################################
 
 add_library(cutlass_library_includes INTERFACE)
-add_library(nvidia::cutlass::library::includes ALIAS cutlass_library_includes)
+add_library(cutlass3::library::includes ALIAS cutlass_library_includes)
 set_target_properties(cutlass_library_includes PROPERTIES EXPORT_NAME library::includes)
+# set_target_properties(cutlass_library_includes PROPERTIES COMPILE_FLAGS "-w")
 
 target_include_directories(
   cutlass_library_includes
@@ -57,7 +59,7 @@ target_link_libraries(
 
 install(
   TARGETS cutlass_library_includes
-  EXPORT NvidiaCutlass
+  EXPORT Cutlass3
   )
 
 install(
@@ -66,7 +68,7 @@ install(
   )
 
 add_library(cutlass_library_internal_interface INTERFACE)
-add_library(nvidia::cutlass::library::obj_interface ALIAS cutlass_library_internal_interface)
+add_library(cutlass3::library::obj_interface ALIAS cutlass_library_internal_interface)
 
 target_include_directories(
   cutlass_library_internal_interface
@@ -130,79 +132,63 @@ function(cutlass_add_cutlass_library)
 
   else()
 
-    cutlass_add_library(
-      ${__NAME} 
-      SHARED
-      EXPORT_NAME ${__EXPORT_NAME}
-      ""
-      )
+    # Retrieve the compiled sources (.o files from hgcc + any .cpp) from the
+    # OBJECT library created above.  We cannot use $<TARGET_OBJECTS:...> alone
+    # because CMake's TARGET_OBJECTS only returns objects CMake compiled natively,
+    # NOT external .o files from add_custom_command (which is how hgcc operates).
+    # Strategy: use TARGET_OBJECTS for CMake-compiled .cpp objects, plus the
+    # hgcc .o files retrieved from the SOURCES property.
+    get_target_property(_obj_sources ${__NAME}_objs SOURCES)
+    set(_hgcc_objs)
+    foreach(_s IN LISTS _obj_sources)
+      if (_s MATCHES "\\.o$")
+        list(APPEND _hgcc_objs "${_s}")
+      endif()
+    endforeach()
 
+    # SHARED library: CMake-compiled objects + hgcc device objects.
+    add_library(${__NAME} SHARED $<TARGET_OBJECTS:${__NAME}_objs> ${_hgcc_objs})
+    set_target_properties(${__NAME} PROPERTIES LINKER_LANGUAGE CXX)
+    add_library(cutlass3::${__EXPORT_NAME} ALIAS ${__NAME})
+    set_target_properties(${__NAME} PROPERTIES EXPORT_NAME ${__EXPORT_NAME})
     target_compile_features(${__NAME} INTERFACE cxx_std_17)
-    
-    set_target_properties(
-      ${__NAME}
-      PROPERTIES
-      OUTPUT_NAME ${__OUTPUT_NAME}
-      WINDOWS_EXPORT_ALL_SYMBOLS 1
-      )
-    
-    target_link_libraries(
-      ${__NAME}
+    set_target_properties(${__NAME} PROPERTIES OUTPUT_NAME ${__OUTPUT_NAME})
+    target_link_libraries(${__NAME}
       PUBLIC cutlass_library_includes
-      PRIVATE $<BUILD_INTERFACE:${__NAME}_objs>
-      cuda_driver
-      )
-    
-    set_target_properties(${__NAME} PROPERTIES DEBUG_POSTFIX "${CUTLASS_LIBRARY_DEBUG_POSTFIX}")
-    
-    cutlass_add_library(
-      ${__NAME}_static
-      STATIC
-      EXPORT_NAME ${__EXPORT_NAME}_static
-      ""
-      )
+      PRIVATE ppu_driver)
+    set_target_properties(${__NAME} PROPERTIES
+      DEBUG_POSTFIX "${CUTLASS_LIBRARY_DEBUG_POSTFIX}"
+      COMPILE_FLAGS "-w")
 
+    # STATIC library: same objects.
+    add_library(${__NAME}_static STATIC $<TARGET_OBJECTS:${__NAME}_objs> ${_hgcc_objs})
+    set_target_properties(${__NAME}_static PROPERTIES LINKER_LANGUAGE CXX)
+    add_library(cutlass3::${__EXPORT_NAME}_static ALIAS ${__NAME}_static)
+    set_target_properties(${__NAME}_static PROPERTIES EXPORT_NAME ${__EXPORT_NAME}_static)
     target_compile_features(${__NAME}_static INTERFACE cxx_std_17)
-    
-    if (WIN32)
-      set(STATIC_OUTPUT_NAME ${__OUTPUT_NAME}.static)
-    else()
-      set(STATIC_OUTPUT_NAME ${__OUTPUT_NAME})
-    endif()
-    
-    set_target_properties(
-      ${__NAME}_static
-      PROPERTIES
-      OUTPUT_NAME ${STATIC_OUTPUT_NAME}
-      WINDOWS_EXPORT_ALL_SYMBOLS 1
-      )
-    
-    target_link_libraries(
-      ${__NAME}_static
+    set_target_properties(${__NAME}_static PROPERTIES OUTPUT_NAME ${__OUTPUT_NAME})
+    target_link_libraries(${__NAME}_static
       PUBLIC cutlass_library_includes
-      PRIVATE $<BUILD_INTERFACE:${__NAME}_objs>
-      cuda_driver
-      )
-    
+      PRIVATE ppu_driver)
     set_target_properties(${__NAME}_static PROPERTIES DEBUG_POSTFIX "${CUTLASS_LIBRARY_DEBUG_POSTFIX}")
-    
+
     install(
       TARGETS ${__NAME} ${__NAME}_static
-      EXPORT NvidiaCutlass
+      EXPORT Cutlass3
       RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
       LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
       ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
       )
-    
+
     if (__SUFFIX)
-    
+
       # The partial libraries generated will be registered as linked libraries
       # to the main cutlass library so users automatically get the necessary link
       # commands to pull in all kernels by default.
-    
+
       target_link_libraries(${DEFAULT_NAME} PUBLIC ${__NAME})
       target_link_libraries(${DEFAULT_NAME}_static PUBLIC ${__NAME}_static)
-    
+
     endif()
 
   endif()
@@ -242,11 +228,6 @@ cutlass_add_cutlass_library(
 
   src/reduction/reduction_device.cu
   src/reduction/init_reduction_operations.cu
-  
-  # cutlass conv reference instances in cutlass library
-
-  src/reference/conv2d.cu
-  src/reference/conv3d.cu
 
   )
 
@@ -262,8 +243,6 @@ file(GLOB_RECURSE GENERATOR_PYTHON_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOU
 # auto-instantiation of CUTLASS kernels
 #
 
-# set cutlass generator compiler version to filter kernels in the generator not supported by a specific toolkit. 
-set(CUTLASS_GENERATOR_CUDA_COMPILER_VERSION ${CMAKE_CUDA_COMPILER_VERSION})
 set(CUTLASS_LIBRARY_GENERATED_KERNEL_LIST_FILE ${CMAKE_CURRENT_BINARY_DIR}/generated_kernels.txt CACHE STRING "Generated kernel listing file")
 
 # --log-level is set to DEBUG to enable printing information about which kernels were excluded
@@ -277,14 +256,13 @@ execute_process(
     --build-dir ${PROJECT_BINARY_DIR}
     --curr-build-dir ${CMAKE_CURRENT_BINARY_DIR}
     --generator-target library
-    --architectures "${CUTLASS_NVCC_ARCHS_ENABLED}"
+    --architectures "${CUTLASS_LIBRARY_GENERATOR_ARCHS}"
     --kernels "${CUTLASS_LIBRARY_KERNELS}"
     --instantiation-level "${CUTLASS_LIBRARY_INSTANTIATION_LEVEL}"
     --ignore-kernels "${CUTLASS_LIBRARY_IGNORE_KERNELS}"
     --exclude-kernels "${CUTLASS_LIBRARY_EXCLUDE_KERNELS}"
     --kernel-filter-file "${KERNEL_FILTER_FILE}"
     --selected-kernel-list "${CUTLASS_LIBRARY_GENERATED_KERNEL_LIST_FILE}"
-    --cuda-version "${CUTLASS_GENERATOR_CUDA_COMPILER_VERSION}"
     --log-level DEBUG
     --disable-cutlass-package-imports
   RESULT_VARIABLE cutlass_lib_INSTANCE_GENERATION_RESULT

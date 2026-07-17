@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
   \brief Epilogue for threadblock scoped GEMMs using Tensor Ops.
 
@@ -39,7 +41,7 @@
 
 #pragma once
 
-#include <cuda/std/cassert>
+#include <hggc/std/cassert>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
@@ -422,7 +424,7 @@ public:
     if (!output_op.is_source_needed())
     {
       source_iterator.clear_mask();
-      __syncthreads();  // Dummy (CUDA 11.0)
+      __syncthreads();  // Dummy (device 11.0)
     }
 
     operator()(output_op, destination_iterator, accumulators, SourceAspectNeeded(source_iterator));
@@ -473,12 +475,6 @@ public:
     //
     // Iterate over accumulator tile
     //
-
-    #ifdef __clang__
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wcuda-compat"
-    // Turn off clangs warning about loop unroll argument using parens.
-    #endif
 
     #pragma unroll(IterationsUnroll ? OutputTileIterator::kIterations : 1)
     for (int iter = 0; iter < OutputTileIterator::kIterations; ++iter)
@@ -533,10 +529,6 @@ public:
       destination_iterator.store(output_fragment);
       ++destination_iterator;
     }
-    
-    #ifdef __clang__
-    #pragma clang diagnostic pop
-    #endif
   }
 };
 

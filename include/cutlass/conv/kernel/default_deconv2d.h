@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -83,7 +84,7 @@ template <
 //                            OpClassSimt convolutions 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Defines a kernel for Deconv2d specialization for Analytic IteratorAlgorithm, 
-/// multi-stage pipeline, and FFMA-based mainloop for SM80
+/// multi-stage pipeline, and FFMA-based mainloop for PPU multistage
 
 template <
   typename ElementA,
@@ -312,7 +313,7 @@ struct DefaultDeconv2d <
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Defines a kernel for Deconv2d specialization for Optimized IteratorAlgorithm, 
-/// multi-stage pipeline, and FFMA-based mainloop for SM80
+/// multi-stage pipeline, and FFMA-based mainloop for PPU multistage
 
 template <
   typename ElementA,
@@ -536,7 +537,7 @@ struct DefaultDeconv2d <
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Defines a kernel for Deconv2d specialization for Analytic IteratorAlgorithm, 
-/// 2 stage pipeline, and FFMA-based mainloop for SM50
+/// 2 stage pipeline, and FFMA-based mainloop for PPU two-stage
 template <
   typename ElementA,
   typename LayoutA,
@@ -766,7 +767,7 @@ struct DefaultDeconv2d <
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Defines a kernel for Deconv2d specialization for Optimized IteratorAlgorithm, 
-/// 2 stage pipeline, and FFMA-based mainloop for SM50
+/// 2 stage pipeline, and FFMA-based mainloop for PPU two-stage
 template <
   typename ElementA,
   typename LayoutA,

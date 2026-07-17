@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -33,7 +34,4 @@ else()
   add_custom_target(test_unit)
 endif()
 
-if (CUTLASS_ENABLE_SELF_CONTAINED_INCLUDES_CHECK)
-  add_subdirectory(self_contained_includes)
-endif()
 

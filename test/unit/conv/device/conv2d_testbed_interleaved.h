@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Implicit GEMM testbed
 */
@@ -193,18 +195,18 @@ public:
 
     size_t smem_size = sizeof(typename Conv2d::UnderlyingKernel::SharedStorage);
 
-    cudaDeviceProp properties;
+    hggcDeviceProp properties;
     int device_idx;
-    cudaError_t result = cudaGetDevice(&device_idx);
+    hggcError_t result = hggcGetDevice(&device_idx);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDevice() API call failed.");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDevice() API call failed.");
     }
 
-    result = cudaGetDeviceProperties(&properties, device_idx);
+    result = hggcGetDeviceProperties(&properties, device_idx);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProperties() failed");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProperties() failed");
     }
 
     if (properties.sharedMemPerMultiprocessor < smem_size) {
@@ -221,10 +223,10 @@ public:
     ElementCompute alpha = ElementCompute(1),
     ElementCompute beta = ElementCompute(0)) {
 
-    // Waive test if insufficient CUDA device
+    // Waive test if insufficient device
     if (!sufficient()) {
       if (CUTLASS_TEST_UNIT_ENABLE_WARNINGS) {
-        std::cerr << "Test waived due to insufficient CUDA device." << std::endl;
+        std::cerr << "Test waived due to insufficient device." << std::endl;
       }
       return true;
     }
@@ -392,9 +394,9 @@ public:
       alpha, 
       beta);
 
-    cudaError_t result = cudaDeviceSynchronize();
-    EXPECT_EQ(result, cudaSuccess) << " device reference error: " 
-                                   << cudaGetErrorString(result);
+    hggcError_t result = hggcDeviceSynchronize();
+    EXPECT_EQ(result, hggcSuccess) << " device reference error: " 
+                                   << hggcGetErrorString(result);
 
     // sync host (copy device data to host) for dumping error output in case of mismatches
     tensor_D_reference.sync_host();
@@ -544,7 +546,7 @@ bool TestAllInterleavedConv2d(
 
   Conv2dProblemVector const *problem_vectors[] = {
     &conv_test_sizes,                               // run user specified sizes
-    &conv_problems.conv2d_default_sizes,            // run default and cudnn bug sizes
+    &conv_problems.conv2d_default_sizes,            // run default and acdnn bug sizes
     &conv_problems.conv2d_resnet50_sizes,           // run resnet50 sizes
 #if CUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED 
     &conv_problems.conv2d_rigorous_sizes,           // run large and rigorous sizes if enabled

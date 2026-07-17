@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -403,7 +404,7 @@ struct DefaultConv3dDgrad <
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Defines a kernel for Conv3dDgrad specialization for Optimized IteratorAlgorithm, 
-/// multi-stage pipeline, and FFMA-based mainloop for SM80
+/// multi-stage pipeline, and FFMA-based mainloop for PPU multistage
 
 template <
   typename ElementA,
@@ -618,7 +619,7 @@ struct DefaultConv3dDgrad <
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Defines a kernel for Conv3dDgrad specialization for Optimized IteratorAlgorithm, 
-/// 2 stage pipeline, and FFMA-based mainloop for SM50
+/// 2 stage pipeline, and FFMA-based mainloop for PPU two-stage
 template <
   typename ElementA,
   typename LayoutA,

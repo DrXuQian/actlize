@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,8 +29,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
-    \brief BLAS-like handle used to launch operations on the CUDA device.
+    \brief BLAS-like handle used to launch operations on the device.
 */
 
 #pragma once
@@ -54,11 +56,11 @@ private:
   /// Provider of operations
   Provider provider_;
 
-  /// CUDA device properties
-  cudaDeviceProp device_;
+  /// device properties
+  hggcDeviceProp device_;
 
-  /// CUDA stream
-  cudaStream_t stream_;
+  /// device stream
+  hggcStream_t stream_;
 
   /// Device workspace
   void *workspace_;
@@ -77,7 +79,7 @@ private:
 public:
 
   /// Constructor
-  Handle(cudaStream_t stream = nullptr, size_t workspace_size = (4<<20));
+  Handle(hggcStream_t stream = nullptr, size_t workspace_size = (4<<20));
 
   /// Destructor
   ~Handle();
@@ -95,11 +97,11 @@ public:
   /// Returns compute capability of the selected device
   int compute_capability() const;
 
-  /// Sets the current CUDA stream
-  void set_stream(cudaStream_t stream);
+  /// Sets the current device stream
+  void set_stream(hggcStream_t stream);
 
-  /// Gets the current CUDA stream
-  cudaStream_t get_stream() const;
+  /// Gets the current device stream
+  hggcStream_t get_stream() const;
 
   /// Gets the current provider
   Provider get_provider() const;
@@ -282,8 +284,8 @@ public:
   /// Planar complex GEMM loading pointers from arrays in global memory
   Status gemm_planar_complex_array(
 
-    int expected_M,                           /// Expected GEMM M dimension (used for sizing CUDA grid)
-    int expected_N,                           /// Expected GEMM N dimension (used for sizing CUDA grid)
+    int expected_M,                           /// Expected GEMM M dimension (used for sizing device grid)
+    int expected_N,                           /// Expected GEMM N dimension (used for sizing device grid)
     int expected_K,                           /// Expected GEMM K dimension
     int batch_count,                          /// Number of independent GEMM computations to execute
 
@@ -342,9 +344,7 @@ public:
 using HandlePtr = std::unique_ptr<Handle>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-/// Finds conv2d operation instances with Conv2d::ElementC = Reduction::ElementWorkspace
-Operation const* find_conv_operation_for_parallel_reduction(Operation const *operation);
-/////////////////////////////////////////////////////////////////////////////////////////////////
+
 /// Finds gemm operation instances with ElementC = Reduction::ElementWorkspace
 Operation const* find_gemm_operation_for_parallel_reduction(Operation const *operation);
 /////////////////////////////////////////////////////////////////////////////////////////////////

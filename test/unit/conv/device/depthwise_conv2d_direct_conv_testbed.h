@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Depthwise Direct Conv testbed
 */
@@ -151,18 +153,18 @@ class TestbedDepthwiseDirectConv2d {
     // Determine SMEM requirements and waive if not satisfied
     //
 
-    cudaDeviceProp properties;
+    hggcDeviceProp properties;
     int device_idx;
-    cudaError_t result = cudaGetDevice(&device_idx);
+    hggcError_t result = hggcGetDevice(&device_idx);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDevice() API call failed.");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDevice() API call failed.");
     }
 
-    result = cudaGetDeviceProperties(&properties, device_idx);
+    result = hggcGetDeviceProperties(&properties, device_idx);
 
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProperties() failed");
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProperties() failed");
     }
 
     if (properties.sharedMemPerBlockOptin < static_cast<size_t>(smem_size)) {
@@ -211,22 +213,22 @@ class TestbedDepthwiseDirectConv2d {
     cutlass::Status status = conv2d_op.can_implement(problem_size);
 
     if (status != cutlass::Status::kSuccess) {
-      cudaError_t error = cudaGetLastError();
-      std::cerr << "This test is not supported: " << cudaGetErrorString(error) << "\n";
+      hggcError_t error = hggcGetLastError();
+      std::cerr << "This test is not supported: " << hggcGetErrorString(error) << "\n";
       return true;
     }
 
     status = conv2d_op.initialize(conv2d_args, workspace.get());
 
     if (status != cutlass::Status::kSuccess) {
-      cudaError_t error = cudaGetLastError();
-      std::cerr << "This test is not supported: " << cudaGetErrorString(error) << "\n";
+      hggcError_t error = hggcGetLastError();
+      std::cerr << "This test is not supported: " << hggcGetErrorString(error) << "\n";
       return true;
     }
 
     if (!sufficient(conv2d_op.get_smem_size())) {
       if (CUTLASS_TEST_UNIT_ENABLE_WARNINGS) {
-        std::cerr << "Test waived due to insufficient CUDA device." << std::endl;
+        std::cerr << "Test waived due to insufficient device." << std::endl;
       }
       return true;
     }
@@ -242,8 +244,8 @@ class TestbedDepthwiseDirectConv2d {
 
     bool passed = false;
 
-    cudaError_t result = cudaDeviceSynchronize();
-    EXPECT_EQ(result, cudaSuccess) << " device reference error: " << cudaGetErrorString(result);
+    hggcError_t result = hggcDeviceSynchronize();
+    EXPECT_EQ(result, hggcSuccess) << " device reference error: " << hggcGetErrorString(result);
 
     tensor_D_computed.sync_host();
 

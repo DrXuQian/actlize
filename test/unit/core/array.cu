@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Statically sized array of elements that accommodates all CUTLASS-supported numeric types
            and is safe to use in a union.
@@ -125,8 +127,8 @@ public:
 
     test::core::test_array_clear<<< grid, block >>>(output.get());
 
-    cudaError_t result = cudaDeviceSynchronize();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    hggcError_t result = hggcDeviceSynchronize();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     //
     // Verify contains all zeros
@@ -134,8 +136,8 @@ public:
 
     cutlass::device_memory::copy_to_host(output_host.data(), output.get(), kThreads);
 
-    result = cudaGetLastError();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    result = hggcGetLastError();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     char const *ptr_host = reinterpret_cast<char const *>(output_host.data());
     for (size_t i = 0; i < sizeof(ArrayTy) * kThreads; ++i) {
@@ -148,13 +150,13 @@ public:
 
     test::core::test_array_threadid<<< grid, block >>>(output.get());
 
-    result = cudaDeviceSynchronize();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    result = hggcDeviceSynchronize();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     cutlass::device_memory::copy_to_host(output_host.data(), output.get(), kThreads);
 
-    result = cudaGetLastError();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    result = hggcGetLastError();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     for (int i = 0; i < kThreads; ++i) {
       T tid = T(i);
@@ -183,13 +185,13 @@ public:
 
     test::core::test_array_sequence<<< grid, block >>>(output.get());
 
-    result = cudaDeviceSynchronize();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    result = hggcDeviceSynchronize();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     cutlass::device_memory::copy_to_host(output_host.data(), output.get(), kThreads);
 
-    result = cudaGetLastError();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    result = hggcGetLastError();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     for (int i = 0; i < kThreads; ++i) {
 
@@ -228,7 +230,7 @@ TEST(Array, Int32x4) {
   TestArray<int, 4>().run();
 }
 
-#if __CUDA_ARCH__ >= 520
+#if __HGGC_ARCH__ >= 100
 TEST(Array, Float16x8) {
   TestArray<cutlass::half_t, 8>().run();
 }

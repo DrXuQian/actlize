@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #include "../common/cutlass_unit_test.h"
 
 #include "cutlass/util/device_rmsnorm.h"
@@ -69,6 +71,11 @@ void rmsnorm_host(cutlass::MatrixCoord tensor_size,
 }
 
 void run_test(int M, int N) {
+  // Wrap the body so any std::exception (typically a device_exception
+  // thrown from device_memory::allocate when a previous test left a
+  // sticky device error) surfaces with a readable message instead of
+  // the bare GoogleTest "std::exception" placeholder.
+  try {
   cutlass::HostTensor<ElementType, Layout> input, output_ref, output, weight;
   input.reset({M, N});
   output.reset({M, N});
@@ -113,6 +120,10 @@ void run_test(int M, int N) {
   EXPECT_TRUE(max_abs_diff < 0.001f && mean_abs_diff < 0.001f)
     << "Max absolute difference  : " << max_abs_diff << "\n"
     << "Mean absolute difference: " << mean_abs_diff;
+  } catch (std::exception const& e) {
+    FAIL() << "RMSNorm run_test(M=" << M << ", N=" << N
+           << ") threw std::exception: " << e.what();
+  }
 }
 
 TEST(RMSNorm, 16x1024) {

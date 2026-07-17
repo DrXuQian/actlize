@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*!
   \file
 
@@ -57,68 +59,25 @@ namespace library {
 
 template <typename ArchTag, typename OperatorClass> struct ArchMap;
 
-template <> struct ArchMap<arch::Sm50, arch::OpClassSimt> {
-  static int const kMin = 50;
-  static int const kMax = 1024;
-};
-
-template <> struct ArchMap<arch::Sm60, arch::OpClassSimt> {
-  static int const kMin = 60;
-  static int const kMax = 1024;
-};
-
-template <> struct ArchMap<arch::Sm61, arch::OpClassSimt> {
-  static int const kMin = 61;
-  static int const kMax = 1024;
-};
-
-template <> struct ArchMap<arch::Sm70, arch::OpClassWmmaTensorOp> {
-  static int const kMin = 70;
-  static int const kMax = 1024;
-};
-
-template <> struct ArchMap<arch::Sm70, arch::OpClassTensorOp> {
-  static int const kMin = 70;
-  static int const kMax = 75;
-};
-
-template <typename OperatorClass> struct ArchMap<arch::Sm75, OperatorClass> {
-  static int const kMin = 75;
-  static int const kMax = 1024;
-};
-
-template <typename OperatorClass> struct ArchMap<arch::Sm80, OperatorClass> {
+template <typename OperatorClass> struct ArchMap<arch::PPU0010, OperatorClass> {
   static int const kMin = 80;
   static int const kMax = 1024;
 };
 
-template <typename OperatorClass> struct ArchMap<arch::Sm86, OperatorClass> {
-  static int const kMin = 86;
+template <> struct ArchMap<arch::PPU0010, arch::OpClassTensorOp> {
+  static int const kMin = 80;
+  static int const kMax = 80;
+};
+
+template <typename OperatorClass> struct ArchMap<arch::PPU0015, OperatorClass> {
+  static int const kMin = 89;
   static int const kMax = 1024;
 };
 
-template <typename OperatorClass> struct ArchMap<arch::Sm89, OperatorClass> {
+template <> struct ArchMap<arch::PPU0015, arch::OpClassTensorOp> {
   static int const kMin = 89;
   static int const kMax = 89;
 };
-
-template <typename OperatorClass> struct ArchMap<arch::Sm90, OperatorClass> {
-  static int const kMin = 90;
-  static int const kMax = 1024;
-};
-
-// Arch conditional WGMMA
-template <> struct ArchMap<arch::Sm90, arch::OpClassTensorOp> {
-  static int const kMin = 90;
-  static int const kMax = 90;
-};
-
-// Arch conditional sparse WGMMA
-template <> struct ArchMap<arch::Sm90, arch::OpClassSparseTensorOp> {
-  static int const kMin = 90;
-  static int const kMax = 90;
-};
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace library

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -63,7 +64,7 @@ struct Type2 {};
 
 } // end namespace (anonymous)
 
-TEST(LibcudacxxNext, DependentBoolValue)
+TEST(LibhggccxxNext, DependentBoolValue)
 {
   CUTLASS_TRACE_HOST("-------------------------------");
   CUTLASS_TRACE_HOST("dependent_bool_value");
@@ -75,7 +76,7 @@ TEST(LibcudacxxNext, DependentBoolValue)
   test_dependent_bool_value<Type0, int, float, Type1, float, int, Type2>();
 }
 
-TEST(LibcudacxxNext, DependentFalse)
+TEST(LibhggccxxNext, DependentFalse)
 {
   CUTLASS_TRACE_HOST("-------------------------------");
   CUTLASS_TRACE_HOST("dependent_false");

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -49,6 +50,7 @@ namespace cutlass {
 namespace gemm {
 namespace kernel {
 
+// PPU uses SIMT as fallback plan
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <

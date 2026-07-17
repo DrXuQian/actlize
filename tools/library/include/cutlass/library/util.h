@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*!
   \file
 
@@ -57,15 +59,6 @@ template <> Provider from_string<Provider>(std::string const &str);
 
 /// Converts a GemmKind enumerant to a string
 char const *to_string(GemmKind type, bool pretty = false);
-
-/// Converts a RankKKind enumerant to a string
-char const *to_string(RankKKind type, bool pretty = false);
-
-/// Converts a TrmmKind enumerant to a string
-char const *to_string(TrmmKind type, bool pretty = false);
-
-/// Converts a SymmKind enumerant to a string
-char const *to_string(SymmKind type, bool pretty = false);
 
 /// Converts a SideMode enumerant to a string
 char const *to_string(SideMode type, bool pretty = false);
@@ -149,26 +142,12 @@ char const *to_string(SplitKMode split_k_mode, bool pretty = false);
 template <>
 SplitKMode from_string<SplitKMode>(std::string const &str);
 
-/// Converts a ConvModeID enumerant to a string
-char const *to_string(ConvModeID type, bool pretty = false);
-
-/// Converts a ConvModeID enumerant from a string
-template <>
-ConvModeID from_string<ConvModeID>(std::string const &str);
-
 /// Converts a IteratorAlgorithmID enumerant to a string
 char const *to_string(IteratorAlgorithmID type, bool pretty = false);
 
 /// Converts a IteratorAlgorithmID enumerant from a string
 template <>
 IteratorAlgorithmID from_string<IteratorAlgorithmID>(std::string const &str);
-
-/// Converts a ConvKind enumerant to a string
-char const *to_string(ConvKind type, bool pretty = false);
-
-/// Converts a ConvKind enumerant from a string
-template <>
-ConvKind from_string<ConvKind>(std::string const &str);
 
 /// Converts a RasterOrder enumerant to a string
 char const *to_string(RasterOrder type, bool pretty = false);

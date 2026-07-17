@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Template for device-level Implicit GEMM Convolution
 */
@@ -39,7 +41,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/device_kernel.h"
 #include "cutlass/conv/convolution.h"
-#include "cutlass/cuda_host_adapter.hpp"
+#include "cutlass/ppu_host_adapter.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -81,7 +83,7 @@ public:
   static cutlass::conv::StrideSupport const kStrideSupport = UnderlyingKernel::kStrideSupport;
   static cutlass::conv::GroupMode const kGroupMode = UnderlyingKernel::kGroupMode;
 
-  static bool const kEnableCudaHostAdapter = CUTLASS_ENABLE_CUDA_HOST_ADAPTER;
+  static bool const kEnableHostAdapter = CUTLASS_ENABLE_HOST_ADAPTER;
 
   static int const kWarpCount = 
     (ThreadblockShape::kM / WarpShape::kM) * 
@@ -231,8 +233,8 @@ public:
   Status initialize(
     Arguments const &args, 
     void *workspace = nullptr, 
-    cudaStream_t stream = nullptr,
-    CudaHostAdapter *cuda_adapter = nullptr) {
+    hggcStream_t stream = nullptr,
+    HostAdapter *host_adapter = nullptr) {
    
     if (args.problem_size.split_k_slices > 1) {
 
@@ -240,9 +242,9 @@ public:
         return Status::kErrorWorkspaceNull;
       }
 
-      cudaError_t status = cudaMemsetAsync(workspace, 0, get_workspace_size(args), stream);
+      hggcError_t status = hggcMemsetAsync(workspace, 0, get_workspace_size(args), stream);
 
-      if (status != cudaSuccess) {
+      if (status != hggcSuccess) {
         return Status::kErrorInternal;
       }
     }
@@ -253,19 +255,19 @@ public:
     	static_cast<int *>(workspace)
     );
 
-    if constexpr (kEnableCudaHostAdapter) {
-      CUTLASS_ASSERT(cuda_adapter);
+    if constexpr (kEnableHostAdapter) {
+      CUTLASS_ASSERT(host_adapter);
       return Status::kSuccess;
     }
     else {
       int smem_size = int(sizeof(typename UnderlyingKernel::SharedStorage));
   
       if (smem_size >= (48 << 10)) {
-        cudaError_t result = cudaFuncSetAttribute(cutlass::Kernel<UnderlyingKernel>,
-                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+        hggcError_t result = hggcFuncSetAttribute(cutlass::Kernel<UnderlyingKernel>,
+                                      hggcFuncAttributeMaxDynamicSharedMemorySize,
                                       smem_size);
   
-        if (result != cudaSuccess) {
+        if (result != hggcSuccess) {
           return Status::kErrorInternal;
         }
       }
@@ -289,7 +291,7 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
+  Status run(hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
 
 
     ThreadblockSwizzle threadblock_swizzle;
@@ -300,15 +302,15 @@ public:
     int smem_size = int(sizeof(typename UnderlyingKernel::SharedStorage));
     cutlass::Status launch_result = cutlass::Status::kSuccess ;
 
-    if constexpr (kEnableCudaHostAdapter) {
+    if constexpr (kEnableHostAdapter) {
         //
-        // Use the cuda host adapter
+        // Use the device host adapter
         //
-        CUTLASS_ASSERT(cuda_adapter);
-        if (cuda_adapter) {
+        CUTLASS_ASSERT(host_adapter);
+        if (host_adapter) {
 
           void* kernel_params[] = {&params_};
-          launch_result = cuda_adapter->launch(
+          launch_result = host_adapter->launch(
               grid, dim3(1,1,1), block, smem_size, stream, kernel_params, kernel_index
               );
         }
@@ -321,8 +323,8 @@ public:
       cutlass::Kernel<UnderlyingKernel><<<grid, block, smem_size, stream>>>(params_);      
     }
 
-    cudaError_t result = cudaGetLastError();
-    if (cudaSuccess == result && Status::kSuccess == launch_result) {
+    hggcError_t result = hggcGetLastError();
+    if (hggcSuccess == result && Status::kSuccess == launch_result) {
       return Status::kSuccess;
     }
     else {
@@ -332,20 +334,20 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status operator()(cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
-    return run(stream, cuda_adapter, kernel_index);
+  Status operator()(hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
+    return run(stream, host_adapter, kernel_index);
   }
 
   /// Runs the kernel using initialized state.
   Status operator()(
     Arguments const &args, 
     void *workspace = nullptr, 
-    cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
+    hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
     
-    Status status = initialize(args, workspace, stream, cuda_adapter);
+    Status status = initialize(args, workspace, stream, host_adapter);
     
     if (status == Status::kSuccess) {
-      status = run(stream, cuda_adapter, kernel_index);
+      status = run(stream, host_adapter, kernel_index);
     }
 
     return status;

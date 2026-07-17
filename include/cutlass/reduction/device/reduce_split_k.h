@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
   \brief Kernel performing a reduction over densely packed tensors in global memory
 */
@@ -36,7 +38,7 @@
 
 #include "cutlass/device_kernel.h"
 #include "cutlass/reduction/kernel/reduce_split_k.h"
-#include "cutlass/cuda_host_adapter.hpp"
+#include "cutlass/ppu_host_adapter.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -65,7 +67,7 @@ public:
 
   using StrideIndex = typename ReductionKernel::StrideIndex;
 
-  static bool const kEnableCudaHostAdapter = CUTLASS_ENABLE_CUDA_HOST_ADAPTER;
+  static bool const kEnableHostAdapter = CUTLASS_ENABLE_HOST_ADAPTER;
 
   /// Argument structure
   struct Arguments {
@@ -145,7 +147,7 @@ public:
   Status initialize(
     Arguments const &args, 
     void *workspace = nullptr, 
-    cudaStream_t stream = nullptr) {
+    hggcStream_t stream = nullptr) {
     
     // initialize the params structure from the arguments
     params_ = typename ReductionKernel::Params(
@@ -177,7 +179,7 @@ public:
   }
 
   /// Runs the kernel using initialized state.
-  Status run(cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
+  Status run(hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
 
     //
     // Launch reduction kernel
@@ -185,11 +187,11 @@ public:
     dim3 block = ReductionKernel::block_shape();
     dim3 grid = ReductionKernel::grid_shape(params_.problem_size);
 
-    if constexpr (kEnableCudaHostAdapter) {
-        CUTLASS_ASSERT(cuda_adapter);
-        if (cuda_adapter) {
+    if constexpr (kEnableHostAdapter) {
+        CUTLASS_ASSERT(host_adapter);
+        if (host_adapter) {
           void* kernel_params[] = {&params_};
-          cuda_adapter->launch(
+          host_adapter->launch(
               grid, dim3(1,1,1), block, 0, stream, kernel_params, kernel_index);
         }
     }
@@ -198,26 +200,26 @@ public:
       Kernel<ReductionKernel><<< grid, block, 0, stream >>>(params_);
     }
 
-    cudaError_t result = cudaGetLastError();
-    return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
+    hggcError_t result = hggcGetLastError();
+    return result == hggcSuccess ? Status::kSuccess : Status::kErrorInternal;
   }
 
 
   /// Runs the kernel using initialized state.
-  Status operator()(cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
-    return run(stream, cuda_adapter, kernel_index);
+  Status operator()(hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
+    return run(stream, host_adapter, kernel_index);
   }
 
   /// Runs the kernel using initialized state.
   Status operator()(
     Arguments const &args, 
     void *workspace = nullptr, 
-    cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr, int32_t kernel_index = 0) {
+    hggcStream_t stream = nullptr, HostAdapter *host_adapter = nullptr, int32_t kernel_index = 0) {
     
     Status status = initialize(args, workspace, stream);
     
     if (status == Status::kSuccess) {
-      status = run(stream,cuda_adapter, kernel_index);
+      status = run(stream,host_adapter, kernel_index);
     }
 
     return status;

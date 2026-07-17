@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Execution environment
 */
@@ -195,7 +197,7 @@ public:
   /// Capacity of allocation in bytes
   size_t bytes() const;
 
-  /// Initializes a device allocation to a random distribution using cuRAND
+  /// Initializes a device allocation to a random distribution using acRAND
   void initialize_random_device(int seed, Distribution dist);
 
   /// Initializes a host allocation to a random distribution using std::cout
@@ -206,12 +208,6 @@ public:
 
   /// Initializes a host allocation to a sequential distribution
   void initialize_sequential_host(Distribution dist);
-
-  /// Initializes a device allocation to a random distribution using cuRAND
-  void initialize_random_sparsemeta_device(int seed, int MetaSizeInBits);
-
-  /// Initializes a host allocation to a random distribution using std::cout
-  void initialize_random_sparsemeta_host(int seed, int MetaSizeInBits);
 
   /// Uniformly fills a tensor with a value when provided o.w. zero
   void fill_device(double value);
@@ -233,7 +229,7 @@ public:
 
 private:
   /// A wrapper that sets the device, performs malloc, and sets back
-  cudaError_t malloc(void** ptr, size_t size);
+  hggcError_t malloc(void** ptr, size_t size);
 };
 
 using DeviceAllocationList = std::list<DeviceAllocation>;

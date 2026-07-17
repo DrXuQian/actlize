@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,14 +29,15 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*!
     \file
     \brief Defines a proxy class for storing Tensor Float 32 data type.
 */
 #pragma once
 
-#if defined(__CUDACC_RTC__)
-#include "cutlass/floating_point_nvrtc.h"
+#if defined(__HGGCCC_RTC__)
+#include "cutlass/floating_point_hgrtc.h"
 #else
 #include <cmath>
 #include <limits>
@@ -65,7 +67,7 @@ struct alignas(4) tfloat32_t {
   private:
     CUTLASS_HOST_DEVICE
     static uint32_t float_to_storage(float s) {
-  #if defined(__CUDA_ARCH__)
+  #if defined(__HGGC_ARCH__)
       uint32_t result = reinterpret_cast<uint32_t const &>(s);
   #else
       uint32_t result;
@@ -88,7 +90,7 @@ struct alignas(4) tfloat32_t {
   static tfloat32_t round_half_ulp_truncate(float const &s) {
     uint32_t x = float_to_storage(s);
 
-    #if defined(__CUDA_ARCH__)
+    #if defined(__HGGC_ARCH__)
     if (::isfinite(s)) {
       x += 0x1000u;
     }
@@ -115,7 +117,7 @@ struct alignas(4) tfloat32_t {
   CUTLASS_HOST_DEVICE
   explicit tfloat32_t(int x) {
     float flt = static_cast<float>(x);
-    #if defined(__CUDA_ARCH__)
+    #if defined(__HGGC_ARCH__)
     storage = reinterpret_cast<uint32_t const &>(flt);
     #else
     std::memcpy(&storage, &flt, sizeof(storage));
@@ -130,7 +132,7 @@ struct alignas(4) tfloat32_t {
     // of the mantissa.
     unsigned bits = (storage & ~0x1fffu);
 
-    #if defined(__CUDA_ARCH__)
+    #if defined(__HGGC_ARCH__)
     return reinterpret_cast<float const &>(bits);
     #else
     float flt;
@@ -212,7 +214,7 @@ bool isfinite(cutlass::tfloat32_t const& h) {
 
 CUTLASS_HOST_DEVICE
 cutlass::tfloat32_t nan_tf32(const char*) {
-  // NVIDIA canonical NaN
+  // device canonical NaN
   return cutlass::tfloat32_t::bitcast(0x7fffffff);
 }
 
@@ -251,7 +253,7 @@ int fpclassify(cutlass::tfloat32_t const& h) {
 
 CUTLASS_HOST_DEVICE
 cutlass::tfloat32_t sqrt(cutlass::tfloat32_t const& h) {
-#if defined(__CUDACC_RTC__)
+#if defined(__HGGCCC_RTC__)
   return cutlass::tfloat32_t(sqrtf(float(h)));
 #else
   return cutlass::tfloat32_t(std::sqrt(float(h)));
@@ -280,7 +282,7 @@ tfloat32_t copysign(tfloat32_t const& a, tfloat32_t const& b) {
 
 namespace std {
 
-#if !defined(__CUDACC_RTC__)
+#if !defined(__HGGCCC_RTC__)
 /// Numeric limits
 template <>
 struct numeric_limits<cutlass::tfloat32_t> {

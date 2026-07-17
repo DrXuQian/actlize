@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/arch/arch.h"
@@ -127,6 +129,28 @@ struct KernelTmaWarpSpecializedCooperativeFP8FastAccum: KernelTmaWarpSpecialized
 struct KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum : KernelPtrArrayTmaWarpSpecializedCooperative { };
 struct KernelPtrArrayTmaWarpSpecializedPingpongFP8FastAccum : KernelPtrArrayTmaWarpSpecializedPingpong { };
 
+// Policies to opt into mixed type GEMMs
+// FIXME: These have been deleted in v3.6.0(change-79735). But they are used in 705_ppu_mixed_dtype_gemm.
+struct KernelTmaWarpSpecializedMixedInput : KernelTmaWarpSpecialized { };
+struct KernelTmaWarpSpecializedPingpongMixedInput : KernelTmaWarpSpecializedPingpong { };
+struct KernelTmaWarpSpecializedCooperativeMixedInput: KernelTmaWarpSpecializedCooperative { };
+
+//////////////////////////////////////////////////////////////////////////////
+
+// PPU specialized Kernel schedule policies
+struct KernelAiuMultistage { };
+struct KernelAiuMultistageMixedInput { };
+struct KernelAiuMultistageMixedInputPerCol { };
+struct KernelAiuMultistageMixedInputFinegrainedGs128 { };
+struct KernelAiuMultistageMixedInputFinegrainedGs64 { };
+struct KernelAiuMultistageBatchArray { };
+struct KernelAiuMultistageBatchArrayOverlapPrologue { };
+struct KernelAiuMultistageStreamK { };
+struct KernelAiuMultistagePersistent {};
+struct KernelAiuMultistagePersistentOverlapPrologue {};
+struct KernelMultistagePersistent {};
+struct KernelMultistageBatchArray {};
+
 //////////////////////////////////////////////////////////////////////////////
 
 // Policies for dispatch of epilogue
@@ -140,178 +164,195 @@ struct EpilogueTransposed { };
 //
 
 // 2 stage pipeline through 1 stage in smem, 1 in rmem, WITHOUT predicated gmem loads
-struct MainloopSm70TwoStageUnpredicated {
+struct MainloopPPUTwoStageUnpredicated {
   constexpr static int Stages = 2;
-  using ArchTag = arch::Sm70;
+  // PPU 1.0/1.5 both support
   using Schedule = KernelMultistage;
   using ClusterShape = Shape<_1,_1,_1>;
 };
 
 // 2 stage pipeline through 1 stage in smem, 1 in rmem, with predicated gmem loads
-struct MainloopSm70TwoStage {
+struct MainloopPPUTwoStage {
   constexpr static int Stages = 2;
-  using ArchTag = arch::Sm70;
+  // PPU 1.0/1.5 both support
   using Schedule = KernelMultistage;
   using ClusterShape = Shape<_1,_1,_1>;
 };
 
 // n-buffer in smem (cp.async), pipelined with registers, WITHOUT predicated gmem loads
 template<int Stages_>
-struct MainloopSm80CpAsyncUnpredicated {
+struct MainloopPPUCpAsyncUnpredicated {
   constexpr static int Stages = Stages_;
-  using ArchTag = arch::Sm80;
+  // PPU 1.0/1.5 both support
   using Schedule = KernelMultistage;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+// n-buffer in smem (cp.async), pipelined with registers, with predicated gmem loads
+// Parametrized by ClusterShape (Schedule is hardcoded to KernelMultistage).
+template<
+  int Stages_,
+  class ClusterShape_ = Shape<_1,_1,_1>
+>
+struct MainloopPPUCpAsyncLegacy {
+  constexpr static int Stages = Stages_;
+  // PPU 1.0/1.5 both support
+  using Schedule = KernelMultistage;
+  using ClusterShape = ClusterShape_;
+};
+
+//////////////////////////////////////////////////////////////////////////////
+
+//
+// PPU specialized Collective Mainloop Policies
+//
+
+// n-buffer in smem (cp.async), pipelined with registers, WITHOUT predicated gmem loads
+template<int Stages_, typename Schedule_ = KernelAiuMultistage>
+struct MainloopPPUAiu {
+  constexpr static int Stages = Stages_;
+  using Schedule = Schedule_;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, typename Schedule_ = KernelAiuMultistagePersistentOverlapPrologue>
+struct MainloopPPUAiuPersistentOverlapPrologue {
+  constexpr static int Stages = Stages_;
+  using Schedule = Schedule_;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, typename Schedule_ = KernelAiuMultistage>
+struct MainloopPPUAiuFP8 {
+  constexpr static int Stages = Stages_;
+  using Schedule = Schedule_;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_>
+struct MainloopPPUAiuBatchArray {
+  constexpr static int Stages = Stages_;
+  using Schedule = KernelAiuMultistageBatchArray;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, typename Schedule_ = KernelAiuMultistageBatchArrayOverlapPrologue>
+struct MainloopPPUAiuBatchArrayPersistOverlapPrologue {
+  constexpr static int Stages = Stages_;
+  using Schedule = Schedule_;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_, typename Schedule_ = KernelAiuMultistageMixedInput>
+struct MainloopPPUAiuMixedInput {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 0;  // default value
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedInputPerCol> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = -1;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs128> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 128;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs64> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 64;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+
+struct KernelMultistageWithScale { };
+struct KernelAiuMultistageWithScale : public KernelAiuMultistage { };
+struct KernelAiuMultistageWithBlockWiseScale : public KernelAiuMultistageWithScale {};
+
+template<int Stages_, typename Schedule_ = KernelAiuMultistageWithScale>
+struct MainloopWithScalePPUAiu {
+  constexpr static int Stages = Stages_;
+  constexpr static bool IsBlockWiseScale = false;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_>
+struct MainloopWithScalePPUAiu<Stages_, KernelAiuMultistageWithBlockWiseScale> {
+  constexpr static int Stages = Stages_;
+  constexpr static bool IsBlockWiseScale = true;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_>
+struct MainloopWithScalePPU0015Aiu {
+  constexpr static int Stages = Stages_;
+  using Schedule = KernelAiuMultistageWithScale;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+struct MainloopPPUTwoStageUnpredicatedLdmatrix {
+  constexpr static int Stages = 2;
+  using Schedule = KernelMultistage;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+struct MainloopPPUTwoStageLdmatrix {
+  constexpr static int Stages = 2;
+  using Schedule = KernelMultistage;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+struct MainloopPPUTwoStageLdmatrixBatchArray {
+  constexpr static int Stages = 2;
+  using Schedule = KernelMultistageBatchArray;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_>
+struct MainloopPPUCpAsyncWithScale {
+  constexpr static int Stages = Stages_;
+  using Schedule = KernelMultistageWithScale;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+// main difference with MainloopPPUCpAsync is MainloopPPUCpAsyncLegacy can configure "Schedule" type, instead of hard coded to KernelMultistage.
+template<
+  int Stages_,
+  typename Schedule_ = KernelMultistage
+>
+struct MainloopPPUCpAsync {
+  constexpr static int Stages = Stages_;
+  using Schedule = Schedule_;
   using ClusterShape = Shape<_1,_1,_1>;
 };
 
 // n-buffer in smem (cp.async), pipelined with registers, with predicated gmem loads
 template<
   int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>
+  typename Schedule_ = KernelMultistage
 >
-struct MainloopSm80CpAsync {
+struct MainloopPPUCpAsyncBatchArray {
   constexpr static int Stages = Stages_;
-  using ArchTag = cute::conditional_t<(size(ClusterShape_{}) > 1), arch::Sm90, arch::Sm80>;
-  using Schedule = KernelMultistage;
-  using ClusterShape = ClusterShape_;
+  using Schedule = Schedule_;
+  using ClusterShape = Shape<_1,_1,_1>;
 };
-
-// n-buffer in smem (cp.async), pipelined with Hopper GMMA, with predicated gmem loads, warp specialized dynamic schedule
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelCpAsyncWarpSpecialized
->
-struct MainloopSm90CpAsyncGmmaWarpSpecialized {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-};
-
-// n-buffer in smem (cp.async), pipelined with Hopper GMMA, with predicated gmem loads, warp specialized dynamic schedule
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelCpAsyncWarpSpecialized
->
-struct MainloopSm90CpAsyncGmmaRmemAWarpSpecialized {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-};
-
-// n-buffer in smem (Hopper TMA), pipelined with Hopper GMMA and TMA, static schedule between TMA and GMMA
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  int PipelineAsyncMmaStages_ = 1
->
-struct MainloopSm90TmaGmma {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  constexpr static int PipelineAsyncMmaStages = PipelineAsyncMmaStages_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelTma;
-};
-
-// n-buffer in smem (Hopper TMA), pipelined with Hopper GMMA and TMA, Warp specialized dynamic schedule
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelTmaWarpSpecializedCooperative
->
-struct MainloopSm90TmaGmmaWarpSpecialized {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-};
-
-// n-buffer in smem (Hopper TMA), pipelined with Hopper GMMA and TMA, Warp specialized dynamic schedule
-// With GMMA's A data from registers.
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelTmaWarpSpecialized
->
-struct MainloopSm90TmaGmmaRmemAWarpSpecialized {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-  static_assert(
-    cute::is_same_v<Schedule, KernelTmaWarpSpecialized> ||
-    cute::is_same_v<Schedule, KernelTmaWarpSpecializedPingpong> ||
-    cute::is_same_v<Schedule, KernelTmaWarpSpecializedCooperative>,
-    "KernelSchedule must be one of the warp specialized policies");
-};
-
-
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelTmaWarpSpecialized
->
-struct MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-  static_assert(
-    cute::is_same_v<Schedule, KernelTmaWarpSpecialized> ||
-    cute::is_same_v<Schedule, KernelTmaWarpSpecializedPingpong> ||
-    cute::is_same_v<Schedule, KernelTmaWarpSpecializedCooperative>,
-    "KernelSchedule must be one of the warp specialized policies");
-};
-
-// n-buffer in smem (Hopper TMA), pipelined with Hopper GMMA and TMA, Warp specialized dynamic schedule
-// For FP8 kernels
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelTmaWarpSpecialized
->
-struct MainloopSm90TmaGmmaWarpSpecializedFP8
-  : MainloopSm90TmaGmmaWarpSpecialized<Stages_, ClusterShape_, KernelSchedule> {
-  static_assert(
-    cute::is_same_v<KernelSchedule, KernelTmaWarpSpecialized> ||
-    cute::is_same_v<KernelSchedule, KernelTmaWarpSpecializedPingpong> ||
-    cute::is_same_v<KernelSchedule, KernelTmaWarpSpecializedCooperative>,
-    "KernelSchedule must be one of the warp specialized policies");
-};
-
-// n-buffer in smem (Hopper TMA), pipelined with Hopper GMMA and TMA, Warp specialized dynamic schedule for Ptr-Array and Grouped Gemm
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelPtrArrayTmaWarpSpecializedCooperative
->
-struct MainloopSm90ArrayTmaGmmaWarpSpecialized {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-  static_assert(
-    cute::is_base_of_v<KernelPtrArrayTmaWarpSpecializedCooperative, KernelSchedule> ||
-    cute::is_base_of_v<KernelPtrArrayTmaWarpSpecializedPingpong, KernelSchedule>,
-    "KernelSchedule must be one of the Ptr-Array or Grouped Gemm TMA Warp Specialized Cooperative or Pingpong policies");
-};
-
-// n-buffer in smem (Hopper TMA), pipelined with Hopper sparse GMMA and TMA, Warp specialized dynamic schedule
-template<
-  int Stages_,
-  class ClusterShape_ = Shape<_1,_1,_1>,
-  class KernelSchedule = KernelTmaWarpSpecializedCooperative
->
-struct MainloopSm90TmaGmmaWarpSpecializedSparse {
-  constexpr static int Stages = Stages_;
-  using ClusterShape = ClusterShape_;
-  using ArchTag = arch::Sm90;
-  using Schedule = KernelSchedule;
-};
-
 
 //////////////////////////////////////////////////////////////////////////////
 

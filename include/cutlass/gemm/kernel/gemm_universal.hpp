@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,10 +29,10 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/gemm/kernel/gemm_universal_decl.h"
-#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -51,16 +52,4 @@ struct IsCutlass3ArrayKernel<ProblemShape, cute::void_t<typename ProblemShape::U
 
 } // namespace cutlass::gemm::kernel
 
-////////////////////////////////////////////////////////////////////////////////
-
-#include "cutlass/gemm/kernel/sm70_gemm.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_tma.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_warpspecialized.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_warpspecialized_pingpong.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_warpspecialized_cooperative.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_array_tma_warpspecialized_pingpong.hpp"
-#include "cutlass/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative.hpp"
 ////////////////////////////////////////////////////////////////////////////////

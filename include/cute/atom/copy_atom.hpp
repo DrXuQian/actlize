@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include <cute/config.hpp>                     // CUTE_HOST_DEVICE
@@ -747,18 +749,8 @@ print_latex_copy(LayoutS const& S, ThrIDS const& TS,  // (m,n) -> (tid,vid)  and
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include <cute/atom/copy_traits_sm50.hpp>
-#include <cute/atom/copy_traits_sm75.hpp>
-#include <cute/atom/copy_traits_sm80.hpp>
-#include <cute/atom/copy_traits_sm90.hpp>
+// ppu has async cp / ld matrix path
+#include <cute/atom/copy_traits_ppu.hpp>
 
-// Config
-#if (__CUDACC_VER_MAJOR__ >= 12)
-#  define CUTE_COPY_ATOM_TMA_SM90_ENABLED
-#endif
-
-#if defined(CUTE_COPY_ATOM_TMA_SM90_ENABLED)
-#include <cute/atom/copy_traits_sm90_tma.hpp>
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

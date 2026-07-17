@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -125,7 +126,7 @@ struct DefaultDeconv2dWithBroadcast {
 //                            OpClassSimt convolutions
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Defines a kernel for Deconv2d specialization,
-/// multi-stage pipeline, and FFMA-based mainloop for SM80
+/// multi-stage pipeline, and FFMA-based mainloop for PPU multistage
 
 template <
   typename ElementA,

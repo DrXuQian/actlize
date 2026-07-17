@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Templates exposing architecture support for multiply-add operations
 */
@@ -86,7 +88,7 @@ struct OpMultiplyAddComplexFastF32 {};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Tag indicating that staged accumulation is not to be used. This is valid only for SM89
+/// Tag indicating that staged accumulation is not to be used. This is valid only for PPU0015
 /// FP8 kernels.
 struct OpMultiplyAddFastAccum;
 
@@ -117,16 +119,13 @@ struct OpClassSimt {};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Tag classifying operators as Tensor Core operations.
+/// Tag classifying operators as Tensor Cell operations.
 struct OpClassTensorOp {};
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// Tag classifying operators as WMMA Tensor Core operations
-struct OpClassWmmaTensorOp {};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Tag classifying operators as Tensor Core with structure sparse operations.
+/// Tag classifying operators as Tensor Cell with structure sparse operations.
 struct OpClassSparseTensorOp {};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -240,16 +239,8 @@ struct SparseMma;
 // Specializations for each compute capability
 //
 
-#include "cutlass/arch/mma_sm50.h"
-#include "cutlass/arch/mma_sm60.h"
-#include "cutlass/arch/mma_sm61.h"
-#include "cutlass/arch/mma_sm70.h"
-#include "cutlass/arch/mma_sm75.h"
-#include "cutlass/arch/mma_sm80.h"
-#include "cutlass/arch/mma_sparse_sm80.h"
-#include "cutlass/arch/mma_sm89.h"
-#include "cutlass/arch/mma_sparse_sm89.h"
-#include "cutlass/arch/mma_sm90.h"
+// PPU supports vector core ops
+#include "cutlass/arch/mma_ppu.h"
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -258,9 +249,8 @@ namespace detail {
 /// Helper for determining whether staged accumulation should be used for a given operator
 template <typename Operator>
 struct UseStagedAccumulation {
-  static bool const value = platform::is_same<typename Operator::MathOperator, OpMultiplyAddFastF32>::value ||
-                            platform::is_same<typename Operator::MathOperator, OpMultiplyAddComplexFastF32>::value ||
-                            is_sm89_staged_policy_v<Operator>;
+  // todo: PPU to support 3xTF32?
+  static bool const value = false;
 };
 } // namespace detail
 } // namespace arch

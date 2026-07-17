@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2024 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include <cute/config.hpp>
@@ -237,7 +239,7 @@ struct tuple_element<I, cute::packed_tuple<T...>>
 
 } // end namespace CUTE_STL_NAMESPACE
 
-#ifdef CUTE_STL_NAMESPACE_IS_CUDA_STD
+#ifdef CUTE_STL_NAMESPACE_IS_HGGC_STD
 namespace std {
 
 template <class ... T>
@@ -251,4 +253,4 @@ struct tuple_element<I, cute::packed_tuple<T...>>
 {};
 
 } // end namespace std
-#endif // CUTE_STL_NAMESPACE_IS_CUDA_STD
+#endif // CUTE_STL_NAMESPACE_IS_HGGC_STD

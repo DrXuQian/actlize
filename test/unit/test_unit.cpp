@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,14 +29,31 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /** \file
     \brief Unit tests for CUTLASS core
 */
 
 #include "common/cutlass_unit_test.h"
 
+// Reset the device after every failing test so that a fatal device
+// fault (e.g. illegal memory access) cannot leak into subsequent test
+// cases via the sticky-error mechanism of the runtime.
+namespace {
+class DeviceResetOnFailure : public ::testing::EmptyTestEventListener {
+  void OnTestEnd(::testing::TestInfo const& info) override {
+    auto const* result = info.result();
+    if (result != nullptr && result->Failed()) {
+      (void)hggcGetLastError();
+      (void)hggcDeviceReset();
+    }
+  }
+};
+} // namespace
+
 int main(int argc, char* arg[]) {
   FilterArchitecture();
   ::testing::InitGoogleTest(&argc, arg);
+  ::testing::UnitTest::GetInstance()->listeners().Append(new DeviceResetOnFailure());
   return RUN_ALL_TESTS();
 }

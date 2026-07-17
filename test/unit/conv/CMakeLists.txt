@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -34,7 +35,7 @@ set(CUTLASS_CONV_TEST_UNIT_REFERENCE_DEVICE_ENABLED ON CACHE BOOL
 
 if(CUTLASS_CONV_TEST_UNIT_REFERENCE_DEVICE_ENABLED)
   message(STATUS "Enable device reference verification in conv unit tests")
-  list(APPEND CUTLASS_CUDA_NVCC_FLAGS -DCUTLASS_CONV_TEST_UNIT_REFERENCE_DEVICE_ENABLED=1)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DCUTLASS_CONV_TEST_UNIT_REFERENCE_DEVICE_ENABLED=1")
 endif()
 
 foreach(SUBDIR
@@ -47,4 +48,3 @@ foreach(SUBDIR
 
 endforeach()
 
-add_subdirectory(device_3x)

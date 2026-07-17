@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include <cute/config.hpp>
@@ -35,7 +37,7 @@
 #include <cute/numeric/integral_constant.hpp>  // cute::true_type, cute::false_type
 #include <cute/numeric/integer_sequence.hpp>
 
-#include <cute/container/cuda_types.hpp>
+#include <cute/container/ppu_types.hpp>
 #include <cute/container/type_list.hpp>
 #if defined(CUTLASS_USE_PACKED_TUPLE)
 #  include <cute/container/packed_tuple.hpp>
@@ -72,7 +74,7 @@ using tuple = packed_tuple<T...>;
 namespace detail
 {
 
-// This is simplified over the implementations in std::, cuda::std::, and thrust:: by ignoring much of
+// This is simplified over the implementations in std::, hggc::std::, and thrust:: by ignoring much of
 // the conversion SFINAE, special overloading, and avoiding cvref template types.
 //
 // Over standard-conforming tuple implementations, this appears to accelerate compilation times by over 3x.
@@ -167,7 +169,7 @@ struct TupleBase<index_sequence<I...>, T...>
 } // end namespace detail
 
 // Attempting to use the following commented-out alias
-// in the declaration of `struct tuple` causes MSVC 2022 build errors.
+// in the declaration of `struct tuple` causes build errors.
 //
 //template <class... T>
 //using TupleBase = detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>;
@@ -176,8 +178,8 @@ struct TupleBase<index_sequence<I...>, T...>
 // The storage (if any) lives in TupleBase's EBO base classes.
 //
 // Inheriting from the above alias TupleBase
-// causes MSVC 2022 build errors when assigning one tuple to another:
-// In summary: this is verbose as a work-around for MSVC build errors.
+// causes build errors when assigning one tuple to another:
+// In summary: this is verbose as a work-around for compiler build errors.
 template <class... T>
 struct tuple : detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>
 {
@@ -642,7 +644,7 @@ CUTE_HOST_DEVICE void print_tuple(Tuple const& t, index_sequence<Is...>, char s 
   print(e);
 }
 
-#if !defined(__CUDACC_RTC__)
+#if !defined(__HGGCCC_RTC__)
 template <class Tuple, std::size_t... Is>
 CUTE_HOST std::ostream& print_tuple_os(std::ostream& os, Tuple const& t, index_sequence<Is...>, char s = '(', char e = ')')
 {
@@ -653,7 +655,7 @@ CUTE_HOST std::ostream& print_tuple_os(std::ostream& os, Tuple const& t, index_s
   }
   return os << e;
 }
-#endif // !defined(__CUDACC_RTC__)
+#endif // !defined(__HGGCCC_RTC__)
 
 } // end namespace detail
 
@@ -664,14 +666,14 @@ CUTE_HOST_DEVICE void print(Tuple const& t)
   return detail::print_tuple(t, make_index_sequence<tuple_size<Tuple>::value>{});
 }
 
-#if !defined(__CUDACC_RTC__)
+#if !defined(__HGGCCC_RTC__)
 template <class Tuple,
           __CUTE_REQUIRES(is_tuple<Tuple>::value)>
 CUTE_HOST std::ostream& operator<<(std::ostream& os, Tuple const& t)
 {
   return detail::print_tuple_os(os, t, make_index_sequence<tuple_size<Tuple>::value>{});
 }
-#endif // !defined(__CUDACC_RTC__)
+#endif // !defined(__HGGCCC_RTC__)
 
 } // end namespace cute
 
@@ -706,11 +708,11 @@ struct tuple_element<I, const cute::tuple<T...>>
 // std compatibility
 //
 
-#ifdef CUTE_STL_NAMESPACE_IS_CUDA_STD
+#ifdef CUTE_STL_NAMESPACE_IS_HGGC_STD
 namespace std
 {
 
-#if defined(__CUDACC_RTC__)
+#if defined(__HGGCCC_RTC__)
 template <class... _Tp>
 struct tuple_size;
 
@@ -739,6 +741,6 @@ struct tuple_element<I, const cute::tuple<T...>>
 {};
 
 } // end namespace std
-#endif // CUTE_STL_NAMESPACE_IS_CUDA_STD
+#endif // CUTE_STL_NAMESPACE_IS_HGGC_STD
 
 #endif // CUTLASS_USE_PACKED_TUPLE

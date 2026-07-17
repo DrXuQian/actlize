@@ -1,3 +1,4 @@
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -32,3 +33,5 @@ cutlass_test_unit_add_executable(
   cutlass_test_levels.cu
   rms_norm.cu
   )
+
+target_compile_options(cutlass_test_unit_util PRIVATE -w)

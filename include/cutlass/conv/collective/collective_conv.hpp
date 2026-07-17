@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/detail/dependent_false.hpp"
@@ -58,5 +60,4 @@ struct CollectiveConv {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "sm90_implicit_gemm_gmma_ss_warpspecialized.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////

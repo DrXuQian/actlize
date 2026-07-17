@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -55,13 +56,15 @@
 #include "cutlass/epilogue/collective/detail.hpp"
 
 #include "cute/tensor.hpp"
-#include "cutlass/cuda_host_adapter.hpp"
+#include "cutlass/ppu_host_adapter.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
 namespace epilogue {
 namespace collective {
+
+using namespace cute;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Collective epilogue that applies elementwise tensor-tensor operations atop other epilogues
@@ -143,8 +146,8 @@ public:
 
   template <class ProblemShape>
   static cutlass::Status
-  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream,
-    CudaHostAdapter* cuda_adapter = nullptr) {
+  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, hggcStream_t stream,
+    HostAdapter* host_adapter = nullptr) {
     return cutlass::Status::kSuccess;
   }
 

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Template for a double-buffered threadblock-scoped GEMM kernel.
 */
@@ -53,9 +55,10 @@ namespace threadblock {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Structure to compute the matrix product targeting CUDA cores and SIMT math
+/// Structure to compute the matrix product targeting alu cores and SIMT math
 /// instructions.
 template <
+    typename Arch,
     /// Size of the Gemm problem - concept: gemm::GemmShape<>
     typename Shape_,
     /// Iterates over tiles of A operand in global memory
@@ -122,8 +125,8 @@ public:
   /// Warp-level Mma
   using Operator = typename Policy::Operator;
 
-  /// Minimum architecture is Sm80 to support cp.async
-  using ArchTag = arch::Sm80;
+  /// Minimum architecture is PPU to support cp.async
+  using ArchTag = Arch;
 
   /// Complex transform on A operand
   static ComplexTransform const kTransformA = Operator::kTransformA;

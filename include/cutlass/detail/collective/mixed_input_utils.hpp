@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,13 +29,13 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
 
 #include "cute/util/type_traits.hpp"
-#include "cute/arch/copy_sm90.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
 
@@ -109,15 +110,15 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t immLut   = (0xf0 & 0xcc) ^ 0xaa;
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii])
           : "n"(lo_mask), "n"(xor_mask), "n"(immLut));
       static constexpr uint32_t lo_bias = xor_mask; // 0x43084308, {136, 136}
       {
-        __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
+        __ppu_bfloat162& bf16x2_val = reinterpret_cast<__ppu_bfloat162&>(r[ii]);
         bf16x2_val = __hsub2(bf16x2_val,
-                              reinterpret_cast<const __nv_bfloat162&>(lo_bias));
+                              reinterpret_cast<const __ppu_bfloat162&>(lo_bias));
       }
     }
   }
@@ -157,15 +158,15 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t immLut  = (0xf0 & 0xcc) | 0xaa;
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii])
           : "n"(lo_mask), "n"(or_mask), "n"(immLut));
       static constexpr uint32_t lo_bias = or_mask; // 0x43004300, {128, 128}
       {
-        __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
+        __ppu_bfloat162& bf16x2_val = reinterpret_cast<__ppu_bfloat162&>(r[ii]);
         bf16x2_val = __hsub2(bf16x2_val,
-                             reinterpret_cast<const __nv_bfloat162&>(lo_bias));
+                             reinterpret_cast<const __ppu_bfloat162&>(lo_bias));
       }
     }
   }
@@ -209,13 +210,13 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t immLut      = (0xf0 & 0xcc) ^ 0xaa;
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii + 0])
           : "n"(lo_mask), "n"(lo_xor_mask), "n"(immLut));
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii + 1])
           : "n"(hi_mask), "n"(hi_xor_mask), "n"(immLut));
@@ -274,13 +275,13 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t immLut  = (0xf0 & 0xcc) | 0xaa;
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii])
           : "n"(lo_mask), "n"(or_mask), "n"(immLut));
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii + 1])
           : "n"(hi_mask), "n"(or_mask), "n"(immLut));
@@ -336,7 +337,7 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t and_mask = 0xFF00FF00;
       asm volatile(
           "{\n"
-          "  and.b32 %0, %0, %1;\n"
+          "  ppu.and.b32 %0, %0, %1;\n"
           "}\n"
           : "+r"(r[ii])
           : "n"(and_mask));
@@ -380,20 +381,20 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t immLut     = (0xf0 & 0xcc) | 0xaa;
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %1, %2, %3, %4;\n"
+          "  ppu.lop3.b32 %0, %1, %2, %3, %4;\n"
           "}\n"
           : "=r"(tmp0)
           : "r"(r[ii]), "n"(and_mask_0), "n"(or_mask), "n"(immLut));
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %1, %2, %3, %4;\n"
+          "  ppu.lop3.b32 %0, %1, %2, %3, %4;\n"
           "}\n"
           : "=r"(tmp1)
           : "r"(r[ii]), "n"(and_mask_1), "n"(or_mask), "n"(immLut));
       {
-        __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
-        bf16x2_val = __hsub2(reinterpret_cast<__nv_bfloat162 const&>(tmp0),
-                             reinterpret_cast<__nv_bfloat162 const&>(tmp1));
+        __ppu_bfloat162& bf16x2_val = reinterpret_cast<__ppu_bfloat162&>(r[ii]);
+        bf16x2_val = __hsub2(reinterpret_cast<__ppu_bfloat162 const&>(tmp0),
+                             reinterpret_cast<__ppu_bfloat162 const&>(tmp1));
       }
     }
   }
@@ -433,7 +434,7 @@ struct LayoutAwareConvertImpl<
       static constexpr uint32_t immLut   = (0xf0 & 0xcc) ^ 0xaa;
       asm volatile(
           "{\n"
-          "  lop3.b32 %0, %0, %1, %2, %3;\n"
+          "  ppu.lop3.b32 %0, %0, %1, %2, %3;\n"
           "}\n"
           : "+r"(r[ii])
           : "n"(and_mask), "n"(xor_mask), "n"(immLut));
@@ -702,7 +703,7 @@ public:
     uint32_t sign; // ((reg & 0x88888888) | 0x64206420) >> 1 
     asm volatile(
       "{\n"
-      "  lop3.b32 %0, %1, %2, %3, %4;\n" \
+      "  ppu.lop3.b32 %0, %1, %2, %3, %4;\n" \
       "}\n"
       : "=r"(sign)
       : "r"(src_reg), "n"(0x88888888), "n"(0x64206420), "n"(immLut)
@@ -720,9 +721,9 @@ public:
       asm volatile(
         "{\n"
         "  .reg .b32 pos, neg                    ;\n" \
-        "  prmt .b32 neg, %3, %4, %1             ;\n" \
-        "  prmt .b32 pos, %5, %6, %1             ;\n" \
-        "  prmt .b32 %0, pos, neg, %2            ;\n" \
+        "  ppu.prmt.b32 neg, %3, %4, %1             ;\n" \
+        "  ppu.prmt.b32 pos, %5, %6, %1             ;\n" \
+        "  ppu.prmt.b32 %0, pos, neg, %2            ;\n" \
         "}\n"
         : "=r"(r[i])
         : "r"(lut_idx), "r"(sign), "r"(scale_neg_[0]), "r"(scale_neg_[1]), "r"(scale_pos_[0]), "r"(scale_pos_[1])
@@ -807,8 +808,8 @@ public:
           constexpr uint32_t immLut = (0xf0 & 0xcc) ^ 0xaa;
           asm volatile(
               "{\n"
-              "  lop3 .b32 %0, %2, %4, %5, %6;\n" \
-              "  xor  .b32 %1, %3, %5;        \n" \
+              "  ppu.lop3.b32 %0, %2, %4, %5, %6;\n" \
+              "  ppu.xor.b32 %1, %3, %5;        \n" \
               "}\n"
               : "=r"(scale_pos_[0]), "=r"(scale_pos_[1])
               : "r"(scale_neg_[0]), "r"(scale_neg_[1]), "n"(0xFFFFFF00), "n"(0x80808080), "n"(immLut)

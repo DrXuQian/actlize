@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Execution environment
 */
@@ -38,13 +40,6 @@
 // Profiler includes
 #include "cutlass/profiler/cutlass_profiler.h"
 #include "cutlass/profiler/gemm_operation_profiler.h"
-#include "cutlass/profiler/rank_k_operation_profiler.h"
-#include "cutlass/profiler/rank_2k_operation_profiler.h"
-#include "cutlass/profiler/trmm_operation_profiler.h"
-#include "cutlass/profiler/symm_operation_profiler.h"
-#include "cutlass/profiler/conv2d_operation_profiler.h"
-#include "cutlass/profiler/conv3d_operation_profiler.h"
-#include "cutlass/profiler/sparse_gemm_operation_profiler.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -60,19 +55,6 @@ CutlassProfiler::CutlassProfiler(
 
   operation_profilers_.emplace_back(new GemmOperationProfiler(options));
 
-  operation_profilers_.emplace_back(new SparseGemmOperationProfiler(options));
-
-  operation_profilers_.emplace_back(new Conv2dOperationProfiler(options));
-
-  operation_profilers_.emplace_back(new Conv3dOperationProfiler(options));
-
-  operation_profilers_.emplace_back(new RankKOperationProfiler(options));
-
-  operation_profilers_.emplace_back(new Rank2KOperationProfiler(options));
-
-  operation_profilers_.emplace_back(new TrmmOperationProfiler(options));
-
-  operation_profilers_.emplace_back(new SymmOperationProfiler(options));
 }
 
 CutlassProfiler::~CutlassProfiler() {
@@ -149,9 +131,12 @@ int CutlassProfiler::profile_() {
   int result = 0;
   // For all profilers (e.g. gemm/sparse_gemm/conv2d...)
   for (auto & profiler : operation_profilers_) {
+    if (options_.operation_kind == library::OperationKind::kInvalid) {
+      std::cout << "ppu profiler only supports gemm currently !!!" << std::endl;
+      continue;
+    }
 
-    if (options_.operation_kind == library::OperationKind::kInvalid ||
-        options_.operation_kind == profiler->kind()) {
+    if (options_.operation_kind == profiler->kind()) {
 
       result = profiler->profile_all(options_, library::Singleton::get().manifest, device_context);
 
@@ -191,13 +176,8 @@ void CutlassProfiler::print_usage_(std::ostream &out) {
   }
 
   out << "\n\nFor details about a particular function, specify the function name with --help.\n\nExample:\n\n"
+    // todo: support mode PPU native ops
     << "  $ cutlass_profiler --operation=Gemm --help\n\n"
-    << "  $ cutlass_profiler --operation=RankK --help\n\n"
-    << "  $ cutlass_profiler --operation=Trmm --help\n\n"
-    << "  $ cutlass_profiler --operation=Symm --help\n\n"
-    << "  $ cutlass_profiler --operation=Conv3d --help\n\n"
-    << "  $ cutlass_profiler --operation=Conv2d --help\n\n"
-    << "  $ cutlass_profiler --operation=SparseGemm --help\n\n"
   ;
 }
 

@@ -1,4 +1,5 @@
-/******************************************************************************
+/***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -27,13 +28,13 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- ******************************************************************************/
+ **************************************************************************************************/
 
 #pragma once
 
 /**
  * \file
- * \brief C++ interface to CUDA device memory management functions.
+ * \brief C++ interface to device memory management functions.
  */
 
 #include <memory>
@@ -51,7 +52,7 @@ namespace device_memory {
  * Allocation lifetime
  ******************************************************************************/
 
-/// Allocate a buffer of \p count elements of type \p T on the current CUDA device
+/// Allocate a buffer of \p count elements of type \p T on the current device
 template <typename T>
 T* allocate(size_t count = 1) {
 
@@ -60,20 +61,20 @@ T* allocate(size_t count = 1) {
 
   bytes = count * sizeof(T);
 
-  cudaError_t cuda_error = cudaMalloc((void**)&ptr, bytes);
+  hggcError_t device_error = hggcMalloc((void**)&ptr, bytes);
 
-  if (cuda_error != cudaSuccess) {
+  if (device_error != hggcSuccess) {
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 0)
     std::ostringstream os;
-    os << "cutlass::device_memory::allocate: cudaMalloc failed: bytes=" << bytes;
+    os << "cutlass::device_memory::allocate: hggcMalloc failed: bytes=" << bytes;
     CUTLASS_TRACE_HOST(os.str());
 #endif
-    throw cuda_exception("Failed to allocate memory", cuda_error);
+    throw device_exception("Failed to allocate memory", device_error);
   }
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
   else {
     std::ostringstream os;
-    os << "cutlass::device_memory::allocate: Successful cudaMalloc: bytes=" << bytes;
+    os << "cutlass::device_memory::allocate: Successful hggcMalloc: bytes=" << bytes;
     CUTLASS_TRACE_HOST(os.str());
   }
 #endif
@@ -85,9 +86,9 @@ T* allocate(size_t count = 1) {
 template <typename T>
 void free(T* ptr) {
   if (ptr) {
-    cudaError_t cuda_error = (cudaFree(ptr));
-    if (cuda_error != cudaSuccess) {
-      throw cuda_exception("Failed to free device memory", cuda_error);
+    hggcError_t device_error = (hggcFree(ptr));
+    if (device_error != hggcSuccess) {
+      throw device_exception("Failed to free device memory", device_error);
     }
   }
 }
@@ -97,59 +98,59 @@ void free(T* ptr) {
  ******************************************************************************/
 
 template <typename T>
-void copy(T* dst, T const* src, size_t count, cudaMemcpyKind kind) {
+void copy(T* dst, T const* src, size_t count, hggcMemcpyKind kind) {
   size_t bytes = count * sizeof_bits<T>::value / 8;
   if (bytes == 0 && count > 0) {
     bytes = 1;
   }
-  cudaError_t cuda_error = (cudaMemcpy(dst, src, bytes, kind));
-  if (cuda_error != cudaSuccess) {
+  hggcError_t device_error = (hggcMemcpy(dst, src, bytes, kind));
+  if (device_error != hggcSuccess) {
     std::ostringstream os;
-    os << "cutlass::device_memory::copy: cudaMemcpy() failed: "
+    os << "cutlass::device_memory::copy: hggcMemcpy() failed: "
        << "dst=" << dst << ", src=" << src
        << ", bytes=" << bytes << ", count=" << count;
-    if (kind == cudaMemcpyHostToDevice) {
-      os << ", kind=cudaMemcpyHostToDevice";
+    if (kind == hggcMemcpyHostToDevice) {
+      os << ", kind=hggcMemcpyHostToDevice";
     }
-    else if (kind == cudaMemcpyDeviceToHost) {
-      os << ", kind=cudaMemcpyDeviceToHost";
+    else if (kind == hggcMemcpyDeviceToHost) {
+      os << ", kind=hggcMemcpyDeviceToHost";
     }
-    else if (kind == cudaMemcpyDeviceToDevice) {
-      os << ", kind=cudaMemcpyDeviceToDevice";
+    else if (kind == hggcMemcpyDeviceToDevice) {
+      os << ", kind=hggcMemcpyDeviceToDevice";
     }
-    else if (kind == cudaMemcpyHostToHost) {
-      os << ", kind=cudaMemcpyHostToHost";
+    else if (kind == hggcMemcpyHostToHost) {
+      os << ", kind=hggcMemcpyHostToHost";
     }
-    else if (kind == cudaMemcpyDefault) {
-      os << ", kind=cudaMemcpyDefault";
+    else if (kind == hggcMemcpyDefault) {
+      os << ", kind=hggcMemcpyDefault";
     }
     else {
       os << ", kind=Unknown";
     }
-    os << ", error: " << cudaGetErrorString(cuda_error);
+    os << ", error: " << hggcGetErrorString(device_error);
 
-    throw cuda_exception(os.str().c_str(), cuda_error);
+    throw device_exception(os.str().c_str(), device_error);
   }
 }
 
 template <typename T>
 void copy_to_device(T* dst, T const* src, size_t count = 1) {
-  copy(dst, src, count, cudaMemcpyHostToDevice);
+  copy(dst, src, count, hggcMemcpyHostToDevice);
 }
 
 template <typename T>
 void copy_to_host(T* dst, T const* src, size_t count = 1) {
-  copy(dst, src, count, cudaMemcpyDeviceToHost);
+  copy(dst, src, count, hggcMemcpyDeviceToHost);
 }
 
 template <typename T>
 void copy_device_to_device(T* dst, T const* src, size_t count = 1) {
-  copy(dst, src, count, cudaMemcpyDeviceToDevice);
+  copy(dst, src, count, hggcMemcpyDeviceToDevice);
 }
 
 template <typename T>
 void copy_host_to_host(T* dst, T const* src, size_t count = 1) {
-  copy(dst, src, count, cudaMemcpyHostToHost);
+  copy(dst, src, count, hggcMemcpyHostToHost);
 }
 
 /// Copies elements from device memory to host-side range
@@ -176,13 +177,13 @@ template <typename T>
 class DeviceAllocation {
 public:
 
-  /// Delete functor for CUDA device memory
+  /// Delete functor for device memory
   struct deleter {
     void operator()(T* ptr) {
-      cudaError_t cuda_error = (cudaFree(ptr));
-      if (cuda_error != cudaSuccess) {
+      hggcError_t device_error = (hggcFree(ptr));
+      if (device_error != hggcSuccess) {
         // noexcept
-        //                throw cuda_exception("cudaFree() failed", cuda_error);
+        //                throw device_exception("hggcFree() failed", device_error);
         return;
       }
     }
@@ -193,7 +194,7 @@ public:
   // Data members
   //
 
-  /// Number of elements of T allocated on the current CUDA device
+  /// Number of elements of T allocated on the current device
   size_t capacity;
 
   /// Smart pointer
@@ -226,11 +227,11 @@ public:
   /// Constructor: allocates no memory
   DeviceAllocation() : capacity(0) {}
 
-  /// Constructor: allocates \p capacity elements on the current CUDA device
+  /// Constructor: allocates \p capacity elements on the current device
   DeviceAllocation(size_t _capacity) : 
     smart_ptr(device_memory::allocate<T>(_capacity)), capacity(_capacity) {}
 
-  /// Constructor: allocates \p capacity elements on the current CUDA device taking ownership of the allocation
+  /// Constructor: allocates \p capacity elements on the current device taking ownership of the allocation
   DeviceAllocation(T *ptr, size_t _capacity) : smart_ptr(ptr), capacity(_capacity) {}
 
   /// Copy constructor

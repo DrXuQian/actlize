@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! 
   \file
 
@@ -296,14 +298,6 @@ template <> struct OpcodeClassMap<arch::OpClassTensorOp> {
   static OpcodeClassID const kId = OpcodeClassID::kTensorOp;
 };
 
-template <> struct OpcodeClassMap<arch::OpClassSparseTensorOp> {
-  static OpcodeClassID const kId = OpcodeClassID::kSparseTensorOp;
-};
-
-template <> struct OpcodeClassMap<arch::OpClassWmmaTensorOp> {
-  static OpcodeClassID const kId = OpcodeClassID::kWmmaTensorOp;
-};
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <cutlass::ComplexTransform Transform> struct ComplexTransformMap;
@@ -318,51 +312,6 @@ template <> struct ComplexTransformMap<cutlass::ComplexTransform::kConjugate> {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <cutlass::conv::Mode  T> struct ConvModeMap;
-
-template <> struct ConvModeMap<conv::Mode::kCrossCorrelation> {
-  static ConvModeID const kId = ConvModeID::kCrossCorrelation;
-};
-
-template <> struct ConvModeMap<conv::Mode::kConvolution> {
-  static ConvModeID const kId = ConvModeID::kConvolution;
-};
-
-
-template <cutlass::conv::Operator  T> struct ConvKindMap;
-
-template <> struct ConvKindMap<conv::Operator::kFprop> {
-  static ConvKind const kId = ConvKind::kFprop;
-};
-
-template <> struct ConvKindMap<conv::Operator::kDgrad> {
-  static ConvKind const kId = ConvKind::kDgrad;
-};
-
-template <> struct ConvKindMap<conv::Operator::kWgrad> {
-  static ConvKind const kId = ConvKind::kWgrad;
-};
-
-
-template <cutlass::conv::IteratorAlgorithm  T> struct IteratorAlgorithmMap;
-
-template <> struct IteratorAlgorithmMap<conv::IteratorAlgorithm::kAnalytic> {
-  static IteratorAlgorithmID const kId = IteratorAlgorithmID::kAnalytic;
-};
-
-template <> struct IteratorAlgorithmMap<conv::IteratorAlgorithm::kOptimized> {
-  static IteratorAlgorithmID const kId = IteratorAlgorithmID::kOptimized;
-};
-
-template <> struct IteratorAlgorithmMap<conv::IteratorAlgorithm::kFixedChannels> {
-  static IteratorAlgorithmID const kId = IteratorAlgorithmID::kFixedChannels;
-};
-
-template <> struct IteratorAlgorithmMap<conv::IteratorAlgorithm::kFewChannels> {
-  static IteratorAlgorithmID const kId = IteratorAlgorithmID::kFewChannels;
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Element, typename Layout>
 TensorDescription make_TensorDescription(int alignment = 1) {

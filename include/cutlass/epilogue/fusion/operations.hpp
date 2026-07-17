@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -486,6 +487,36 @@ struct LinCombDeEltActDePerRowBias
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+// PPU adds LinCombDeEltActDePerColBias
+
+// Z = Aux
+// dY = alpha * acc + beta * C
+// D = d_activation(dY, Z)
+// dBias = sum of rows of D
+template<
+  class GmemLayoutTagAux_,
+  template <class> class ActivationFn_,
+  class ElementOutput_,
+  class ElementCompute_,
+  class ElementAux_ = ElementOutput_,
+  class ElementBias_ = ElementCompute_,
+  class ElementSource_ = ElementOutput_,
+  class ElementScalar_ = ElementCompute_,
+  int AlignmentAux_ = 128 / cute::sizeof_bits_v<ElementAux_>,
+  int AlignmentBias_ = 128 / cute::sizeof_bits_v<ElementBias_>,
+  FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest
+>
+struct LinCombDeEltActDePerColBias
+    : LinCombDeEltAct<GmemLayoutTagAux_, ActivationFn_, ElementOutput_, ElementCompute_,
+        ElementAux_, ElementSource_, ElementScalar_, AlignmentAux_, RoundStyle_> {
+  using ElementBias = ElementBias_;
+  static constexpr int AlignmentBias = AlignmentBias_;
+  static constexpr bool IsDePerColBiasSupported = true;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 } // namespace cutlass::epilogue::fusion
 

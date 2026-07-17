@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Defines operations for reduction operation in CUTLASS Library.
 */
@@ -208,7 +210,7 @@ public:
     void const *configuration_ptr, 
     void *host_workspace, 
     void *device_workspace, 
-    cudaStream_t stream = nullptr) const {
+    hggcStream_t stream = nullptr) const {
 
     OperatorArguments args;
 
@@ -231,7 +233,7 @@ public:
     void const *arguments_ptr,
     void *host_workspace, 
     void *device_workspace = nullptr, 
-    cudaStream_t stream = nullptr,
+    hggcStream_t stream = nullptr,
     bool launch_with_pdl = false) const {
 
     if (launch_with_pdl) {

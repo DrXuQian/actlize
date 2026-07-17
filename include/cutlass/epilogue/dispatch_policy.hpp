@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/numeric_conversion.h"
@@ -47,6 +49,8 @@ namespace cutlass::epilogue {
 
 struct PtrArrayDefault {};
 struct EpilogueSimtVectorized {};
+// ppu epilogue schedule
+struct EpilogueSimtVectorizedWithoutEvt : EpilogueSimtVectorized {} ;
 struct EpiloguePtrArraySimtVectorized {};
 struct NoSmemWarpSpecialized {};
 struct PtrArrayNoSmemWarpSpecialized {};
@@ -154,7 +158,7 @@ template<
   bool ReuseSmemC_,
   bool DelayTmaStore_
 >
-struct Sm90TmaWarpSpecialized {
+struct PPUTmaWarpSpecialized {
   constexpr static int StagesC = StagesC_;
   constexpr static int StagesD = StagesD_;
   constexpr static int FragmentSize = FragmentSize_;
@@ -170,7 +174,7 @@ template<
   bool DelayTmaStore_,
   int NumEpilogueWarpGroups_
 >
-struct Sm90PtrArrayTmaWarpSpecialized {
+struct PPUPtrArrayTmaWarpSpecialized {
   constexpr static int StagesC = StagesC_;
   constexpr static int StagesD = StagesD_;
   constexpr static int FragmentSize = FragmentSize_;
@@ -179,13 +183,12 @@ struct Sm90PtrArrayTmaWarpSpecialized {
   constexpr static int NumEpilogueWarpGroups = NumEpilogueWarpGroups_;
 };
 
-// DEPRECATED policies, will be removed in next release
 template<
   int StagesC_,
   int StagesD_,
   int FragmentSize_ = 2
 >
-struct Sm90TmaWarpSpecializedBiasElementwise {
+struct PPUTmaWarpSpecializedBiasElementwise {
   constexpr static int StagesC = StagesC_;
   constexpr static int StagesD = StagesD_;
   constexpr static int FragmentSize = FragmentSize_;

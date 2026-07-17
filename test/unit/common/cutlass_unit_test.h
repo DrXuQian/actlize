@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -40,15 +41,15 @@
 #include <cstdlib>
 #include <string>
 
-#include <cuda_runtime_api.h>
+#include <hggc_runtime.h>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Gets a CUDA device
-cudaDeviceProp GetCudaDevice();
+/// Gets a device
+hggcDeviceProp GetHggcDevice();
 
 /// Prints device properties
-std::ostream &operator<<(std::ostream &out, cudaDeviceProp const &device);
+std::ostream &operator<<(std::ostream &out, hggcDeviceProp const &device);
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -87,12 +88,6 @@ int CutlassUnitTestProblemCount();
 
 #if !defined(CUTLASS_TEST_UNIT_ENABLE_WARNINGS)
 #define CUTLASS_TEST_UNIT_ENABLE_WARNINGS false
-#endif
-
-#if (__CUDACC_VER_MAJOR__ >= 12)
-  #define CUDA_12_0_SM90_FEATURES_SUPPORTED true
-#else
-  #define CUDA_12_0_SM90_FEATURES_SUPPORTED false
 #endif
 
 #include <cutlass/cutlass.h>

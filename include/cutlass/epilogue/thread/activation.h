@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief This extends the contents of cutlass/functional.h with frequently used activation functions.
 
@@ -782,6 +784,193 @@ struct ElementwiseFilter<Array<T, N> > {
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+// PPU adds more activations
+
+// additional threshold param than original LeakyRelu
+template <typename T>
+struct AcLeakyReLU {
+
+  static const bool kIsHeavy = false;
+
+  struct Arguments {
+    T threshold = T(0);
+    T leaky_alpha = T(0);
+  };
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& value, T const& threshold, T const& leaky_alpha) const {
+    T res = value > threshold ? value : value * leaky_alpha;
+    return res;
+  }
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& value, Arguments const& args = Arguments()) const {
+    return this->operator()(value, args.threshold, args.leaky_alpha);
+  }
+};
+
+template <typename T, int N>
+struct AcLeakyReLU<Array<T, N> > {
+
+  static const bool kIsHeavy = false;
+
+  using Arguments = typename AcLeakyReLU<T>::Arguments;
+
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const& values, T const& threshold, T const& leaky_alpha) const {
+    Array<T, N> y;
+    AcLeakyReLU<T> leaky_op;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < int(values.size()); ++i) {
+      y[i] = leaky_op(values[i], threshold, leaky_alpha);
+    }
+
+    return y;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const& values, Arguments const& args = Arguments()) const {
+    return this->operator()(values, args.threshold, args.leaky_alpha);
+  }
+};
+
+// HSigmoid operator
+template <typename T>
+struct AcHSigmoid {
+  CUTLASS_HOST_DEVICE
+  T operator()(T const &scalar) const {
+    if (scalar < T(-3.0)) {
+      return T(0.0);
+    } else if (scalar > T(3.0)) {
+      return T(1.0);
+    } else {
+      return T(scalar * T(1.0 / 6.0) + T(0.5));
+    }
+  }
+};
+
+template <typename T, int N>
+struct AcHSigmoid<Array<T, N> > {
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const &rhs) const {
+    Array<T, N> y;
+    AcHSigmoid<T> hsigmoid_op;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < int(rhs.size()); ++i) {
+      y[i] = hsigmoid_op(rhs[i]);
+    }
+
+    return y;
+  }
+};
+
+
+template <typename T>
+struct AcHSwish {
+  CUTLASS_HOST_DEVICE
+  T operator()(T const &scalar) const {
+    return T(scalar * AcHSigmoid<T>()(scalar));
+  }
+};
+
+template <typename T, int N>
+struct AcHSwish<Array<T, N> > {
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const &rhs) const {
+    Array<T, N> y;
+    AcHSigmoid<T> hsigmoid_op;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < int(rhs.size()); ++i) {
+      y[i] = rhs[i] * hsigmoid_op(rhs[i]);
+    }
+
+    return y;
+  }
+};
+
+
+/// ClippedReLu operator - propagates NaNs
+template <typename T>
+struct AcClipReLu {
+
+  struct Arguments {
+    T threshold0 = T(0);
+    T threshold1 = T(0);
+  };
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T value, T const & threshold0, T const & threshold1) const {
+    if (value < threshold0) {
+      value = threshold0;
+    } else if(value > threshold1) {
+      value = threshold1;
+    }
+    return value;
+  }
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& value, Arguments const& args = Arguments()) const {
+    return this->operator()(value, args.threshold0, args.threshold1);
+  }
+};
+
+template <typename T, int N>
+struct AcClipReLu<Array<T, N>> {
+
+  using Arguments = typename AcClipReLu<T>::Arguments;
+
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const &frag, T const & threshold0, T const & threshold1) const {
+    Array<T, N> result;
+    AcClipReLu<T> clip_relu_op;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N; ++i) {
+      result[i] = clip_relu_op(frag[i], threshold0, threshold1);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const& values, Arguments const& args = Arguments()) const {
+    return this->operator()(values, args.threshold0, args.threshold1);
+  }
+};
+
+
+/// ELu operator - propagates NaNs
+template <typename T>
+struct AcPReLu {
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T value, T const & coeff) const {
+    if (value < T(.0f)) {
+      value = T(float(float(value) * float(coeff)));
+    }
+    return value;
+  }
+};
+
+template <typename T, int N>
+struct AcPReLu<Array<T, N>> {
+
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const &frag, Array<T, N> const & coeff) const {
+    Array<T, N> result;
+    AcPReLu<T> PReLu_op;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N; ++i) {
+      result[i] = PReLu_op(frag[i], coeff[i]);
+    }
+    return result;
+  }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 } // namespace thread
 } // namespace epilogue

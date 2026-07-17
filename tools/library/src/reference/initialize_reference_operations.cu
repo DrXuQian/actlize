@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief
 
@@ -60,14 +62,10 @@ void initialize_gemm_reference_operations_fp_other(Manifest &manifest);
 void initialize_gemm_reference_operations_fp_mixed_input(Manifest &manifest);
 void initialize_gemm_reference_operations_int_mixed_input(Manifest &manifest);
 
-void initialize_conv2d_reference_operations(Manifest &manifest);
-void initialize_conv3d_reference_operations(Manifest &manifest);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 void initialize_reference_operations(Manifest &manifest) {
-  initialize_conv2d_reference_operations(manifest);
-  initialize_conv3d_reference_operations(manifest);
 
   initialize_gemm_reference_operations_int4(manifest);
 

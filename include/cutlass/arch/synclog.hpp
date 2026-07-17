@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Synchronization event logging for race condition debugging.
 */
@@ -36,13 +38,13 @@
 
 #include "cutlass/detail/helper_macros.hpp"
 
-#if defined(__CUDACC_RTC__)
-#include <cuda/std/cstdint>
+#if defined(__HGGCCC_RTC__)
+#include <hggc/std/cstdint>
 #else
 #include <cstdint>
 #endif
 
-#if !defined(__CUDACC_RTC__)
+#if !defined(__HGGCCC_RTC__)
 #include <mutex>
 #include <vector>
 #endif
@@ -58,13 +60,13 @@ constexpr uint32_t synclog_cap = 1 << 26;
 
 inline std::mutex synclog_mutex;
 inline std::vector<uint32_t*> synclog_buf_list;
-#if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+#if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
 CUTLASS_DEVICE uint32_t* synclog_buf;
 #endif
 
 CUTLASS_DEVICE
 uint32_t* synclog_alloc(uint32_t n) {
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   uint32_t* buf = synclog_buf;
   if (buf == nullptr) return nullptr;
   uint32_t last = atomicAdd(&buf[0], n);
@@ -76,10 +78,10 @@ uint32_t* synclog_alloc(uint32_t n) {
 
 CUTLASS_DEVICE
 void synclog_emit_prefix(uint32_t* to, uint32_t header, uint32_t line) {
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   uint64_t time64;
   asm volatile (
-    "mov.u64 %0, %%globaltimer;\n"
+    "ppu.mov.u64 %0, %%globaltimer;\n"
     : "=l"(time64) :
   );
   to[0] = header;
@@ -232,7 +234,7 @@ constexpr uint32_t synclog_length_cpasync_barrier_arrive = synclog_length_prefix
 
 CUTLASS_DEVICE
 bool synclog_condition_emit() {
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   return threadIdx.x%NumThreadsPerWarp == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
   #else
@@ -242,7 +244,7 @@ bool synclog_condition_emit() {
 
 CUTLASS_DEVICE
 bool synclog_condition_print() {
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   return threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
   #else
@@ -252,7 +254,7 @@ bool synclog_condition_print() {
 
 CUTLASS_DEVICE
 void synclog_print_prefix(char const* header, uint32_t at) {
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   uint32_t line = synclog_buf[at + 1];
   uint32_t timeLo = synclog_buf[at + 2];
   uint32_t timeHi = synclog_buf[at + 3];
@@ -276,8 +278,8 @@ CUTLASS_DEVICE
 uint64_t synclog_mbarrier_bits(uint32_t smem_addr) {
   uint64_t bits = 0;
   asm volatile (
-    "mbarrier.inval.shared::cta.b64 [%1];\n"
-    "ld.shared::cta.b64 %0, [%1];\n"
+    "ppu.awbar.inval.shared::cta.b64 [%1];\n"
+    "ppu.ld.shared::cta.b64 %0, [%1];\n"
     : "=l"(bits) : "r"(smem_addr)
   );
   return bits;
@@ -296,25 +298,25 @@ void synclog_print_wgmma_desc(char const* str, uint32_t lo, uint32_t hi, char co
 
 inline void synclog_setup() {
   #if defined(CUTLASS_ENABLE_SYNCLOG)
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   std::scoped_lock lock(synclog_mutex);
   auto fail = [] () {
     fprintf(stderr, "synclog_setup() failed\n");
     std::terminate();
   };
   int orig_device = 0;
-  if (cudaGetDevice(&orig_device) != cudaSuccess) {
+  if (hggcGetDevice(&orig_device) != hggcSuccess) {
     fail();
   }
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+  if (hggcGetDeviceCount(&device_count) != hggcSuccess) {
     fail();
   }
   if (synclog_buf_list.size() == 0) {
     for (int device = 0; device < device_count; device++) {
       uint32_t* buf = 0;
-      if (cudaSetDevice(device) != cudaSuccess ||
-        cudaMalloc(&buf, synclog_cap * sizeof(uint32_t)) != cudaSuccess) {
+      if (hggcSetDevice(device) != hggcSuccess ||
+        hggcMalloc(&buf, synclog_cap * sizeof(uint32_t)) != hggcSuccess) {
         fail();
       }
       synclog_buf_list.push_back(buf);
@@ -322,13 +324,13 @@ inline void synclog_setup() {
   }
   for (int device = 0; device < device_count; device++) {
     uint32_t* buf = synclog_buf_list.at(device);
-    if (cudaSetDevice(device) != cudaSuccess ||
-      cudaMemset(buf, 0, synclog_cap * sizeof(uint32_t)) != cudaSuccess ||
-      cudaMemcpyToSymbol(synclog_buf, &buf, sizeof(buf)) != cudaSuccess) {
+    if (hggcSetDevice(device) != hggcSuccess ||
+      hggcMemset(buf, 0, synclog_cap * sizeof(uint32_t)) != hggcSuccess ||
+      hggcMemcpyToSymbol(synclog_buf, &buf, sizeof(buf)) != hggcSuccess) {
       fail();
     }
   }
-  if (cudaSetDevice(orig_device) != cudaSuccess) {
+  if (hggcSetDevice(orig_device) != hggcSuccess) {
     fail();
   }
   #endif
@@ -992,14 +994,14 @@ void synclog_emit_cpasync_barrier_arrive(
 
 #if !defined(CUTLASS_ENABLE_SYNCLOG)
 CUTLASS_DEVICE
-#elif defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+#elif defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
 static __attribute__((__noinline__)) __device__
 #else
 static __attribute__((__noinline__))
 #endif
 void synclog_print() {
   #if defined(CUTLASS_ENABLE_SYNCLOG)
-  #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+  #if defined(__HGGCCC__) || (defined(__clang__) && defined(__HGGC__))
   if (synclog_buf == nullptr || !synclog_condition_print()) {
     return;
   }
@@ -1287,7 +1289,6 @@ void synclog_print() {
         continue;
       }
     }
-    asm volatile ("brkpt;\n" ::);
   }
   if (synclog_buf[0] >= synclog_cap) {
     printf(

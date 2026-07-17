@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -47,7 +48,7 @@ namespace library {
 
 /// Constructor
 Handle::Handle(
-  cudaStream_t stream,
+  hggcStream_t stream,
   size_t workspace_size
 ):
   provider_(Provider::kCUTLASS),
@@ -57,14 +58,14 @@ Handle::Handle(
   scalar_pointer_mode_(ScalarPointerMode::kHost),
   last_operation_(nullptr) {
 
-  cudaError_t error = cudaGetDevice(&device_idx_);
-  if (error != cudaSuccess) {
-    throw std::runtime_error("cudaGetDevice() failed");
+  hggcError_t error = hggcGetDevice(&device_idx_);
+  if (error != hggcSuccess) {
+    throw std::runtime_error("hggcGetDevice() failed");
   }
 
-  error = cudaGetDeviceProperties(&device_, device_idx_);
-  if (error != cudaSuccess) {
-    throw std::runtime_error("cudaGetDeviceProperties() failed");
+  error = hggcGetDeviceProperties(&device_, device_idx_);
+  if (error != hggcSuccess) {
+    throw std::runtime_error("hggcGetDeviceProperties() failed");
   }
 
   set_workspace_size(workspace_size);
@@ -77,13 +78,13 @@ Handle::~Handle() {
   if (workspace_) {
 
     int device_before;
-    cudaGetDevice(&device_before);
+    hggcGetDevice(&device_before);
     if (device_before != device_idx_) {
-      cudaSetDevice(device_idx_);
+      hggcSetDevice(device_idx_);
     }
-    cudaFree(workspace_);
+    hggcFree(workspace_);
     if (device_before != device_idx_) {
-      cudaSetDevice(device_before);
+      hggcSetDevice(device_before);
     }
 
     workspace_ = nullptr;
@@ -93,9 +94,9 @@ Handle::~Handle() {
 
 /// Move constructor
 Handle::Handle(Handle && handle) {
-  cudaError_t error = cudaGetDevice(&device_idx_);
-  if (error != cudaSuccess) {
-    throw std::runtime_error("cudaGetDevice() failed");
+  hggcError_t error = hggcGetDevice(&device_idx_);
+  if (error != hggcSuccess) {
+    throw std::runtime_error("hggcGetDevice() failed");
   }
   device_ = handle.device_;
   workspace_size_ = handle.workspace_size_;
@@ -129,13 +130,13 @@ int Handle::compute_capability() const {
   return device_.major * 10 + device_.minor;
 }
 
-/// Sets the current CUDA stream
-void Handle::set_stream(cudaStream_t stream) {
+/// Sets the current device stream
+void Handle::set_stream(hggcStream_t stream) {
   stream_ = stream;
 }
 
-/// Gets the current CUDA stream
-cudaStream_t Handle::get_stream() const {
+/// Gets the current device stream
+hggcStream_t Handle::get_stream() const {
   return stream_;
 }
 
@@ -162,15 +163,15 @@ void *Handle::get_workspace() const {
 /// Sets the size of device workspace, invalidating previous calls to get_device_workspace()
 void Handle::set_workspace_size(size_t bytes) {
   int device_before;
-  cudaGetDevice(&device_before);
+  hggcGetDevice(&device_before);
   if (device_before != device_idx_) {
-    cudaSetDevice(device_idx_);
+    hggcSetDevice(device_idx_);
   }
 
   if (bytes != workspace_size_) {
 
     if (workspace_) {
-      cudaFree(workspace_);
+      hggcFree(workspace_);
     }
 
     workspace_ = nullptr;
@@ -178,23 +179,23 @@ void Handle::set_workspace_size(size_t bytes) {
 
     if (workspace_size_) {
 
-      cudaError_t error = cudaMalloc((void **)&workspace_, workspace_size_);
+      hggcError_t error = hggcMalloc((void **)&workspace_, workspace_size_);
 
-      if (error != cudaSuccess) {
+      if (error != hggcSuccess) {
         throw std::runtime_error("Failed to allocate workspace");
       }
     }
   }
 
   if (workspace_) {
-    cudaError_t error = cudaMemset(workspace_, 0, workspace_size_);
+    hggcError_t error = hggcMemset(workspace_, 0, workspace_size_);
 
-    if (error != cudaSuccess) {
+    if (error != hggcSuccess) {
       throw std::runtime_error("Failed to clear workspace");
     }
   }
   if (device_before != device_idx_) {
-    cudaSetDevice(device_before);
+    hggcSetDevice(device_before);
   }
 }
 
@@ -895,8 +896,8 @@ Status Handle::gemm_planar_complex(
 /// Planar complex batched GEMM loading pointers from arrays in global memory
 Status Handle::gemm_planar_complex_array(
 
-  int expected_M,                           /// Expected GEMM M dimension (used for sizing CUDA grid)
-  int expected_N,                           /// Expected GEMM N dimension (used for sizing CUDA grid)
+  int expected_M,                           /// Expected GEMM M dimension (used for sizing device grid)
+  int expected_N,                           /// Expected GEMM N dimension (used for sizing device grid)
   int expected_K,                           /// Expected GEMM K dimension
   int batch_count,                          /// Number of independent GEMM computations to execute
 
@@ -1077,69 +1078,6 @@ Status Handle::gemm_planar_complex_array(
   };
 
   return operation->run(&arguments, host_workspace, workspace_, stream_);
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Finds conv operation instances with Conv::ElementC = Reduction::ElementWorkspace
-Operation const* find_conv_operation_for_parallel_reduction(Operation const *operation) {
-
-  ConvDescription const &conv_desc =
-    static_cast<ConvDescription const &>(operation->description());
-
-  // if the curren conv operation accumulator and output data type match return operation
-  if(conv_desc.tile_description.math_instruction.element_accumulator == conv_desc.C.element) {
-    return operation;
-  }
-
-  // find conv operation to match conv output and reduction workspace data type
-  ConvFunctionalKey key(
-    library::Provider::kCUTLASS,
-    conv_desc.conv_kind,
-    conv_desc.A.element,
-    conv_desc.A.layout,
-    conv_desc.B.element,
-    conv_desc.B.layout,
-    conv_desc.tile_description.math_instruction.element_accumulator,
-    conv_desc.C.layout,
-    conv_desc.tile_description.math_instruction.element_accumulator,
-    conv_desc.element_epilogue);
-
-  // conv operation table for conv2d or conv3d
-  auto conv_operations = (conv_desc.kind == OperationKind::kConv2d) ?
-                          Singleton::get().operation_table.conv2d_operations :
-                          Singleton::get().operation_table.conv3d_operations;
-
-  // find ConvFunctionalKey in convolution operation table
-  auto operators_it = conv_operations.find(key);
-
-  if (operators_it == conv_operations.end()) {
-    return nullptr;
-  }
-
-  if (operators_it->second.empty()) {
-    return nullptr;
-  }
-
-  // conv operation for same compute capability and iterator algorithm
-  ConvPreferenceKey preference_key(
-    conv_desc.tile_description.minimum_compute_capability,
-    conv_desc.iterator_algorithm);
-
-  auto it = operators_it->second.find(preference_key);
-
-  if(it == operators_it->second.end()) {
-    return nullptr;
-  }
-
-  // return matching conv opertion (same tile sizes and instruction)
-  for (auto op : it->second) {
-    if (op->description().tile_description == operation->description().tile_description) {
-      return op;
-    }
-  }
-
-  return nullptr;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

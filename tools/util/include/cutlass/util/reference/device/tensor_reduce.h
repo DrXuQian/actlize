@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include <cmath>
@@ -124,20 +126,52 @@ __global__ void TensorTransformReducePartial(
 
   __shared__ ComputeType scratchpad[kBlockSize];
 
+  // Hoist base pointers and layout/extent out of the per-iteration body.
+  // Some device backends generate poor register allocation when the
+  // multi-iteration loop repeatedly evaluates view_A.at()/view_B.at()
+  // through the by-value TensorView arguments, leading to the second
+  // base-pointer being clobbered between iterations.
+  //
+  // Also mark both base pointers as __restrict__. Without it the PPU
+  // clang 13.0.1 backend fails to keep ptr_B's base scalar register
+  // (sreg pair) live across the fp16 double-tensor reduction path:
+  // it speculatively folds ptr_B's load into ptr_A's address-gen,
+  // then when the per-element load issues against the wrong base the
+  // vmem.ld.b16 trips a 'global mem out of range' inside
+  // cutlass::half_t::convert during the transform(a,b) call. The
+  // single-tensor and the fp32 double-tensor paths happen to avoid
+  // the same alias-folding because of their wider element-size code
+  // sequence. Adding __restrict__ tells the backend the two streams
+  // never overlap, which is true for every call site of this kernel.
+  Element const* __restrict__ ptr_A = view_A.data();
+  Element const* __restrict__ ptr_B = view_B.data();
+  Layout layout_A = view_A.layout();
+  auto extent_A = view_A.extent();
+
   for (; idx < size; idx += blockDim.x * gridDim.x) {
 
     // Map linear thread ID onto tensor coordinate
     typename Layout::TensorCoord coord;
 
-    cutlass::reference::detail::LinearToCoordinate<Layout::kRank>()(coord, idx, view_A.extent());
+    cutlass::reference::detail::LinearToCoordinate<Layout::kRank>()(coord, idx, extent_A);
 
-    if (view_A.contains(coord)) {
+    bool inside = true;
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < Layout::TensorCoord::kRank; ++r) {
+      if (coord[r] < 0 || coord[r] >= extent_A[r]) {
+        inside = false;
+      }
+    }
+
+    if (inside) {
+
+      int64_t off = layout_A(coord);
 
       // Fetch element
-      Element a = view_A.at(coord);
-      Element b = view_B.at(coord);
+      Element a = ptr_A[off];
+      Element b = ptr_B[off];
 
-      // Transform 
+      // Transform
       identity = reduce(identity, transform(a, b));
     }
   }
@@ -209,7 +243,7 @@ ComputeType TensorTransformReduce(
   TransformOp transform,                /// Transforms the tensor element to ComputeType: g(Element) => ComputeType
   ComputeType *workspace,               /// Device-side workspace for accumulating partial results. The reduced element is stored in workspace[0]
   int workspace_size,                   /// Number of elements in workspace
-  cudaStream_t stream = nullptr,        /// CUDA stream to launch into
+  hggcStream_t stream = nullptr,        /// device stream to launch into
   bool copy_out = true                  /// If true, the value of workspace[0] is copied to host and returned. Otherwise, `identity` is returned.
 ) {
 
@@ -233,9 +267,9 @@ ComputeType TensorTransformReduce(
   );
 
   if (copy_out) {
-    cudaError_t result = cudaMemcpy(&identity, workspace, sizeof(identity), cudaMemcpyDeviceToHost);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaMemcpy() failed");
+    hggcError_t result = hggcMemcpy(&identity, workspace, sizeof(identity), hggcMemcpyDeviceToHost);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcMemcpy() failed");
     }
   }
 
@@ -258,7 +292,7 @@ ComputeType TensorTransformReduce(
   TransformOp transform,                /// Transforms the tensor element to ComputeType: g(Element) => ComputeType
   ComputeType *workspace,               /// Device-side workspace for accumulating partial results. The reduced element is stored in workspace[0]
   int workspace_size,                   /// Number of elements in workspace
-  cudaStream_t stream = nullptr,        /// CUDA stream to launch into
+  hggcStream_t stream = nullptr,        /// device stream to launch into
   bool copy_out = true                  /// If true, the value of workspace[0] is copied to host and returned. Otherwise, `identity` is returned.
 ) {
 
@@ -286,9 +320,9 @@ ComputeType TensorTransformReduce(
   );
 
   if (copy_out) {
-    cudaError_t result = cudaMemcpy(&identity, workspace, sizeof(identity), cudaMemcpyDeviceToHost);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaMemcpy() failed");
+    hggcError_t result = hggcMemcpy(&identity, workspace, sizeof(identity), hggcMemcpyDeviceToHost);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcMemcpy() failed");
     }
   }
 
@@ -309,24 +343,24 @@ ComputeType TensorTransformReduce(
   ComputeType identity,            
   ReduceOp reduce,                 
   TransformOp transform,
-  cudaStream_t stream = nullptr, 
+  hggcStream_t stream = nullptr, 
   int workspace_size = 0           
 ) {
 
-  // Optionally query for the SM count to size the workspace.
+  // Optionally query for the CU count to size the workspace.
   if (!workspace_size) {
 
     int device_idx = 0;
-    cudaDeviceProp prop;
+    hggcDeviceProp prop;
 
-    cudaError_t result = cudaGetDevice(&device_idx);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDevice() failed");
+    hggcError_t result = hggcGetDevice(&device_idx);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDevice() failed");
     }
 
-    result = cudaGetDeviceProperties(&prop, device_idx);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProp() failed");
+    result = hggcGetDeviceProperties(&prop, device_idx);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProp() failed");
     }
 
     workspace_size = int(prop.multiProcessorCount);
@@ -363,24 +397,24 @@ ComputeType TensorTransformReduce(
   ComputeType identity,            
   ReduceOp reduce,                 
   TransformOp transform,
-  cudaStream_t stream = nullptr, 
+  hggcStream_t stream = nullptr, 
   int workspace_size = 0           
 ) {
 
-  // Optionally query for the SM count to size the workspace.
+  // Optionally query for the CU count to size the workspace.
   if (!workspace_size) {
 
     int device_idx = 0;
-    cudaDeviceProp prop;
+    hggcDeviceProp prop;
 
-    cudaError_t result = cudaGetDevice(&device_idx);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDevice() failed");
+    hggcError_t result = hggcGetDevice(&device_idx);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDevice() failed");
     }
 
-    result = cudaGetDeviceProperties(&prop, device_idx);
-    if (result != cudaSuccess) {
-      throw std::runtime_error("cudaGetDeviceProp() failed");
+    result = hggcGetDeviceProperties(&prop, device_idx);
+    if (result != hggcSuccess) {
+      throw std::runtime_error("hggcGetDeviceProp() failed");
     }
 
     workspace_size = int(prop.multiProcessorCount);
@@ -413,7 +447,7 @@ template <
 ComputeType TensorSum(
   TensorView<Element, Layout> view,
   ComputeType identity = ComputeType(),
-  cudaStream_t stream = nullptr,
+  hggcStream_t stream = nullptr,
   int workspace_size = 0
 ) {
 
@@ -433,7 +467,7 @@ template <
 ComputeType TensorSumSq(
   TensorView<Element, Layout> view,
   ComputeType identity = ComputeType(),
-  cudaStream_t stream = nullptr,
+  hggcStream_t stream = nullptr,
   int workspace_size = 0
 ) {
 
@@ -453,7 +487,7 @@ template <
 ComputeType TensorNorm(
   TensorView<Element, Layout> view,
   ComputeType identity = ComputeType(),
-  cudaStream_t stream = nullptr,
+  hggcStream_t stream = nullptr,
   int workspace_size = 0
 ) {
 
@@ -472,7 +506,7 @@ ComputeType TensorSumSqDiff(
   TensorView<Element, Layout> view_A,
   TensorView<Element, Layout> view_B,
   ComputeType identity = ComputeType(),
-  cudaStream_t stream = nullptr,
+  hggcStream_t stream = nullptr,
   int workspace_size = 0
 ) {
 
@@ -494,7 +528,7 @@ ComputeType TensorNormDiff(
   TensorView<Element, Layout> view_A,
   TensorView<Element, Layout> view_B,
   ComputeType identity = ComputeType(),
-  cudaStream_t stream = nullptr,
+  hggcStream_t stream = nullptr,
   int workspace_size = 0
 ) {
 

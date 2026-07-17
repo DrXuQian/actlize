@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,12 +29,13 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief CUTLASS host-device template for complex numbers supporting all CUTLASS numeric types.
 */
 
 #include <complex>
-#include <cuda/std/complex>
+#include <hggc/std/complex>
 
 #include "../common/cutlass_unit_test.h"
 
@@ -365,9 +367,9 @@ void conj_tester(T z, T z_c_expected, const char type_name[]) {
   using cutlass::conj;
   auto z_c = conj(z);
   static_assert(std::is_same_v<decltype(z_c), T>);
-  constexpr bool is_cuComplex = std::is_same_v<T, cuDoubleComplex> ||
-    std::is_same_v<T, cuFloatComplex>;
-  if constexpr (is_cuComplex) {
+  constexpr bool is_acComplex = std::is_same_v<T, acDoubleComplex> ||
+    std::is_same_v<T, acFloatComplex>;
+  if constexpr (is_acComplex) {
     EXPECT_EQ(z_c.x, z_c_expected.x);
     EXPECT_EQ(z_c.y, z_c_expected.y) << "conj failed for type " << type_name;
   }
@@ -377,8 +379,8 @@ void conj_tester(T z, T z_c_expected, const char type_name[]) {
 
   auto z_c2 = cutlass::conjugate<T>{}(z);
   static_assert(std::is_same_v<decltype(z_c2), T>);
-  if constexpr (is_cuComplex) {
-    // cuFloatComplex and cuDoubleComplex don't report conj(z) as
+  if constexpr (is_acComplex) {
+    // acFloatComplex and acDoubleComplex don't report conj(z) as
     // being well-formed, probably because they are type aliases of
     // some kind.  cutlass::conj works fine, though!
     static_assert(! cutlass::platform::is_arithmetic_v<T> &&
@@ -471,29 +473,29 @@ TEST(complex, conj_with_complex_types_not_in_cutlass_namespace) {
   }
 }
 
-TEST(complex, conj_with_cuda_std_complex_types) {
+TEST(complex, conj_with_hggc_std_complex_types) {
   {
-    cuda::std::complex<double> z{3.0, 4.0};
-    cuda::std::complex<double> z_c_expected{3.0, -4.0};
-    test::conj_tester(z, z_c_expected, "cuda::std::complex<double>");
+    hggc::std::complex<double> z{3.0, 4.0};
+    hggc::std::complex<double> z_c_expected{3.0, -4.0};
+    test::conj_tester(z, z_c_expected, "hggc::std::complex<double>");
   }
   {
-    cuda::std::complex<float> z{3.0f, 4.0f};
-    cuda::std::complex<float> z_c_expected{3.0f, -4.0f};
-    test::conj_tester(z, z_c_expected, "cuda::std::complex<float>");
+    hggc::std::complex<float> z{3.0f, 4.0f};
+    hggc::std::complex<float> z_c_expected{3.0f, -4.0f};
+    test::conj_tester(z, z_c_expected, "hggc::std::complex<float>");
   }
 }
 
-TEST(complex, conj_with_cuComplex_types) {
+TEST(complex, conj_with_acComplex_types) {
   {
-    cuDoubleComplex z = make_cuDoubleComplex(3.0, 4.0);
-    cuDoubleComplex z_c_expected = make_cuDoubleComplex(3.0, -4.0);
-    test::conj_tester(z, z_c_expected, "cuDoubleComplex");
+    acDoubleComplex z = make_acDoubleComplex(3.0, 4.0);
+    acDoubleComplex z_c_expected = make_acDoubleComplex(3.0, -4.0);
+    test::conj_tester(z, z_c_expected, "acDoubleComplex");
   }
   {
-    cuFloatComplex z = make_cuFloatComplex(3.0f, 4.0f);
-    cuFloatComplex z_c_expected = make_cuFloatComplex(3.0f, -4.0f);
-    test::conj_tester(z, z_c_expected, "cuFloatComplex");
+    acFloatComplex z = make_acFloatComplex(3.0f, 4.0f);
+    acFloatComplex z_c_expected = make_acFloatComplex(3.0f, -4.0f);
+    test::conj_tester(z, z_c_expected, "acFloatComplex");
   }
 }
 

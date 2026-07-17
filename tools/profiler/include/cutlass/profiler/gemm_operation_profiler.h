@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Gemm Profiler
 */
@@ -144,7 +146,7 @@ public:
     /// Buffer used for the cutlass reduction operations' host workspace
     std::vector<uint8_t> reduction_host_workspace;
 
-    cudaStream_t stream;
+    hggcStream_t stream;
   };
 
 protected:
@@ -227,7 +229,7 @@ protected:
     ProblemSpace const &problem_space);
 
   /// Verifies CUTLASS against references
-  bool verify_with_cublas_(
+  bool verify_with_acblas_(
     Options const &options,
     PerformanceReport &report,
     DeviceContext &device_context,

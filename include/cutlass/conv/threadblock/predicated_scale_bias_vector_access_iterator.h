@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -275,16 +276,16 @@ class PredicatedScaleBiasVectorAccessIterator<ThreadblockShape_,
   bool valid() {
     uint32_t enabled = 0;
 
-#if defined(_MSC_VER) || (__CUDACC_VER_MAJOR__ < 11)
+#if (__HGGCCC_VER_MAJOR__ < 11)
     enabled = threadIdx.x < kThreads * 2;
 #else
     asm volatile(
         "{\n"
         "  .reg .u32 tid_reg;\n"
         "  .reg .pred p;\n"
-        "  mov.u32 tid_reg, %%tid.x;\n"
-        "  setp.lt.u32 p, tid_reg, %1;\n"
-        "  selp.u32 %0, 1, 0, p;\n"
+        "  ppu.mov.u32 tid_reg, %%tid.x;\n"
+        "  ppu.cmpp.lt.u32 p, tid_reg, %1;\n"
+        "  ppu.selp.u32 %0, 1, 0, p;\n"
         "}\n" : "+r"(enabled) :"n"(kThreads * 2));
 #endif
 

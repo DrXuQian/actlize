@@ -1,4 +1,5 @@
-/******************************************************************************
+/***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -27,7 +28,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- ******************************************************************************/
+ **************************************************************************************************/
 
 #pragma once
 
@@ -156,7 +157,10 @@ void rmsnorm(cutlass::MatrixCoord tensor_size,
              TensorRef<T, layout::RowMajor> ref_output,
              TensorRef<T, layout::RowMajor> ref_input,
              TensorRef<T, layout::RowMajor> ref_weight,
-             cudaStream_t stream, float epsilon = 1e-5f){
+             hggcStream_t stream, float epsilon = 1e-5f){
+  // Clear any sticky device error left over from a previously failing test or
+  // launch, so that the post-launch error check below reflects this kernel.
+  (void)hggcGetLastError();
   const int m = tensor_size.row();
   const int n = tensor_size.column();
   T* output = ref_output.data();
@@ -176,9 +180,16 @@ void rmsnorm(cutlass::MatrixCoord tensor_size,
         output, input, weight, m, n, epsilon);
   }
 
-  auto result = cudaGetLastError();
-  if (result != cudaSuccess) {
-    std::cerr << "CUDA error: " << cudaGetErrorString(result) << std::endl;
+  // Synchronize first so any deferred launch errors surface here. Otherwise
+  // hggcGetLastError() may report stale state on the PPU device runtime.
+  auto sync_result = hggcDeviceSynchronize();
+  auto last_result = hggcGetLastError();
+  auto result = (sync_result != hggcSuccess) ? sync_result : last_result;
+  if (result != hggcSuccess) {
+    std::cerr << "cutlass::rmsnorm device error: " << hggcGetErrorString(result)
+              << " (m=" << m << ", n=" << n
+              << ", path=" << ((n % 8 == 0 && std::is_same<T, cutlass::half_t>::value) ? "e8" : "e1")
+              << ")" << std::endl;
     abort();
   }
 }

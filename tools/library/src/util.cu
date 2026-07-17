@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -56,8 +57,8 @@ Provider_enumerants[] = {
   {"cutlass", "CUTLASS", Provider::kCUTLASS},
   {"host", "reference_host", Provider::kReferenceHost},
   {"device", "reference_device", Provider::kReferenceDevice},
-  {"cublas", "cuBLAS", Provider::kCUBLAS},
-  {"cudnn", "cuDNN", Provider::kCUDNN},                           
+  {"acblas", "acBLAS", Provider::kACBLAS},
+  {"acdnn", "acDNN", Provider::kACDNN},                           
 };
 
 /// Converts a Provider enumerant to a string
@@ -101,7 +102,6 @@ static struct {
 }
 GemmKind_enumerants[] = {
   {"gemm", "<Gemm>", GemmKind::kGemm},
-  {"spgemm", "<Sparse>", GemmKind::kSparse},
   {"universal", "<Universal>", GemmKind::kUniversal},
   {"planar_complex", "<PlanarComplex>", GemmKind::kPlanarComplex},
   {"planar_complex_array", "<PlanarComplexArray>", GemmKind::kPlanarComplexArray},
@@ -126,90 +126,6 @@ char const *to_string(GemmKind type, bool pretty) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-
-static struct {
-  char const *text;
-  char const *pretty;
-  RankKKind enumerant;
-}
-RankKKind_enumerants[] = {
-  {"universal", "<Universal>", RankKKind::kUniversal},
-};
-
-/// Converts a SyrkKind enumerant to a string
-char const *to_string(RankKKind type, bool pretty) {
-
-  for (auto const & possible :RankKKind_enumerants) {
-    if (type == possible.enumerant) {
-      if (pretty) {
-        return possible.pretty;
-      }
-      else {
-        return possible.text;
-      }
-    }
-  }
-
-  return pretty ? "Invalid" : "invalid";
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-static struct {
-  char const *text;
-  char const *pretty;
-  TrmmKind enumerant;
-}
-TrmmKind_enumerants[] = {
-  {"universal", "<Universal>", TrmmKind::kUniversal},
-};
-
-/// Converts a TrmmKind enumerant to a string
-char const *to_string(TrmmKind type, bool pretty) {
-
-  for (auto const & possible :TrmmKind_enumerants) {
-    if (type == possible.enumerant) {
-      if (pretty) {
-        return possible.pretty;
-      }
-      else {
-        return possible.text;
-      }
-    }
-  }
-
-  return pretty ? "Invalid" : "invalid";
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-static struct {
-  char const *text;
-  char const *pretty;
-  SymmKind enumerant;
-}
-SymmKind_enumerants[] = {
-  {"universal", "<Universal>", SymmKind::kUniversal},
-};
-
-/// Converts a SymmKind enumerant to a string
-char const *to_string(SymmKind type, bool pretty) {
-
-  for (auto const & possible :SymmKind_enumerants) {
-    if (type == possible.enumerant) {
-      if (pretty) {
-        return possible.pretty;
-      }
-      else {
-        return possible.text;
-      }
-    }
-  }
-
-  return pretty ? "Invalid" : "invalid";
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
 static struct {
   char const *text;
   char const *pretty;
@@ -268,33 +184,6 @@ char const *to_string(FillMode type, bool pretty) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-static struct {
-  char const *text;
-  char const *pretty;
-  BlasMode enumerant;
-}
-BlasMode_enumerants[] = {
-  {"symmetric", "Symmetric", BlasMode::kSymmetric},
-  {"hermitian", "Hermitian", BlasMode::kHermitian}
-};
-
-/// Converts a BlasMode enumerant to a string
-char const *to_string(BlasMode type, bool pretty) {
-
-  for (auto const & possible :BlasMode_enumerants) {
-    if (type == possible.enumerant) {
-      if (pretty) {
-        return possible.pretty;
-      }
-      else {
-        return possible.text;
-      }
-    }
-  }
-
-  return pretty ? "Invalid" : "invalid";
-}
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 static struct {
@@ -333,14 +222,7 @@ static struct {
 }
 OperationKind_enumerants[] = {
   {"eq_gemm", "EqGemm", OperationKind::kEqGemm}, 
-  {"gemm", "Gemm", OperationKind::kGemm},
-  {"rank_k", "RankK", OperationKind::kRankK},
-  {"rank_2k", "Rank2K", OperationKind::kRank2K},
-  {"trmm", "Trmm", OperationKind::kTrmm},
-  {"symm", "Symm", OperationKind::kSymm},
-  {"conv2d", "Conv2d", OperationKind::kConv2d},           
-  {"conv3d", "Conv3d", OperationKind::kConv3d},           
-  {"spgemm", "SparseGemm", OperationKind::kSparseGemm},
+  {"gemm", "Gemm", OperationKind::kGemm},         
 };
 
 /// Converts a Status enumerant to a string
@@ -754,9 +636,6 @@ static struct {
 OpcodeClassID_enumerants[] = {
   {"simt", "<simt>", OpcodeClassID::kSimt},
   {"tensorop", "<tensorop>", OpcodeClassID::kTensorOp},
-  {"wmmatensorop", "<wmmatensorop>", OpcodeClassID::kWmmaTensorOp},
-  {"wmma", "<wmma>", OpcodeClassID::kWmmaTensorOp},
-  {"sptensorop", "<sptensorop>", OpcodeClassID::kSparseTensorOp}
 };
 
 /// Converts a OpcodeClassID enumerant to a string
@@ -875,49 +754,6 @@ SplitKMode from_string<SplitKMode>(std::string const &str) {
   return SplitKMode::kInvalid;
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-static struct {
-  char const *text;
-  char const *pretty;
-  ConvModeID enumerant;
-}
-ConvModeID_enumerants[] = {
-  {"cross", "<cross>", ConvModeID::kCrossCorrelation},
-  {"conv", "<conv>", ConvModeID::kConvolution},
-};
-
-/// Converts a ConvModeID enumerant to a string
-char const *to_string(ConvModeID type, bool pretty) {
-
-  for (auto const & possible : ConvModeID_enumerants) {
-    if (type == possible.enumerant) {
-      if (pretty) {
-        return possible.pretty;
-      }
-      else {
-        return possible.text;
-      }
-    }
-  }
-
-  return pretty ? "Invalid" : "invalid";
-}
-
-/// Converts a ConvModeID enumerant from a string
-template <>
-ConvModeID from_string<ConvModeID>(std::string const &str) {
-
-  for (auto const & possible : ConvModeID_enumerants) {
-    if ((str.compare(possible.text) == 0) ||
-        (str.compare(possible.pretty) == 0)) {
-      return possible.enumerant;
-    }
-  }
-
-  return ConvModeID::kInvalid;
-}
-
-
 static struct {
   char const *text;
   char const *pretty;
@@ -963,50 +799,6 @@ IteratorAlgorithmID from_string<IteratorAlgorithmID>(std::string const &str) {
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-static struct {
-  char const *text;
-  char const *pretty;
-  ConvKind enumerant;
-}
-ConvKind_enumerants[] = {
-  {"unknown", "<unknown>", ConvKind::kUnknown},
-  {"fprop", "<fprop>", ConvKind::kFprop},
-  {"dgrad", "<dgrad>", ConvKind::kDgrad},
-  {"wgrad", "<wgrad>", ConvKind::kWgrad},
-};
-
-/// Converts a ConvKind enumerant to a string
-char const *to_string(ConvKind type, bool pretty) {
-
-  for (auto const & possible : ConvKind_enumerants) {
-    if (type == possible.enumerant) {
-      if (pretty) {
-        return possible.pretty;
-      }
-      else {
-        return possible.text;
-      }
-    }
-  }
-
-  return pretty ? "Invalid" : "invalid";
-}
-
-
-/// Converts a ConvKind enumerant from a string
-template <>
-ConvKind from_string<ConvKind>(std::string const &str) {
-
-  for (auto const & possible : ConvKind_enumerants) {
-    if ((str.compare(possible.text) == 0) ||
-        (str.compare(possible.pretty) == 0)) {
-      return possible.enumerant;
-    }
-  }
-
-  return ConvKind::kInvalid;
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
 
 static struct {
   char const *text;

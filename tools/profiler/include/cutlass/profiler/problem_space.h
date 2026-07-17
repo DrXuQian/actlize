@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief 
 
@@ -916,16 +918,6 @@ bool arg_as_SplitKModeID(
   ProblemSpace::Problem const &problem);
 
 /// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
-bool arg_as_ConvModeID(library::ConvModeID &conv_mode, KernelArgument::Value const *value_ptr);
-
-/// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
-bool arg_as_ConvModeID(
-  library::ConvModeID &conv_mode,
-  char const *name,
-  ProblemSpace const &problem_space, 
-  ProblemSpace::Problem const &problem);
-
-/// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
 bool arg_as_IteratorAlgorithmID(library::IteratorAlgorithmID &iterator_algorithm, KernelArgument::Value const *value_ptr);
 
 /// Lexically casts an argument to an int64 if it is defined. Returns true if not null.
@@ -977,19 +969,6 @@ bool tensor_description_satisfies(
 /// Returns true if a tensor description satisfies a `tensor` value
 bool tensor_description_satisfies(
   library::TensorDescription const &tensor_desc,
-  char const *name, 
-  ProblemSpace const &problem_space, 
-  ProblemSpace::Problem const &problem);
-
-
-/// Returns true if a conv kind satisfies the value
-bool conv_kind_satisfies(
-  library::ConvKind const &conv_kind,
-  EnumeratedTypeArgument::EnumeratedTypeValue const *value_ptr);
-
-/// Returns true if a conv kind satisfies the value
-bool conv_kind_satisfies(
-  library::ConvKind const &conv_kind,
   char const *name, 
   ProblemSpace const &problem_space, 
   ProblemSpace::Problem const &problem);

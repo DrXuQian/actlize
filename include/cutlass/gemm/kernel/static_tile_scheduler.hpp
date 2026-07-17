@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/fast_math.h"
@@ -36,9 +38,10 @@
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cute/layout.hpp"
 #include "cute/tensor.hpp"
-#include "cute/arch/cluster_sm90.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 namespace cutlass::gemm::kernel::detail {
+
+using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -83,7 +86,7 @@ public:
     }
   };
 
-  using Params = PersistentTileSchedulerSm90Params;
+  using Params = PersistentTileSchedulerPPUParams;
   using RasterOrder = typename Params::RasterOrder;
   using RasterOrderOptions = typename Params::RasterOrderOptions;
   static constexpr bool IsDynamicPersistent = false;
@@ -106,9 +109,11 @@ public:
       [[maybe_unused]] const uint32_t epilogue_subtile = 1,
       [[maybe_unused]] uint32_t ktile_start_alignment_count = 1u) {
 
-    // We only need the tile and cluster shape during scheduler setup, so let FTAD do the magic
-    static_assert(cute::is_static<TileShape>::value);
-    static_assert(cute::is_static<ClusterShape>::value);
+// cutlass3 change
+// rtc will use this to get grid size on host
+    // ppu no need check
+    // static_assert(cute::is_static<TileShape>::value);
+    // static_assert(cute::is_static<ClusterShape>::value);
 
     dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
 
@@ -134,9 +139,8 @@ public:
   StaticPersistentTileScheduler() { }
 
   CUTLASS_DEVICE explicit StaticPersistentTileScheduler(Params const& params_) : scheduler_params(params_) {
-    // MSVC requires protecting use of CUDA-specific nonstandard syntax,
-    // like blockIdx and gridDim, with __CUDA_ARCH__.
-#if defined(__CUDA_ARCH__)
+    // Device-specific nonstandard syntax requires __HGGC_ARCH__ guard.
+#if defined(__HGGC_ARCH__)
     if (params_.raster_order_ == RasterOrder::AlongN) {
       current_work_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
     }
@@ -296,12 +300,12 @@ public:
   static auto
   work_tile_to_cta_coord(WorkTileInfo work_tile_info) {
     // Get every cta coord in three dimensions of the cluster
-    auto [cta_m_in_cluster, cta_n_in_cluster, cta_l_in_cluster] = cute::block_id_in_cluster();
+    // block_id_in_cluster, cta_m_in_cluster, cta_n_in_cluster, cta_l_in_cluster,always {0,0,0}
     return make_coord(
-      work_tile_info.M_idx + static_cast<int32_t>(cta_m_in_cluster),
-      work_tile_info.N_idx + static_cast<int32_t>(cta_n_in_cluster),
+      work_tile_info.M_idx + static_cast<int32_t>(0),
+      work_tile_info.N_idx + static_cast<int32_t>(0),
       _,
-      work_tile_info.L_idx + static_cast<int32_t>(cta_l_in_cluster)
+      work_tile_info.L_idx + static_cast<int32_t>(0)
     );
   }
 

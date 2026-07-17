@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
  /*! \file
   \brief Functor performing elementwise operations used by epilogues.
 */
@@ -81,7 +83,7 @@ class EpilogueWithVisitorCallbacks :
 
 public:
 
-  static_assert(Stages <= 2, "Sm80 EVT only support upto 2 Stages.");
+  static_assert(Stages <= 2, "PPU EVT only support upto 2 Stages.");
 
   // Whether the epilogue is pipelined
   static bool constexpr Pipelined = Stages > 1;
@@ -303,12 +305,6 @@ public:
       // Pipeline Loop
       //
 
-      #ifdef __clang__
-      #pragma clang diagnostic push
-      #pragma clang diagnostic ignored "-Wcuda-compat"
-      // Turn off clang warning about loop unroll argument using parens.
-      #endif
-
       #pragma unroll(IterationsUnroll ? kIterations : 1)
       for (int iter_idx = 1; iter_idx < kIterations + 1; ++iter_idx) {
 
@@ -384,17 +380,7 @@ public:
         callbacks.end_step(iter_idx-1);
       }
 
-      #ifdef __clang__
-      #pragma clang diagnostic pop
-      #endif
-
     } else {
-
-      #ifdef __clang__
-      #pragma clang diagnostic push
-      #pragma clang diagnostic ignored "-Wcuda-compat"
-      // Turn off clang warning about loop unroll argument using parens.
-      #endif
 
       #pragma unroll(IterationsUnroll ? kIterations : 1)
       for (int iter_idx = 0; iter_idx < kIterations; ++iter_idx) {
@@ -476,10 +462,6 @@ public:
 
         callbacks.end_step(iter_idx);
       }
-
-      #ifdef __clang__
-      #pragma clang diagnostic pop
-      #endif
 
     }
 

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -26,8 +27,9 @@
  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*
-**************************************************************************************************/
+ *
+ **************************************************************************************************/
+
 /*! \file
 \brief unit tests for NHWC tensor layout
 */
@@ -133,8 +135,8 @@ namespace layout {
     test::layout::test_nhwc_inverse<<< grid, block >>>(output.get(), 
             n_size, h_size, w_size, c_size);
 
-    cudaError_t result = cudaDeviceSynchronize();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    hggcError_t result = hggcDeviceSynchronize();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     //
     // Verify output
@@ -142,8 +144,8 @@ namespace layout {
 
     cutlass::device_memory::copy_to_host(output_host, output.get(), size);
 
-    result = cudaGetLastError();
-    ASSERT_EQ(result, cudaSuccess) << "CUDA error: " << cudaGetErrorString(result);
+    result = hggcGetLastError();
+    ASSERT_EQ(result, hggcSuccess) << "device error: " << hggcGetErrorString(result);
 
     for (int n_idx = 0; n_idx < n_size; n_idx++) {
       for (int p_idx = 0; p_idx < h_size; p_idx++) {

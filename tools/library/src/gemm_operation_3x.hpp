@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief Defines operations for all GEMM operation kinds in CUTLASS Library.
 */
@@ -248,11 +250,11 @@ protected:
         arguments->ldc, arguments->batch_stride_C);
     operator_args.epilogue.dD = operator_args.epilogue.dC;
 
-    /* Query device SM count to pass onto the kernel as an argument, where needed */
-    operator_args.hw_info.sm_count = arguments->sm_count;
-    if constexpr (!std::is_const_v<decltype(operator_args.scheduler.max_swizzle_size)>) {
-      operator_args.scheduler.max_swizzle_size = arguments->swizzle_size;
-    }
+    /* Query device CU count to pass onto the kernel as an argument, where needed */
+    operator_args.hw_info.cu_count = arguments->cu_count;
+    // if constexpr (!std::is_const_v<decltype(operator_args.scheduler.max_swizzle_size)>) {
+    //   operator_args.scheduler.max_swizzle_size = arguments->swizzle_size;
+    // }
 
     if constexpr (!std::is_const_v<decltype(operator_args.scheduler.raster_order)>) {
       using Enum_t = decltype(operator_args.scheduler.raster_order);
@@ -322,7 +324,7 @@ public:
       void const *configuration_ptr,
       void *host_workspace,
       void *device_workspace,
-      cudaStream_t stream = nullptr) const override {
+      hggcStream_t stream = nullptr) const override {
     Operator *op = new (host_workspace) Operator;
     return Status::kSuccess;
   }
@@ -332,7 +334,7 @@ public:
       void const *arguments_ptr,
       void *host_workspace,
       void *device_workspace = nullptr,
-      cudaStream_t stream = nullptr,
+      hggcStream_t stream = nullptr,
       bool launch_with_pdl = false) const override {
 
     OperatorArguments args;

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -509,7 +510,6 @@ TEST(CuTe_core, Composition)
     test_composition(a, b);
   }
 
-  // The SM80 fp64 MMA NT problem
   {
     auto a = make_layout(Shape<_1,Shape<_2,_4>>{}, Stride<_0,Stride<_m1,_512>>{});
     auto b = make_layout(_2{}, _m1{});

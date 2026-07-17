@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cute/layout.hpp"
@@ -35,12 +37,12 @@
 #include "cute/swizzle.hpp"              // cute::Swizzle
 #include "cute/swizzle_layout.hpp"       // cute::detail::get_swizzle_portion
 #include "cute/util/type_traits.hpp"
-#include "cute/arch/copy_sm90_tma.hpp"
 #include "cutlass/layout/matrix.h"
 #include "cutlass/layout/tensor.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/detail/collective.hpp"
 
+#include "cute/arch/copy_aiu_base.hpp"
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::detail {
@@ -293,26 +295,6 @@ using StrideToLayoutTagC_t = typename StrideToLayoutTagC<S>::type;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Inspects a tiled copy and whether its copy engine is TMA or not
-template<class GmemTiledCopy>
-constexpr bool is_tma_copy_engine() {
-  if constexpr (cute::is_void_v<GmemTiledCopy>) {
-    return false;
-  }
-  else {
-   if constexpr (   cute::is_base_of_v<cute::SM90_TMA_LOAD,                         GmemTiledCopy>
-                  || cute::is_base_of_v<cute::SM90_TMA_LOAD_MULTICAST,              GmemTiledCopy>
-                  || cute::is_base_of_v<cute::SM90_TMA_LOAD_IM2COL,                 GmemTiledCopy>
-                  || cute::is_base_of_v<cute::SM90_TMA_LOAD_IM2COL_MULTICAST,       GmemTiledCopy>
-                  || cute::is_base_of_v<cute::SM90_TMA_STORE,                       GmemTiledCopy>
-                  || cute::is_base_of_v<cute::SM90_TMA_STORE_IM2COL,                GmemTiledCopy>
-                  ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 template <class X, class = void>
 struct RawDtype { using type = X; };
 
@@ -329,24 +311,20 @@ get_alignment_count_from_gmem_tiled_copy() {
     return 1;
   }
 
+  // aiu supports alignment 1
+  else if (cute::is_aiu_copy_engine(GmemTiledCopy{})) {
+    // could not combine, for build correctness
+    return 1;
+  }
+
   // Account for ElementC = void kernels
   else if constexpr (cute::is_void_v<Element>) {
     return 0;
   }
 
   else {
-    // For TMA tiled copies, we know the alignment has to be 128 bits
-    if constexpr (is_tma_copy_engine<GmemTiledCopy>()) {
-      // For sparse MMA, alignment in logical elements is increased by sparsity factor
-      if constexpr (cute::is_sparse_v<ElementMma>) {
-        return 128 / sizeof_bits<Element>::value * ElementMma::sparsity;
-      }
-      return 128 / sizeof_bits<Element>::value;
-    }
-    else {
-      // For non-TMA tiled copies, TiledCopy holds the alignment count directly in its TiledShape_MN
-      return GmemTiledCopy::NumValSrc;
-    }
+    // For non-TMA tiled copies, TiledCopy holds the alignment count directly in its TiledShape_MN
+    return GmemTiledCopy::NumValSrc;
   }
 }
 

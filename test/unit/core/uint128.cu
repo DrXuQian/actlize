@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
     \brief Tests for basic uint128 functionality
 */
@@ -106,7 +108,7 @@ TEST(uint128_t, device_arithmetic) {
 
   uint128_add_operator<<< dim3(1,1), dim3(N, 1) >>>(sum.device_data(), input.device_data(), b, N);
 
-  ASSERT_EQ(cudaGetLastError(), cudaSuccess) << "Kernel launch error.";
+  ASSERT_EQ(hggcGetLastError(), hggcSuccess) << "Kernel launch error.";
 
   sum.sync_host();
 

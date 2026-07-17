@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -53,6 +54,7 @@ namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// todo: support PPU naive tensor op conv on cutlass3
 template <
   typename ElementA,
   typename LayoutA,
@@ -77,54 +79,13 @@ template <
   /// Access granularity of B matrix in units of elements
   int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value
 >
-struct DefaultDeconv3dWithBroadcast {
-
-  using ImplicitGemmBase = typename DefaultDeconv3d<
-    ElementA, LayoutA,
-    ElementB, LayoutB,
-    ElementC, LayoutC,
-    ElementAccumulator,
-    OperatorClass,
-    ArchTag,
-    ThreadblockShape,
-    WarpShape,
-    InstructionShape,
-    EpilogueOutputOp,
-    ThreadblockSwizzle,
-    Stages,
-    MathOperatorTag,
-    IteratorAlgorithm,
-    StrideSupport
-  >::Kernel;
-
-  // Define epilogue
-  using Epilogue = typename cutlass::conv::kernel::detail::DefaultConvEpilogueWithBroadcastTensorOp<
-    ArchTag,
-    typename ImplicitGemmBase::Epilogue::Shape,
-    typename ImplicitGemmBase::Epilogue::WarpMmaOperator,
-    ImplicitGemmBase::Epilogue::kPartitionsK,
-    ElementC,
-    typename EpilogueOutputOp::ElementT,
-    typename EpilogueOutputOp::ElementVector,
-    EpilogueOutputOp,
-    ImplicitGemmBase::Epilogue::kElementsPerAccess
-  >::Epilogue;
-
-  // Define the kernel
-  using Kernel = cutlass::conv::kernel::ImplicitGemmConvolutionWithFusedEpilogue<
-    typename ImplicitGemmBase::Mma,
-    Epilogue,
-    ThreadblockSwizzle,
-    conv::Operator::kDeconv,
-    Conv3dProblemSize
-  >;
-};
+struct DefaultDeconv3dWithBroadcast { };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 //                            OpClassSimt convolutions
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Defines a kernel for Deconv3d specialization for Analytic IteratorAlgorithm,
-/// multi-stage pipeline, and FFMA-based mainloop for SM80
+/// multi-stage pipeline, and FFMA-based mainloop for PPU multistage
 
 template <
   typename ElementA,

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /*! \file
   \brief Epilogue for threadblock scoped GEMM/CONV to store accumulator in shared memory after
     applying scale, bias loaded from global memory and element-wise operations.
@@ -38,7 +40,7 @@
 
 #pragma once
 
-#include <cuda/std/cassert>
+#include <hggc/std/cassert>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -53,29 +54,29 @@ namespace detail {
   CUTLASS_HOST_DEVICE
   static uint32_t
   get_max_cta_occupancy(
-    int max_sm_per_gpc,
+    int max_cu_per_gpc,
     GemmCoord cluster_shape,
-    int sm_count) {
-      // Provided SM count could possibly be less than the assumed maximum SMs per GPC
+    int cu_count) {
+      // Provided CU count could possibly be less than the assumed maximum CUs per GPC
       auto cluster_size = cluster_shape.m() * cluster_shape.n();
-      int const min_num_gpc = sm_count < max_sm_per_gpc ? 1 : sm_count / max_sm_per_gpc;
-      int const max_cta_occupancy_per_gpc = max_sm_per_gpc - (max_sm_per_gpc % cluster_size);
+      int const min_num_gpc = cu_count < max_cu_per_gpc ? 1 : cu_count / max_cu_per_gpc;
+      int const max_cta_occupancy_per_gpc = max_cu_per_gpc - (max_cu_per_gpc % cluster_size);
       int cta_per_device = min_num_gpc * max_cta_occupancy_per_gpc;
 
-      // The calculation below allows for larger grid size launch for different GPUs.
-      int const num_gpc_residual = sm_count < max_sm_per_gpc ? 0 : sm_count % max_sm_per_gpc;
+      // The calculation below allows for larger grid size launch for different PPUs.
+      int const num_gpc_residual = cu_count < max_cu_per_gpc ? 0 : cu_count % max_cu_per_gpc;
       int const max_cta_occupancy_per_residual_gpc = num_gpc_residual - (num_gpc_residual % cluster_size);
       cta_per_device += max_cta_occupancy_per_residual_gpc;
 
-      cta_per_device = sm_count < cta_per_device ? sm_count : cta_per_device;
+      cta_per_device = cu_count < cta_per_device ? cu_count : cta_per_device;
       return cta_per_device;
    }
 //
-// Parameters for SM90 tile schedulers
+// Parameters for PPU tile schedulers
 //
 
-// Parameters for SM90 persistent tile scheduler
-struct PersistentTileSchedulerSm90Params {
+// Parameters for PPU persistent tile scheduler
+struct PersistentTileSchedulerPPUParams {
 
   enum class RasterOrder {
     AlongM,
@@ -216,7 +217,7 @@ struct PersistentTileSchedulerSm90Params {
     bool truncate_by_problem_size=true
     ) {
 
-    int const sm_count = hw_info.sm_count;
+    int const cu_count = hw_info.cu_count;
 
     // Round up to nearest multiple of swizzle_size along each mode
     auto log_swizzle_size = get_log_swizzle_size(problem_blocks.x, problem_blocks.y, max_swizzle_size);
@@ -253,21 +254,16 @@ struct PersistentTileSchedulerSm90Params {
     auto cluster_size = cluster_shape.m() * cluster_shape.n();
     if (cluster_size == 1) {
       if (raster_order == RasterOrder::AlongN) {
-        launch_grid.y = possibly_truncate(sm_count, problem_blocks_total);
+        launch_grid.y = possibly_truncate(cu_count, problem_blocks_total);
       }
       else {
-        launch_grid.x = possibly_truncate(sm_count, problem_blocks_total);
+        launch_grid.x = possibly_truncate(cu_count, problem_blocks_total);
       }
     }
     else {
-      int cta_per_device = sm_count;
-      /*
-      * Optimal grid size calculation is based on
-      * GH100: 8 GPCs, 72 TPCs (9 TPCs/GPC), 2 SMs/TPC, 144 SMs per full GPU
-      * Hence, maximum SMs per GPC = 18
-      */
-      constexpr int max_sm_per_gpc = 18;
-      cta_per_device = get_max_cta_occupancy(max_sm_per_gpc, cluster_shape, sm_count);
+      int cta_per_device = cu_count;
+      constexpr int max_cu_per_gpc = 18;
+      cta_per_device = get_max_cta_occupancy(max_cu_per_gpc, cluster_shape, cu_count);
       if (raster_order == RasterOrder::AlongN) {
         launch_grid.y = possibly_truncate(
             cta_per_device       / cluster_shape.m(),
@@ -357,10 +353,8 @@ struct PersistentTileSchedulerSm90Params {
   }
 };
 
-////////////////////////////////////////////////////////////////////////////////
-
-// Parameters for SM90 persistent stream-K scheduler
-struct PersistentTileSchedulerSm90StreamKParams {
+// Parameters for PPU persistent stream-K scheduler
+struct PersistentTileSchedulerPPUStreamKParams {
 
   // Strategies for computing reductions between CTAs computing portions of a given output tile
   enum class ReductionMode {
@@ -395,7 +389,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
     StreamK
   };
 
-  using UnderlyingParams = PersistentTileSchedulerSm90Params;
+  using UnderlyingParams = PersistentTileSchedulerPPUParams;
   using RasterOrder = UnderlyingParams::RasterOrder;
   using RasterOrderOptions = UnderlyingParams::RasterOrderOptions;
 
@@ -567,13 +561,13 @@ struct PersistentTileSchedulerSm90StreamKParams {
     const uint32_t epilogue_subtile = 1
   ) {
 
-    #if !defined(__CUDACC_RTC__)
-    if (hw_info.sm_count <= 0) {
-      CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
-          "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-      hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+    #if !defined(__HGGCCC_RTC__)
+    if (hw_info.cu_count <= 0) {
+      CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid CU count.\n"
+          "  For optimal performance, populate the arguments KernelHardwareInfo struct with the CU count.");
+      hw_info.cu_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
     }
-    #endif // !defined(__CUDACC_RTC__) 
+    #endif // !defined(__HGGCCC_RTC__)
 
     UnderlyingParams underlying_params;
     underlying_params.initialize(
@@ -600,9 +594,9 @@ struct PersistentTileSchedulerSm90StreamKParams {
       decomposition_mode,
       reduction_mode,
       epilogue_subtile
-    ); 
+    );
   }
-  
+
   // max_sk_groups_ unless this extends beyond the extent of the dimension over
   // which the problem is rasterized. For example, if the tiled problem shape
   // (in CTA_M x CTA_N representation) when using 1x1 clusters is 4x16,
@@ -787,14 +781,14 @@ struct PersistentTileSchedulerSm90StreamKParams {
         (decomposition_mode == DecompositionMode::Heuristic && splits > 1)) {
       // Short circuit to basic split-K decomposition
       uint32_t adapted_splits = adjust_split_count(
-        splits, hw_info.sm_count, k_tiles_per_output_tile
+        splits, hw_info.cu_count, k_tiles_per_output_tile
       );
       sk_splits = adapted_splits;
       return DecompositionMode::SplitK;
     }
     else {
       // Calculate the maximum number of blocks from clusters of shape cluster_shape that we
-      // can fit within sm_count SMs.
+      // can fit within cu_count CUs.
       // Get block numbers in m, n and l dimensions
       auto problem_blocks_l = problem_blocks.z;
       auto problem_blocks_m = round_up(problem_blocks.x, (1 << underlying_params.log_swizzle_size_) * cluster_shape.m());
@@ -840,7 +834,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
       else {
         bool do_separate_reduction = should_perform_separate_reduction(
           epilogue_subtile, sk_units, sk_tiles, dp_tiles, ctas_per_wave);
-        
+
         uint64_t sk_cluster_tiles = sk_tiles / cluster_size;
 
         groups = calculate_groups(underlying_params, reduction_mode, problem_blocks_m, problem_blocks_n, cluster_shape,
@@ -849,8 +843,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
         auto sk_units_per_group = sk_units / groups;
 
         // sk_tiles is guaranteed to be divisible by cluster_size because it is calculated as:
-        //    sk_tiles = (waves <= 2) ? total_tiles : (sm_count + (total_tiles % sm_count))
-        // Both total_tiles and sm_count are multiples of cluster size due to padding added
+        //    sk_tiles = (waves <= 2) ? total_tiles : (cu_count + (total_tiles % cu_count))
+        // Both total_tiles and cu_count are multiples of cluster size due to padding added
         // prior to kernel launch.
         uint64_t sk_cluster_tiles_per_group = sk_cluster_tiles / groups;
         uint64_t sk_tiles_per_group = sk_cluster_tiles_per_group * cluster_size;
@@ -1101,7 +1095,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
     return round_up_to_l2_alignment(bits_to_bytes<size_t>(workspace_bits));
   }
 
-  #if !defined(__CUDACC_RTC__)
+  #if !defined(__HGGCCC_RTC__)
   static void
   get_workspace_component_sizes(
     dim3 problem_blocks,
@@ -1138,11 +1132,11 @@ struct PersistentTileSchedulerSm90StreamKParams {
     else {
       KernelHardwareInfo new_hw_info;
       new_hw_info.device_id = hw_info.device_id;
-      new_hw_info.sm_count = hw_info.sm_count;
-      if (new_hw_info.sm_count <= 0) {
-        CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
-            "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-        new_hw_info.sm_count = KernelHardwareInfo::query_device_multiprocessor_count(new_hw_info.device_id);
+      new_hw_info.cu_count = hw_info.cu_count;
+      if (new_hw_info.cu_count <= 0) {
+        CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid CU count.\n"
+            "  For optimal performance, populate the arguments KernelHardwareInfo struct with the CU count.");
+        new_hw_info.cu_count = KernelHardwareInfo::query_device_multiprocessor_count(new_hw_info.device_id);
       }
 
       dim3 grid = get_grid_shape(
@@ -1168,7 +1162,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
       if (decomposition_mode == DecompositionMode::SplitK ||
          (decomposition_mode == DecompositionMode::Heuristic && splits > 1)) {
         splits = adjust_split_count(
-          splits, new_hw_info.sm_count, k_tiles_per_output_tile
+          splits, new_hw_info.cu_count, k_tiles_per_output_tile
         );
       }
 
@@ -1203,7 +1197,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
       }
     }
   }
-  #endif // !defined(__CUDACC_RTC__)
+  #endif // !defined(__HGGCCC_RTC__)
 
   // Returns whether the kernel is configured in a manner for which separate reduction should be used
   CUTLASS_HOST_DEVICE
@@ -1281,7 +1275,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
     size_t barrier_workspace_size = 0;
     size_t reduction_workspace_size = 0;
 
-    #if !defined(__CUDACC_RTC__)
+    #if !defined(__HGGCCC_RTC__)
       get_workspace_component_sizes(
         problem_blocks,
         k_tiles_per_output_tile,
@@ -1312,7 +1306,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
   static cutlass::Status
   initialize_workspace(
     void* workspace,
-    cudaStream_t stream,
+    hggcStream_t stream,
     BatchedGemmCoord problem_shape,
     GemmCoord tile_shape,
     GemmCoord cluster_shape,
@@ -1326,7 +1320,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t barrier_bits,
     uint32_t element_accumulator_bits,
     uint32_t epilogue_subtile,
-    CudaHostAdapter* cuda_adapter = nullptr,
+    HostAdapter* host_adapter = nullptr,
     uint32_t ktile_start_alignment_count = 1) {
 
     dim3 problem_blocks = UnderlyingParams::get_tiled_cta_shape_mnl(problem_shape, tile_shape, cluster_shape);
@@ -1350,7 +1344,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
       element_accumulator_bits,
       epilogue_subtile,
       1,
-      cuda_adapter,
+      host_adapter,
       ktile_start_alignment_count
     );
   }
@@ -1361,7 +1355,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
   static cutlass::Status
   initialize_workspace(
     void* workspace,
-    cudaStream_t stream,
+    hggcStream_t stream,
     dim3 problem_blocks,
     uint32_t k_tiles_per_output_tile,
     GemmCoord tile_shape,
@@ -1377,10 +1371,10 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t element_accumulator_bits,
     uint32_t epilogue_subtile = 1,
     uint32_t num_accumulator_mtxs = 1,
-    CudaHostAdapter* cuda_adapter = nullptr,
+    HostAdapter* host_adapter = nullptr,
     uint32_t ktile_start_alignment_count = 1) {
 
-    #if !defined(__CUDACC_RTC__)
+    #if !defined(__HGGCCC_RTC__)
       uint64_t barrier_workspace_size = 0;
       uint64_t reduction_workspace_size = 0;
 
@@ -1413,9 +1407,9 @@ struct PersistentTileSchedulerSm90StreamKParams {
         // Only the barrier workspace needs to be cleared for stream-K.
         // Barrier workspace follows reduction workspace.
         uint8_t* barrier_workspace = reinterpret_cast<uint8_t*>(workspace) + reduction_workspace_size;
-        return zero_workspace(static_cast<void*>(barrier_workspace), barrier_workspace_size, stream, cuda_adapter);
+        return zero_workspace(static_cast<void*>(barrier_workspace), barrier_workspace_size, stream, host_adapter);
       }
-    #endif // !defined(__CUDACC_RTC__)
+    #endif // !defined(__HGGCCC_RTC__)
 
     return Status::kSuccess;
   }
@@ -1527,12 +1521,12 @@ struct PersistentTileSchedulerSm90StreamKParams {
   CUTLASS_HOST_DEVICE
   static int adjust_split_count(
       int splits,
-      int sm_count,
+      int cu_count,
       uint32_t k_tiles_per_output_tile
       ) {
-    // Don't split by more than the available number of SMs
-    if (splits > sm_count) {
-      splits = sm_count;
+    // Don't split by more than the available number of CUs
+    if (splits > cu_count) {
+      splits = cu_count;
     }
 
     // Don't split by more than the K tile iterations
@@ -1550,9 +1544,9 @@ struct PersistentTileSchedulerSm90StreamKParams {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Parameters for SM90 persistent group scheduler (only used for Grouped Gemms)
+// Parameters for PPU persistent group scheduler (only used for Grouped Gemms)
 template<class ProblemShape>
-struct PersistentTileSchedulerSm90GroupParams {
+struct PersistentTileSchedulerPPUGroupParams {
 
   enum class RasterOrder {
     AlongM,
@@ -1665,7 +1659,7 @@ struct PersistentTileSchedulerSm90GroupParams {
     RasterOrderOptions raster_order_option,
     bool truncate_by_problem_size=true) {
 
-    int const sm_count = hw_info.sm_count;
+    int const cu_count = hw_info.cu_count;
 
     // Round up to nearest multiple of swizzle_size along each mode
     auto log_swizzle_size = get_log_swizzle_size(problem_blocks.x, problem_blocks.y, max_swizzle_size);
@@ -1702,18 +1696,15 @@ struct PersistentTileSchedulerSm90GroupParams {
     auto cluster_size = cluster_shape.m() * cluster_shape.n();
     if (cluster_size == 1) {
       if (raster_order == RasterOrder::AlongN) {
-        launch_grid.y = possibly_truncate(sm_count, problem_blocks_total);
+        launch_grid.y = possibly_truncate(cu_count, problem_blocks_total);
       }
       else {
-        launch_grid.x = possibly_truncate(sm_count, problem_blocks_total);
+        launch_grid.x = possibly_truncate(cu_count, problem_blocks_total);
       }
     }
     else {
-      // Optimal grid size calculation is based on
-      // GH100: 8 GPCs, 72 TPCs (9 TPCs/GPC), 2 SMs/TPC, 144 SMs per full GPU
-      // Hence, maximum SMs per GPC = 18
-      constexpr int max_sm_per_gpc = 18;
-      int cta_per_device = get_max_cta_occupancy(max_sm_per_gpc, cluster_shape, sm_count);
+      constexpr int max_cu_per_gpc = 18;
+      int cta_per_device = get_max_cta_occupancy(max_cu_per_gpc, cluster_shape, cu_count);
 
       if (raster_order == RasterOrder::AlongN) {
         launch_grid.y = possibly_truncate(
@@ -1772,6 +1763,381 @@ struct PersistentTileSchedulerSm90GroupParams {
           return RasterOrder::AlongM;
       }
     }
+  }
+};
+
+//-----------------------------------------------------------------------------
+// PPU0015 scheduler params
+//-----------------------------------------------------------------------------
+
+// Users are not supposed to use this class directly.
+// This is a CRTP base class for the actual tile scheduler params.
+template<typename Subclass>
+struct TileSchedulerPPU0015Params {
+  enum class RasterOrder {
+    AlongM,
+    AlongN
+  };
+
+  enum class RasterOrderOptions {
+    Heuristic,
+    AlongM,
+    AlongN
+  };
+
+  // common members
+  FastDivmod divmod_batch_{};
+  int32_t blocks_per_problem_ = 0;
+  RasterOrder raster_order_ = RasterOrder::AlongN;
+
+  // Initializes members. This variant of the method should only be used when
+  // problem_shape and tile_shape contain modes of only rank 1.
+  void
+  initialize(
+    BatchedGemmCoord problem_shape,
+    GemmCoord tile_shape,
+    GemmCoord cluster_shape,
+    KernelHardwareInfo const& hw_info,
+    int tb_per_cu,
+    RasterOrderOptions raster_order_option,
+    void* workspace,
+    int swizzle_step
+  ) {
+    dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape, tile_shape, cluster_shape);
+    // Version of initialize that takes in as input the number of CTAs in the M and N and L dimensions.
+    // This is useful for calculating the tiled shape when a mode of problem and/or CTA shape has rank > 1,
+    // for which using CuTe algebra for calculating tile shapes is easiest.
+    static_cast<Subclass*>(this)->initialize(
+      problem_blocks,
+      cluster_shape,
+      hw_info,
+      tb_per_cu,
+      raster_order_option,
+      workspace,
+      swizzle_step
+    );
+  }
+
+  // Given the inputs, computes the physical grid we should launch.
+  // This variant of the method should only be used when
+  // problem_shape and tile_shape contain modes of only rank 1.
+  CUTLASS_HOST_DEVICE static
+  dim3
+  get_grid_shape(
+    BatchedGemmCoord problem_shape,
+    GemmCoord cta_shape,
+    GemmCoord cluster_shape,
+    KernelHardwareInfo hw_info,
+    int tb_per_cu,
+    RasterOrderOptions raster_order_option,
+    bool truncate_by_problem_size=true
+    ) {
+
+    dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape, cta_shape, cluster_shape);
+    return get_grid_shape(
+      problem_blocks,
+      cluster_shape,
+      hw_info,
+      tb_per_cu,
+      raster_order_option,
+      truncate_by_problem_size
+    );
+  }
+
+  // Version of get_grid_shape that takes in as input the number of CTAs in the M and N and L dimensions.
+  // This is useful for calculating the tiled shape when a mode of problem and/or CTA shape has rank > 1,
+  // for which using CuTe algebra for calculating tile shapes is easiest.
+  CUTLASS_HOST_DEVICE static
+  dim3
+  get_grid_shape(
+    dim3 problem_blocks,
+    GemmCoord cluster_shape,
+    KernelHardwareInfo hw_info,
+    int tb_per_cu,
+    RasterOrderOptions raster_order_option,
+    bool truncate_by_problem_size=true
+    ) {
+
+    int const cu_count = hw_info.cu_count * tb_per_cu;
+    int problem_blocks_total = problem_blocks.x * problem_blocks.y * problem_blocks.z;
+    dim3 launch_grid = dim3(1, 1, 1);
+
+    auto possibly_truncate = [&](int x, int y) {
+      if (truncate_by_problem_size) {
+        return platform::min(x, y);
+      }
+      else {
+        return x;
+      }
+    };
+
+    launch_grid.x = possibly_truncate(cu_count, problem_blocks_total);
+
+    return launch_grid;
+  }
+
+  CUTLASS_HOST_DEVICE
+  static RasterOrder
+  get_rasterization_order(
+    uint32_t tiles_m,
+    uint32_t tiles_n,
+    RasterOrderOptions raster_order_option
+  ) {
+
+    if (raster_order_option == RasterOrderOptions::Heuristic) {
+      if (tiles_n > tiles_m) {
+        return RasterOrder::AlongM;
+      }
+      else {
+        return RasterOrder::AlongN;
+      }
+    }
+    else {
+      switch (raster_order_option) {
+        case RasterOrderOptions::AlongN:
+          return RasterOrder::AlongN;
+          break;
+        default:
+          return RasterOrder::AlongM;
+      }
+    }
+  }
+
+  // Get the number of CTA tiles in this problem. This variant of the method should only be used when
+  // problem_shape and tile_shape contain modes of only rank 1.
+  CUTLASS_HOST_DEVICE
+  static dim3
+  get_tiled_cta_shape_mnl(BatchedGemmCoord problem_shape, GemmCoord cta_shape, GemmCoord cluster_shape) {
+    auto cta_m = (problem_shape.m() + cta_shape.m() - 1) / cta_shape.m();
+    auto cta_n = (problem_shape.n() + cta_shape.n() - 1) / cta_shape.n();
+
+    return get_tiled_cta_shape_mnl(problem_shape, cluster_shape, cta_m, cta_n);
+  }
+
+  // Version of get_tiled_cta_shape_mnl that takes in as input the number of CTAs in the M and N dimensions.
+  // This is useful for calculating the tiled shape when a mode of problem and/or CTA shape has rank > 1,
+  // for which using CuTe algebra for calculating tile shapes is easiest.
+  CUTLASS_HOST_DEVICE
+  static dim3
+  get_tiled_cta_shape_mnl(BatchedGemmCoord problem_shape, GemmCoord cluster_shape, uint32_t cta_m, uint32_t cta_n) {
+
+    // Round up to nearest multiple of cluster dim along each mode
+    auto problem_blocks_m = ((cta_m + cluster_shape.m() - 1) / cluster_shape.m()) * cluster_shape.m();
+    auto problem_blocks_n = ((cta_n + cluster_shape.n() - 1) / cluster_shape.n()) * cluster_shape.n();
+
+    return {
+      static_cast<uint32_t>(problem_blocks_m),
+      static_cast<uint32_t>(problem_blocks_n),
+      static_cast<uint32_t>(problem_shape.batch())
+    };
+  }
+};
+
+// CRTP class for normal static/dynamic tile scheduler params
+// Parameters for PPU1.5 persistent common tile scheduler, no round-up TB in both M & N axis
+template<typename Subclass>
+struct TileSchedulerPPU0015CommonParams: public TileSchedulerPPU0015Params<Subclass> {
+  using typename TileSchedulerPPU0015Params<Subclass>::RasterOrderOptions;
+  using typename TileSchedulerPPU0015Params<Subclass>::RasterOrder;
+  using TileSchedulerPPU0015Params<Subclass>::divmod_batch_;
+  using TileSchedulerPPU0015Params<Subclass>::blocks_per_problem_;
+  using TileSchedulerPPU0015Params<Subclass>::raster_order_;
+
+  // swizzle params
+  FastDivmod divmod_cluster_blk_major_{};
+  FastDivmod divmod_cluster_blk_minor_{};
+  FastDivmod divmod_swizzle_step_{};
+  FastDivmod divmod_remain_swizzle_step_{};
+  bool has_remain_swizzle_step_ = false;
+  // pre-allocate params
+  int32_t tb_per_cu_ = 0;
+  int32_t cu39_begin_number_ = 0;
+
+  void
+  initialize(
+    dim3 problem_blocks,
+    GemmCoord cluster_shape,
+    KernelHardwareInfo const& hw_info,
+    int tb_per_cu,
+    RasterOrderOptions raster_order_option,
+    void* workspace,
+    int swizzle_step
+  ) {
+    RasterOrder raster_order = get_rasterization_order(
+                                             problem_blocks.x,
+                                             problem_blocks.y,
+                                             raster_order_option
+                                           );
+
+    //
+    // Set members
+    //
+    int problem_tiles_m_ = problem_blocks.x;
+    int problem_tiles_n_ = problem_blocks.y;
+    if (raster_order == RasterOrder::AlongN) {
+      divmod_cluster_blk_major_ = FastDivmod(problem_tiles_n_);
+      divmod_cluster_blk_minor_ = FastDivmod(problem_tiles_m_);
+
+      has_remain_swizzle_step_ = (problem_tiles_m_ % swizzle_step != 0);
+      divmod_remain_swizzle_step_ = has_remain_swizzle_step_ ? FastDivmod(problem_tiles_m_ % swizzle_step) : FastDivmod();
+    } else {
+      divmod_cluster_blk_major_ = FastDivmod(problem_tiles_m_);
+      divmod_cluster_blk_minor_ = FastDivmod(problem_tiles_n_);
+
+      has_remain_swizzle_step_ = (problem_tiles_n_ % swizzle_step != 0);
+      divmod_remain_swizzle_step_ = has_remain_swizzle_step_ ? FastDivmod(problem_tiles_n_ % swizzle_step) : FastDivmod();
+    }
+    blocks_per_problem_ = problem_tiles_m_ * problem_tiles_n_ * problem_blocks.z;
+    raster_order_ = raster_order;
+    divmod_batch_ = FastDivmod(problem_tiles_m_ * problem_tiles_n_);
+    divmod_swizzle_step_ = FastDivmod(swizzle_step);
+
+    tb_per_cu_ = tb_per_cu;
+    int blocks_per_wave = tb_per_cu_ * hw_info.cu_count;
+    int wave_low = blocks_per_problem_ / blocks_per_wave;
+    int wave_high = ceil_div(blocks_per_problem_, blocks_per_wave);
+    if (hw_info.cu_count == 39 && problem_blocks.z == 1) {
+      cu39_begin_number_ = min(blocks_per_problem_ - wave_low * 3 * tb_per_cu, 36 * tb_per_cu * wave_high);
+    }
+    static_cast<Subclass*>(this)->specific_initialize(wave_low, wave_high, workspace);
+  }
+
+  CUTLASS_DEVICE
+  cute::tuple<int32_t, int32_t>
+  get_work_idx_m_and_n(int32_t linear_idx) const {
+    int32_t cluster_idx_minor, cluster_idx_major, cluster_idx_minor_div_swizzle, extra, offset;
+
+    divmod_swizzle_step_(extra, offset, linear_idx);
+
+    divmod_cluster_blk_major_(cluster_idx_minor_div_swizzle, cluster_idx_major, extra);
+    // if doesn't reside in the last swizzle step(eg. step=2 and block_tile_num_m = 3, then false for the last row)
+    int32_t integral_step_num = has_remain_swizzle_step_ ? (int(divmod_cluster_blk_minor_) - int(divmod_remain_swizzle_step_)):
+                                                           int(divmod_cluster_blk_minor_);
+    int32_t minor_base = cluster_idx_minor_div_swizzle * int(divmod_swizzle_step_);
+    if (__builtin_expect(!has_remain_swizzle_step_ || minor_base < integral_step_num, true)) {
+      cluster_idx_minor = minor_base + offset;
+    } else {
+      linear_idx -= integral_step_num * int(divmod_cluster_blk_major_);
+      int32_t major_offset, minor_offset;
+      divmod_remain_swizzle_step_(major_offset, minor_offset, linear_idx);
+      cluster_idx_major = major_offset;
+      cluster_idx_minor = (integral_step_num + minor_offset);
+    }
+#if 0
+    if (threadIdx.x == 0 && (blockIdx.x == 7 || blockIdx.x == 8)) {
+      printf("blockIdx.x=%d, divmod_remain_swizzle_step_=%d, cluster_idx_minor_div_swizzle=%d, integral_step_num=%d \
+              linear_idx=%d, divmod_swizzle_step_=%d, extra=%d, offset=%d, \
+              divmod_cluster_blk_major_=%d, cluster_idx_minor_div_swizzle=%d, cluster_idx_major=%d \
+              cluster_idx_minor=%d\n", 
+              blockIdx.x, int(divmod_remain_swizzle_step_), cluster_idx_minor_div_swizzle, integral_step_num,
+              linear_idx, int(divmod_swizzle_step_), extra, offset,
+              int(divmod_cluster_blk_major_), cluster_idx_minor_div_swizzle, cluster_idx_major,
+              cluster_idx_minor);
+    }
+#endif
+    if (raster_order_ == RasterOrder::AlongN) {
+      return {cluster_idx_minor, cluster_idx_major};
+    } else {
+      return {cluster_idx_major, cluster_idx_minor};
+    }
+  }
+};
+
+struct StaticTileSchedulerPPU0015Params: public TileSchedulerPPU0015CommonParams<StaticTileSchedulerPPU0015Params> {
+  void specific_initialize(int wave_low, int wave_high, void* workspace) {}
+};
+
+struct DynamicTileSchedulerPPU0015Params: public TileSchedulerPPU0015CommonParams<DynamicTileSchedulerPPU0015Params> {
+  int32_t* workspace_ = nullptr;
+  int32_t wave_low_ = 0;
+  int32_t wave_high_ = 0;
+
+  void specific_initialize(int wave_low, int wave_high, void* workspace) {
+    wave_low_ = wave_low;
+    wave_high_ = wave_high;
+    workspace_ = reinterpret_cast<int32_t*>(workspace);
+  }
+};
+
+
+// Parameters for PPU1.5 persistent tile scheduler, round-up TB in both M & N axis
+struct StaticTileSchedulerPadPPU0015Params: public TileSchedulerPPU0015Params<StaticTileSchedulerPadPPU0015Params> {
+  using typename TileSchedulerPPU0015Params<StaticTileSchedulerPadPPU0015Params>::RasterOrderOptions;
+  using typename TileSchedulerPPU0015Params<StaticTileSchedulerPadPPU0015Params>::RasterOrder;
+  using TileSchedulerPPU0015Params<StaticTileSchedulerPadPPU0015Params>::divmod_batch_;
+  using TileSchedulerPPU0015Params<StaticTileSchedulerPadPPU0015Params>::blocks_per_problem_;
+  using TileSchedulerPPU0015Params<StaticTileSchedulerPadPPU0015Params>::raster_order_;
+
+  FastDivmod divmod_x_swizzle_step_{};
+  FastDivmod divmod_xy_swizzle_step_{};
+  FastDivmod divmod_x_ce_num_{};
+  int y_swizzle_step_ = 1;
+  int y_ce_num_ = 1;
+
+  void
+  initialize(
+    dim3 problem_blocks,
+    GemmCoord cluster_shape,
+    KernelHardwareInfo const& hw_info,
+    int tb_per_cu,
+    RasterOrderOptions raster_order_option,
+    void* workspace,
+    int swizzle_step
+  ) {
+
+    CUTLASS_UNUSED(hw_info);
+
+    // raster_order is not used now.
+    // RasterOrder raster_order = get_rasterization_order(
+    //                                          problem_blocks.x,
+    //                                          problem_blocks.y,
+    //                                          raster_order_option
+    //                                        );
+
+    // x_swizzle_step * y_swizzle_step = tb_per_ce
+    int x_swizzle_step = swizzle_step;
+    int y_swizzle_step = 4 * tb_per_cu / x_swizzle_step;
+
+    //
+    // Set members
+    //
+    int problem_tiles_m_ = round_up(problem_blocks.x, x_swizzle_step);
+    int problem_tiles_n_ = round_up(problem_blocks.y, y_swizzle_step);
+
+    blocks_per_problem_ = problem_tiles_m_ * problem_tiles_n_ * problem_blocks.z;
+    divmod_batch_ = FastDivmod(problem_tiles_m_ * problem_tiles_n_);
+    divmod_x_swizzle_step_ = FastDivmod(x_swizzle_step);
+    divmod_xy_swizzle_step_ = FastDivmod(x_swizzle_step * y_swizzle_step);
+    divmod_x_ce_num_ = FastDivmod(problem_tiles_m_ / x_swizzle_step);
+
+    y_swizzle_step_ = y_swizzle_step;
+    y_ce_num_ = problem_tiles_n_ / y_swizzle_step;
+  }
+
+  CUTLASS_DEVICE
+  cute::tuple<int32_t, int32_t>
+  get_work_idx_m_and_n(int32_t linear_idx) const {
+    int32_t i_ce, ce_inner_offset, ce_m, ce_n, ce_inner_m, ce_inner_n, ce_m_num;
+
+    divmod_xy_swizzle_step_(i_ce, ce_inner_offset, linear_idx);
+    divmod_x_ce_num_(ce_n, ce_m, i_ce);
+    divmod_x_swizzle_step_(ce_inner_n, ce_inner_m, ce_inner_offset);
+    int blk_m_offset = ce_m * (y_ce_num_ * y_swizzle_step_) + ce_inner_m;
+    int blk_n_offset = ce_n * (int(divmod_x_ce_num_) * int(divmod_x_swizzle_step_)) + ce_inner_n;
+    
+    return {blk_m_offset, blk_n_offset};
+#if 0
+    if (threadIdx.x == 0 && (blockIdx.x == 7 || blockIdx.x == 8)) {
+      printf("blockIdx.x=%d, divmod_remain_swizzle_step_=%d, cluster_idx_minor_div_swizzle=%d, integral_step_num=%d \
+              linear_idx=%d, divmod_swizzle_step_=%d, extra=%d, offset=%d, \
+              divmod_cluster_blk_major=%d, cluster_idx_minor_div_swizzle=%d, cluster_idx_major=%d \
+              cluster_idx_minor=%d\n", 
+              blockIdx.x, int(divmod_remain_swizzle_step_), cluster_idx_minor_div_swizzle, integral_step_num,
+              linear_idx, int(divmod_swizzle_step_), extra, offset,
+              int(divmod_cluster_blk_major), cluster_idx_minor_div_swizzle, cluster_idx_major,
+              cluster_idx_minor);
+    }
+#endif
   }
 };
 

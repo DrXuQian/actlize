@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -121,8 +122,8 @@ enum class Provider {
   kCUTLASS,
   kReferenceHost,
   kReferenceDevice,
-  kCUBLAS,
-  kCUDNN,
+  kACBLAS,
+  kACDNN,
   kInvalid
 };
 
@@ -131,14 +132,7 @@ enum class Provider {
 /// Enumeration indicating the kind of operation
 enum class OperationKind {
   kGemm,
-  kRankK,
-  kRank2K,
-  kTrmm,
-  kSymm,
-  kConv2d,
-  kConv3d,
   kEqGemm,
-  kSparseGemm,
   kReduction,
   kInvalid
 };
@@ -163,8 +157,6 @@ enum class SplitKMode {
 enum class OpcodeClassID {
   kSimt,
   kTensorOp,
-  kWmmaTensorOp,
-  kSparseTensorOp,
   kInvalid
 };
 
@@ -188,44 +180,10 @@ enum class MathOperationID {
 /// Enumeration indicating what kind of GEMM operation to perform
 enum class GemmKind {
   kGemm,
-  kSparse,
   kUniversal,
   kPlanarComplex,
   kPlanarComplexArray,
   kGrouped,
-  kInvalid
-};
-
-/// Enumeration indicating what kind of RankK update operation to perform
-enum class RankKKind {
-  kUniversal,
-  kInvalid
-};
-
-/// Enumeration indicating what kind of TRMM operation to perform
-enum class TrmmKind {
-  kUniversal,
-  kInvalid
-};
-
-/// Enumeration indicating what kind of SYMM/HEMM operation to perform
-enum class SymmKind {
-  kUniversal,
-  kInvalid
-};
-
-/// Enumeration indicating what kind of Conv2d operation to perform
-enum class ConvKind {
-  kUnknown,
-  kFprop,
-  kDgrad,
-  kWgrad,
-  kInvalid
-};
-
-enum class ConvModeID {
-  kCrossCorrelation,
-  kConvolution,
   kInvalid
 };
 

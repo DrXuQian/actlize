@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,48 +29,29 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #include <complex>
 
 #include "../common/cutlass_unit_test.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-TEST(SM75_CUTLASS_TEST, level_not_specified) {
+TEST(PPU001x_CUTLASS_TEST, level_not_specified) {
 
   EXPECT_TRUE(true);
 }
 
-TEST(SM80_CUTLASS_TEST, level_not_specified) {
-
-  EXPECT_TRUE(true);
-}
-
-CUTLASS_TEST_L0(SM75_CUTLASS_TEST, level0, {
+CUTLASS_TEST_L0(PPU001x_CUTLASS_TEST, level0, {
 
   EXPECT_TRUE(true);
 })
 
-CUTLASS_TEST_L1(SM75_CUTLASS_TEST, level1, {
+CUTLASS_TEST_L1(PPU001x_CUTLASS_TEST, level1, {
 
   EXPECT_TRUE(true);
 })
 
-CUTLASS_TEST_L2(SM75_CUTLASS_TEST, level2, {
-
-  EXPECT_TRUE(true);
-})
-
-CUTLASS_TEST_L0(SM80_CUTLASS_TEST, level0, {
-
-  EXPECT_TRUE(true);
-})
-
-CUTLASS_TEST_L1(SM80_CUTLASS_TEST, level1, {
-
-  EXPECT_TRUE(true);
-})
-
-CUTLASS_TEST_L2(SM80_CUTLASS_TEST, level2, {
+CUTLASS_TEST_L2(PPU001x_CUTLASS_TEST, level2, {
 
   EXPECT_TRUE(true);
 })

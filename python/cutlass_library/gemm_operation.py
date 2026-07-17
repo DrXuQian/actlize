@@ -1,5 +1,7 @@
 #################################################################################################
 #
+# Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
+# Copyright (c) 2024, PTG Group Holding Limited. All rights reserved.
 # Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -70,6 +72,7 @@ class GemmOperation:
     kinds_3x = {
       GemmKind.Universal3x,
       GemmKind.SparseUniversal3x,
+      GemmKind.PPU0015Universal3x,
     }
     self.is_3x = gemm_kind in kinds_3x
     self.prefix = "3x" if self.is_3x else ""
@@ -148,7 +151,6 @@ class GemmOperation:
 
     tensor_ops = [
       OpcodeClass.TensorOp,
-      OpcodeClass.WmmaTensorOp,
       OpcodeClass.SparseTensorOp,
     ]
 
@@ -257,30 +259,27 @@ class GemmOperation:
   def procedural_name(self):
     ''' The full procedural name indicates architecture, extended name, tile size, and layout. '''
     opcode_class_name = OpcodeClassNames[self.tile_description.math_instruction.opcode_class]
-    if self.arch >= 90:
-      kernel_name_template = "cutlass{p}_sm{ar}_{op}_{ex}{ct}{cs}_{l}_{s}_align{al}{t}{k}{e}"
-      return kernel_name_template.format(
-          p = self.prefix,
-          ar = self.arch,
-          op = opcode_class_name,
-          ex = self.extended_name_3x(),
-          ct = '_' + 'x'.join([str(i) for i in self.tile_description.tile_shape]) if self.tile_description.tile_shape[0] > 0 else "",
-          cs = '_' + 'x'.join([str(i) for i in self.tile_description.cluster_shape]),
-          l = self.tile_description.stages,
-          s = self.layout_name_3x(),
-          al = str(max(self.A.alignment, self.B.alignment)),
-          t = TileSchedulerSuffixes[self.tile_scheduler],
-          k = self.kernel_schedule_name_3x(),
-          e = self.epilogue_schedule_name_3x())
+
+    if self.tile_description.maximum_compute_capability == 89:
+      ppu_arch = '0015'
+    elif self.tile_description.maximum_compute_capability == 80:
+      ppu_arch = '0010'
     else:
-      threadblock = self.tile_description.procedural_name()
-      return "cutlass{p}_{op}_{ex}_{tb}_{l}_align{a}".format(
-          p = self.prefix,
-          op = opcode_class_name,
-          ex = self.extended_name(),
-          tb = threadblock,
-          l = self.layout_name(),
-          a = str(max(self.A.alignment, self.B.alignment)))
+      ppu_arch = 'xxxx'
+
+    kernel_name_template = "cutlass{p}_ppu{ar}_{op}_{ex}{ct}_{l}_{s}_align{al}{t}{k}{e}"
+    return kernel_name_template.format(
+        p = self.prefix,
+        ar = ppu_arch,
+        op = opcode_class_name,
+        ex = self.extended_name_3x(),
+        ct = '_' + 'x'.join([str(i) for i in self.tile_description.tile_shape]) if self.tile_description.tile_shape[0] > 0 else "",
+        l = self.tile_description.stages,
+        s = self.layout_name_3x(),
+        al = str(max(self.A.alignment, self.B.alignment)),
+        t = TileSchedulerSuffixes[self.tile_scheduler],
+        k = self.kernel_schedule_name_3x(),
+        e = self.epilogue_schedule_name_3x())
 
   #
   def configuration_name(self):
@@ -396,6 +395,17 @@ ${compile_guard_start}
 ${compile_guard_end}
 """
 
+  def get_arch_tag(self, arch: int) -> str:
+    arch_map = {
+        80: "cutlass::arch::PPU0010",
+        89: "cutlass::arch::PPU0015"
+    }
+    arch_tag = arch_map.get(arch)
+    if arch_tag is None:
+        raise ValueError(f"Unsupported architecture: {arch}.")
+        
+    return arch_tag
+
   #
   def emit(self, operation):
 
@@ -415,7 +425,7 @@ ${compile_guard_end}
       'layout_c': LayoutTag[operation.C.layout],
       'element_accumulator': DataTypeTag[operation.accumulator_type()],
       'opcode_class': OpcodeClassTag[operation.tile_description.math_instruction.opcode_class],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
+      'arch': self.get_arch_tag(operation.arch),
       'threadblock_shape_m': str(operation.tile_description.threadblock_shape[0]),
       'threadblock_shape_n': str(operation.tile_description.threadblock_shape[1]),
       'threadblock_shape_k': str(operation.tile_description.threadblock_shape[2]),
@@ -443,97 +453,6 @@ ${compile_guard_end}
     return SubstituteTemplate(template, values)
 
 ###################################################################################################
-
-class EmitSparseGemmInstance:
-  ''' Responsible for emitting a CUTLASS template definition'''
-
-  def __init__(self, operation_suffix = ''):
-    self.operation_suffix = operation_suffix
-    self.includes = []
-    self.gemm_template = """
-  // Gemm operator ${operation_name}
-  using Operation_${operation_name} = cutlass::gemm::device::SparseGemm<
-    ${element_a}, ${layout_a},
-    ${element_b}, ${layout_b},
-    ${element_c}, ${layout_c},
-    ${element_accumulator},
-    ${opcode_class},
-    ${arch},
-    cutlass::gemm::GemmShape<${threadblock_shape_m}, ${threadblock_shape_n}, ${threadblock_shape_k}>,
-    cutlass::gemm::GemmShape<${warp_shape_m}, ${warp_shape_n}, ${warp_shape_k}>,
-    cutlass::gemm::GemmShape<${instruction_shape_m}, ${instruction_shape_n}, ${instruction_shape_k}>,
-    ${epilogue_functor}<
-      ${element_c},
-      ${epilogue_vector_length},
-      ${element_accumulator},
-      ${element_epilogue}
-    >,
-    ${swizzling_functor},
-    ${stages},
-    ${align_a},
-    ${align_b},
-    false,
-    ${math_operation}
-    ${residual}
-  >;
-"""
-
-  #
-  def instance_template(self):
-    return """
-${compile_guard_start}
-  manifest.append(new ${gemm_kind}<Operation_${operation_name}>("${operation_name}"));
-${compile_guard_end}
-"""
-
-  #
-  def emit(self, operation):
-
-    warp_shape = [operation.tile_description.threadblock_shape[idx] // operation.tile_description.warp_count[idx] for idx in range(3)]
-
-    epilogue_vector_length = int(min(operation.C.alignment * DataTypeSize[operation.C.element], 128) / DataTypeSize[operation.C.element])
-
-    residual = ''
-
-    values = {
-      'operation_name': operation.procedural_name(),
-      'element_a': DataTypeTag[operation.A.element],
-      'layout_a': LayoutTag[operation.A.layout],
-      'element_b': DataTypeTag[operation.B.element],
-      'layout_b': LayoutTag[operation.B.layout],
-      'element_c': DataTypeTag[operation.C.element],
-      'layout_c': LayoutTag[operation.C.layout],
-      'element_accumulator': DataTypeTag[operation.accumulator_type()],
-      'opcode_class': OpcodeClassTag[operation.tile_description.math_instruction.opcode_class],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
-      'threadblock_shape_m': str(operation.tile_description.threadblock_shape[0]),
-      'threadblock_shape_n': str(operation.tile_description.threadblock_shape[1]),
-      'threadblock_shape_k': str(operation.tile_description.threadblock_shape[2]),
-      'warp_shape_m': str(warp_shape[0]),
-      'warp_shape_n': str(warp_shape[1]),
-      'warp_shape_k': str(warp_shape[2]),
-      'instruction_shape_m': str(operation.tile_description.math_instruction.instruction_shape[0]),
-      'instruction_shape_n': str(operation.tile_description.math_instruction.instruction_shape[1]),
-      'instruction_shape_k': str(operation.tile_description.math_instruction.instruction_shape[2]),
-      'epilogue_vector_length': str(epilogue_vector_length),
-      'element_epilogue': str(DataTypeTag[operation.element_epilogue]),
-      'epilogue_functor': EpilogueFunctorTag[operation.epilogue_functor],
-      'swizzling_functor': SwizzlingFunctorTag[operation.swizzling_functor],
-      'stages': str(operation.tile_description.stages),
-      'align_a': str(operation.A.alignment),
-      'align_b': str(operation.B.alignment),
-      'transform_a': ComplexTransformTag[operation.A.complex_transform],
-      'transform_b': ComplexTransformTag[operation.B.complex_transform],
-      'math_operation': MathOperationTag[operation.tile_description.math_instruction.math_operation],
-      'residual': residual
-    }
-
-    template = self.gemm_template
-
-    return SubstituteTemplate(template, values)
-
-###################################################################################################
-
 
 #
 class EmitGemmUniversalInstance:
@@ -616,6 +535,17 @@ ${compile_guard_start}
 ${compile_guard_end}
 """
 
+  def get_arch_tag(self, arch: int) -> str:
+    arch_map = {
+        80: "cutlass::arch::PPU0010",
+        89: "cutlass::arch::PPU0015"
+    }
+    arch_tag = arch_map.get(arch)
+    if arch_tag is None:
+        raise ValueError(f"Unsupported architecture: {arch}.")
+        
+    return arch_tag
+
   #
   def emit(self, operation):
 
@@ -672,7 +602,7 @@ ${compile_guard_end}
       'layout_c': LayoutTag[instance_layout_C],
       'element_accumulator': DataTypeTag[operation.accumulator_type()],
       'opcode_class': OpcodeClassTag[operation.tile_description.math_instruction.opcode_class],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
+      'arch': self.get_arch_tag(operation.arch),
       'threadblock_shape_m': str(operation.tile_description.threadblock_shape[0]),
       'threadblock_shape_n': str(operation.tile_description.threadblock_shape[1]),
       'threadblock_shape_k': str(operation.tile_description.threadblock_shape[2]),
@@ -704,11 +634,13 @@ class EmitGemmUniversal3xInstance:
     self.operation_suffix = operation_suffix
     self.includes = [
       "cutlass/cutlass.h",
-      "cutlass/gemm/gemm.h",
       "cutlass/numeric_types.h",
-      "cutlass/gemm/kernel/gemm_universal.hpp",
-      "cutlass/gemm/collective/collective_builder.hpp",
+      "cutlass/epilogue/collective/default_epilogue.hpp",
+      "cutlass/epilogue/thread/linear_combination.h",
       "cutlass/epilogue/collective/collective_builder.hpp",
+
+      "ppu_include.hpp",
+      "cutlass/gemm/collective/builders/ppu_mma_builder.inl",
     ]
     self.builtin_epilogue_functor_template = \
 """${epilogue_functor}<
@@ -720,11 +652,13 @@ class EmitGemmUniversal3xInstance:
 
     self.gemm_template = """
 
+using namespace cute;
+
 using ${operation_name}_epilogue =
   typename cutlass::epilogue::collective::CollectiveBuilder<
     ${arch}, ${opcode_class_epi},
     cute::Shape<cute::_${tile_shape_epi_m}, cute::_${tile_shape_epi_n}, cute::_${tile_shape_epi_k}>,
-    cute::Shape<${cluster_shape_m}, ${cluster_shape_n}, ${cluster_shape_k}>,
+    cute::Shape<cute::_${warp_shape_m}, cute::_${warp_shape_n}, cute::_${warp_shape_k}>,
     ${epi_tile_mn},
     ${element_accumulator}, ${element_epilogue},
     ${element_c}, ${layout_c}, ${align_c},
@@ -740,7 +674,7 @@ using ${operation_name}_mainloop =
     ${element_b}, ${layout_b}, ${align_b},
     ${element_accumulator},
     cute::Shape<cute::_${tile_shape_main_m}, cute::_${tile_shape_main_n}, cute::_${tile_shape_main_k}>,
-    cute::Shape<${cluster_shape_m}, ${cluster_shape_n}, ${cluster_shape_k}>,
+    cute::Shape<cute::_${warp_shape_m}, cute::_${warp_shape_n}, cute::_${warp_shape_k}>,
     ${stages},
     ${kernel_schedule}
   >::CollectiveOp;
@@ -779,6 +713,10 @@ ${compile_guard_end}
     opcode_class_main = operation.tile_description.math_instruction.opcode_class
     opcode_class_epi = opcode_class_main
     tile_shape = operation.tile_description.tile_shape
+    warp_count = operation.tile_description.warp_count
+
+    warp_shape = [tile_shape[idx] // warp_count[idx] for idx in range(3)]
+
     instruction_shape = operation.tile_description.math_instruction.instruction_shape
     cluster_m = operation.tile_description.cluster_shape[0]
     cluster_n = operation.tile_description.cluster_shape[1]
@@ -833,16 +771,16 @@ ${compile_guard_end}
       'element_accumulator': DataTypeTag[operation.accumulator_type()],
       'opcode_class_main': OpcodeClassTag[opcode_class_main],
       'opcode_class_epi': OpcodeClassTag[opcode_class_epi],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
+      'arch': "cutlass::arch::PPU0010",
       'tile_shape_epi_m': str(tile_shape_epi_m),
       'tile_shape_epi_n': str(tile_shape_epi_n),
       'tile_shape_epi_k': str(tile_shape_epi_k),
       'tile_shape_main_m': str(tile_shape_main_m),
       'tile_shape_main_n': str(tile_shape_main_n),
       'tile_shape_main_k': str(tile_shape_main_k),
-      'cluster_shape_m': 'cute::_' + str(operation.tile_description.cluster_shape[0]) if operation.tile_description.cluster_shape[0] > 0 else "int",
-      'cluster_shape_n': 'cute::_' + str(operation.tile_description.cluster_shape[1]) if operation.tile_description.cluster_shape[1] > 0 else "int",
-      'cluster_shape_k': 'cute::_' + str(operation.tile_description.cluster_shape[2]) if operation.tile_description.cluster_shape[2] > 0 else "int",
+      'warp_shape_m': str(warp_shape[0]),
+      'warp_shape_n': str(warp_shape[1]),
+      'warp_shape_k': str(warp_shape[2]),
       'instruction_shape_m': str(instruction_shape[0]),
       'instruction_shape_n': str(instruction_shape[1]),
       'instruction_shape_k': str(instruction_shape[2]),
@@ -867,307 +805,177 @@ ${compile_guard_end}
 
 ###################################################################################################
 
-#
-class EmitGemmPlanarComplexInstance:
-  ''' Responsible for emitting a CUTLASS template definition'''
 
-  def __init__(self, operation_suffix = ''):
-    self.operation_suffix = operation_suffix
-    self.includes = []
-    self.template = """
-  // Gemm operator ${operation_name}
-  using Operation_${operation_name} = typename cutlass::gemm::kernel::DefaultGemmPlanarComplexUniversal<
-    ${element_a}, ${layout_a}, ${transform_a}, ${alignment_a},
-    ${element_b}, ${layout_b}, ${transform_b}, ${alignment_b},
-    ${element_c}, cutlass::layout::RowMajor,
-    ${element_accumulator},
-    ${opcode_class},
-    ${arch},
-    cutlass::gemm::GemmShape<${threadblock_shape_m}, ${threadblock_shape_n}, ${threadblock_shape_k}>,
-    cutlass::gemm::GemmShape<${warp_shape_m}, ${warp_shape_n}, ${warp_shape_k}>,
-    cutlass::gemm::GemmShape<${instruction_shape_m}, ${instruction_shape_n}, ${instruction_shape_k}>,
-    cutlass::epilogue::thread::LinearCombinationPlanarComplex<
-      ${element_c},
-      ${alignment_c},
-      ${element_accumulator},
-      ${element_epilogue}
-    >,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    ${stages},
-    ${math_operator}
-  >::GemmKernel;
-
-  struct ${operation_name} :
-    public Operation_${operation_name} { };
-"""
-
-  #
-  def instance_template(self):
-    return """
-${compile_guard_start}
-  manifest.append(new ${gemm_kind}<
-    cutlass::gemm::device::GemmUniversalAdapter<${operation_name}>
-  >("${operation_name}"));
-${compile_guard_end}
-"""
-
-  #
-  def emit(self, operation):
-
-    warp_shape = [operation.tile_description.threadblock_shape[idx] // operation.tile_description.warp_count[idx] for idx in range(3)]
-
-    # exchange and transpose A and B types, layouts, and complex transforms since the C layout is row-major
-    transposed_layout_A = TransposedLayout[operation.A.layout]
-    transposed_layout_B = TransposedLayout[operation.B.layout]
-
-    values = {
-      'operation_name': operation.procedural_name(),
-      'element_a': DataTypeTag[operation.B.element],
-      'layout_a': LayoutTag[transposed_layout_B],
-      'transform_a': ComplexTransformTag[operation.B.complex_transform],
-      'alignment_a': str(operation.B.alignment),
-      'element_b': DataTypeTag[operation.A.element],
-      'layout_b': LayoutTag[transposed_layout_A],
-      'transform_b': ComplexTransformTag[operation.A.complex_transform],
-      'alignment_b': str(operation.A.alignment),
-      'element_c': DataTypeTag[operation.C.element],
-      'layout_c': LayoutTag[operation.C.layout],
-      'element_accumulator': DataTypeTag[operation.tile_description.math_instruction.element_accumulator],
-      'opcode_class': OpcodeClassTag[operation.tile_description.math_instruction.opcode_class],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
-      'threadblock_shape_m': str(operation.tile_description.threadblock_shape[0]),
-      'threadblock_shape_n': str(operation.tile_description.threadblock_shape[1]),
-      'threadblock_shape_k': str(operation.tile_description.threadblock_shape[2]),
-      'warp_shape_m': str(warp_shape[0]),
-      'warp_shape_n': str(warp_shape[1]),
-      'warp_shape_k': str(warp_shape[2]),
-      'instruction_shape_m': str(operation.tile_description.math_instruction.instruction_shape[0]),
-      'instruction_shape_n': str(operation.tile_description.math_instruction.instruction_shape[1]),
-      'instruction_shape_k': str(operation.tile_description.math_instruction.instruction_shape[2]),
-      'alignment_c': str(operation.C.alignment),
-      'element_epilogue': str(DataTypeTag[operation.element_epilogue]),
-      'stages': str(operation.tile_description.stages),
-      'math_operator': 'cutlass::arch::OpMultiplyAdd'
-    }
-
-    return SubstituteTemplate(self.template, values)
-
-###################################################################################################
-
-#
-class EmitGemmPlanarComplexArrayInstance:
-  ''' Responsible for emitting a CUTLASS template definition'''
-
-  def __init__(self, operation_suffix = ''):
-    self.operation_suffix = operation_suffix
-    self.includes = []
-    self.template = """
-  // Gemm operator ${operation_name}
-  using Operation_${operation_name} = typename cutlass::gemm::kernel::DefaultGemmPlanarComplexUniversal<
-    ${element_a}, ${layout_a}, ${transform_a}, ${alignment_a},
-    ${element_b}, ${layout_b}, ${transform_b}, ${alignment_b},
-    ${element_c}, cutlass::layout::RowMajor,
-    ${element_accumulator},
-    ${opcode_class},
-    ${arch},
-    cutlass::gemm::GemmShape<${threadblock_shape_m}, ${threadblock_shape_n}, ${threadblock_shape_k}>,
-    cutlass::gemm::GemmShape<${warp_shape_m}, ${warp_shape_n}, ${warp_shape_k}>,
-    cutlass::gemm::GemmShape<${instruction_shape_m}, ${instruction_shape_n}, ${instruction_shape_k}>,
-    cutlass::epilogue::thread::LinearCombinationPlanarComplex<
-      ${element_c},
-      ${alignment_c},
-      ${element_accumulator},
-      ${element_epilogue}
-    >,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    ${stages},
-    ${math_operator}
-  >::GemmArrayKernel;
-
-  struct ${operation_name} : public Operation_${operation_name} { };
-"""
-
-  #
-  def instance_template(self):
-    return """
-${compile_guard_start}
-  manifest.append(new ${gemm_kind}<
-    cutlass::gemm::device::GemmUniversalAdapter<${operation_name}>
-  >("${operation_name}"));
-${compile_guard_end}
-"""
-
-  #
-  def emit(self, operation):
-
-    warp_shape = [operation.tile_description.threadblock_shape[idx] // operation.tile_description.warp_count[idx] for idx in range(3)]
-
-    # exchange and transpose A and B types, layouts, and complex transforms since the C layout is row-major
-    transposed_layout_A = TransposedLayout[operation.A.layout]
-    transposed_layout_B = TransposedLayout[operation.B.layout]
-
-    values = {
-      'operation_name': operation.procedural_name(),
-      'element_a': DataTypeTag[operation.B.element],
-      'layout_a': LayoutTag[transposed_layout_B],
-      'transform_a': ComplexTransformTag[operation.B.complex_transform],
-      'alignment_a': str(operation.B.alignment),
-      'element_b': DataTypeTag[operation.A.element],
-      'layout_b': LayoutTag[transposed_layout_A],
-      'transform_b': ComplexTransformTag[operation.A.complex_transform],
-      'alignment_b': str(operation.A.alignment),
-      'element_c': DataTypeTag[operation.C.element],
-      'layout_c': LayoutTag[operation.C.layout],
-      'element_accumulator': DataTypeTag[operation.tile_description.math_instruction.element_accumulator],
-      'opcode_class': OpcodeClassTag[operation.tile_description.math_instruction.opcode_class],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
-      'threadblock_shape_m': str(operation.tile_description.threadblock_shape[0]),
-      'threadblock_shape_n': str(operation.tile_description.threadblock_shape[1]),
-      'threadblock_shape_k': str(operation.tile_description.threadblock_shape[2]),
-      'warp_shape_m': str(warp_shape[0]),
-      'warp_shape_n': str(warp_shape[1]),
-      'warp_shape_k': str(warp_shape[2]),
-      'instruction_shape_m': str(operation.tile_description.math_instruction.instruction_shape[0]),
-      'instruction_shape_n': str(operation.tile_description.math_instruction.instruction_shape[1]),
-      'instruction_shape_k': str(operation.tile_description.math_instruction.instruction_shape[2]),
-      'alignment_c': str(operation.C.alignment),
-      'element_epilogue': str(DataTypeTag[operation.element_epilogue]),
-      'stages': str(operation.tile_description.stages),
-      'math_operator': 'cutlass::arch::OpMultiplyAdd'
-    }
-
-    return SubstituteTemplate(self.template, values)
-
-###################################################################################################
-
-#
-class EmitGemmGroupedInstance:
-  ''' Responsible for emitting a CUTLASS template definition'''
+class EmitPPU0015GemmUniversal3xInstance:
+  ''' Responsible for emitting a CUTLASS 3.x template definition'''
 
   def __init__(self, operation_suffix = ''):
     self.operation_suffix = operation_suffix
     self.includes = [
       "cutlass/cutlass.h",
       "cutlass/numeric_types.h",
-      "cutlass/arch/arch.h",
-      "cutlass/arch/mma.h",
-      "cutlass/layout/matrix.h",
-      "cutlass/gemm/device/gemm.h",
-      "cutlass/gemm/kernel/gemm_grouped.h",
-      "cutlass/gemm/kernel/default_gemm_grouped.h",
-      "cutlass/gemm/device/gemm_grouped.h"
+      "cutlass/epilogue/collective/default_epilogue.hpp",
+      "cutlass/epilogue/thread/linear_combination.h",
+      "cutlass/epilogue/collective/collective_builder.hpp",
+
+      "ppu_include.hpp",
+      "cutlass/gemm/config/gemm_operands.hpp",
+      "cutlass/gemm/config/gemm_configs.hpp",
     ]
     self.builtin_epilogue_functor_template = \
 """${epilogue_functor}<
+      ${element_d},
+      ${element_epilogue},
       ${element_c},
-      ${epilogue_vector_length},
-      ${element_accumulator},
       ${element_epilogue}
     >"""
 
     self.gemm_template = """
-// Gemm operator ${operation_name}
-using ${operation_name}_base =
-  typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    ${element_a}, ${layout_a}, ${transform_a}, ${align_a},
-    ${element_b}, ${layout_b}, ${transform_b}, ${align_b},
-    ${element_c}, ${layout_c},
-    ${element_accumulator},
-    ${opcode_class},
+
+using namespace cute;
+
+static constexpr cutlass::config::KernelScheduleType schedule_type 
+      = cutlass::config::KernelScheduleType(int(cutlass::config::KernelScheduleType::${kernel_schedule}));
+
+using ${operation_name}_base = typename cutlass::gemm::config::GemmKernelConfig<
     ${arch},
-    cutlass::gemm::GemmShape<${threadblock_shape_m}, ${threadblock_shape_n}, ${threadblock_shape_k}>,
-    cutlass::gemm::GemmShape<${warp_shape_m}, ${warp_shape_n}, ${warp_shape_k}>,
-    cutlass::gemm::GemmShape<${instruction_shape_m}, ${instruction_shape_n}, ${instruction_shape_k}>,
-    ${epilogue_functor},
-    ${swizzling_functor},
+    ${element_a}, ${layout_a}, ${align_a},
+    ${element_b}, ${layout_b}, ${align_b},
+    ${element_accumulator}, ${element_c}, ${align_c},
+    ${element_d}, ${align_d}, ${element_a},
+    ${tile_shape_main_m}, ${tile_shape_main_n}, ${tile_shape_main_k},
+    ${warp_shape_m}, ${warp_shape_n}, ${warp_shape_k},
     ${stages},
-    ${scheduler_mode},
-    ${math_operation}
->::GemmKernel;
+    ${epilogue_functor},
+    true,
+    false,
+    true,
+    schedule_type,
+    cutlass::arch::OpClassTensorOp
+  >::GemmKernel;
 
 // Define named type
-struct ${operation_name}${operation_suffix} :
+struct ${operation_name} :
   public ${operation_name}_base { };
-"""
 
+"""
   #
   def instance_template(self):
     return """
 ${compile_guard_start}
-  manifest.append(new ${gemm_kind}<
-    cutlass::gemm::device::GemmGrouped<${operation_name}>
-  >("${operation_name}"));
+  {
+    using GemmKernel = cutlass::gemm::device::GemmUniversalAdapter<${operation_name}>;
+    manifest.append(
+      new ${gemm_kind}<GemmKernel>("${operation_name}"));
+  }
 ${compile_guard_end}
 """
 
   #
   def emit(self, operation):
+    _LOGGER.debug("*** EmitGemmConfigurationLibrary::emit(operation)")
+    _LOGGER.debug("***   operation.procedural_name(): " + operation.procedural_name())
+    _LOGGER.debug("***   tile_shape: " + str(operation.tile_description.tile_shape))
+    _LOGGER.debug("***   warp_count: " + str(operation.tile_description.warp_count))
 
-    threadblock_shape = operation.tile_description.threadblock_shape
+    opcode_class_main = operation.tile_description.math_instruction.opcode_class
+    opcode_class_epi = opcode_class_main
+    tile_shape = operation.tile_description.tile_shape
     warp_count = operation.tile_description.warp_count
 
-    warp_shape = [threadblock_shape[idx] // warp_count[idx] for idx in range(3)]
+    warp_shape = [tile_shape[idx] // warp_count[idx] for idx in range(3)]
 
-    transpose_layouts = {
-      LayoutType.ColumnMajor: LayoutType.RowMajor,
-      LayoutType.RowMajor: LayoutType.ColumnMajor
-    }
+    instruction_shape = operation.tile_description.math_instruction.instruction_shape
+    cluster_m = operation.tile_description.cluster_shape[0]
+    cluster_n = operation.tile_description.cluster_shape[1]
 
-    instance_layout_A, instance_layout_B, instance_layout_C = \
-      (operation.A.layout, operation.B.layout, operation.C.layout)
-    #
+    tile_shape_main_m, tile_shape_main_n, tile_shape_main_k = tile_shape
+    tile_shape_epi_m, tile_shape_epi_n, tile_shape_epi_k = tile_shape
+
+    # PPU1.5 kernel schedule
+    if tile_shape_main_k == 64:
+      kernel_sch_str = "PERSISTENT_OVERLAP_PROEPILOGUE"
+    else:
+      # K32 use normal KernelAiuMultistage
+      kernel_sch_str = "DEFAULT"
+
+    # account for static/dynamic cluster shapes
+    cta_m = tile_shape[0] // cluster_m if cluster_m > 0 else tile_shape[0]
+    cta_n = tile_shape[1] // cluster_n if cluster_n > 0 else tile_shape[1]
+
+    epi_tile_mn = "cutlass::epilogue::collective::EpilogueTileAuto"
+
+    instance_layout_A, instance_layout_B, instance_layout_C , instance_layout_D = \
+      (operation.A.layout, operation.B.layout, operation.C.layout, operation.D.layout)
+
+    # 3.0 profiler integration only supports trivial epilogues for now
+    epilogue_vector_length = 1
 
     # Support built-in epilogue functors or user-defined functions
     if isinstance(operation.epilogue_functor, enum.Enum):
-
-      epilogue_vector_length = \
-        min(operation.C.alignment * DataTypeSize[operation.C.element], 128) // DataTypeSize[operation.C.element]
-
       values = {
-        'epilogue_vector_length': str(epilogue_vector_length),
         'element_epilogue': str(DataTypeTag[operation.element_epilogue]),
-        'epilogue_functor': EpilogueFunctorTag[operation.epilogue_functor],
+        'epilogue_functor': EpilogueFunctor3xTag[operation.epilogue_functor],
       }
       epilogue_functor = SubstituteTemplate(self.builtin_epilogue_functor_template, values)
     else:
       epilogue_functor = self.epilogue_functor.emit_declaration()
     #
-
+    # Cutlass3x complex kernels' ElementA(B) is a tuple in collective mainloop builder, e.g. cute::tuple<Element, Transform>, Transform : cute::identity / cute::conjugate.
+    element_a = DataTypeTag[operation.A.element] if not operation.is_complex() else f"cute::tuple<{str(DataTypeTag[operation.A.element])},{str(ComplexTransformTag3x[operation.A.complex_transform])}>"
+    element_b = DataTypeTag[operation.B.element] if not operation.is_complex() else f"cute::tuple<{str(DataTypeTag[operation.B.element])},{str(ComplexTransformTag3x[operation.B.complex_transform])}>"
+    epilogue_schedule_type = EpilogueScheduleTag[operation.epilogue_schedule]
+    is_no_smem_epilogue = operation.epilogue_schedule == EpilogueScheduleType.NoSmemWarpSpecialized
     values = {
       'operation_name': operation.procedural_name(),
       'operation_suffix': self.operation_suffix,
-      'element_a': DataTypeTag[operation.A.element],
+      'element_a': element_a,
       'layout_a': LayoutTag[instance_layout_A],
-      'element_b': DataTypeTag[operation.B.element],
+      'element_b': element_b,
       'layout_b': LayoutTag[instance_layout_B],
       'element_c': DataTypeTag[operation.C.element],
       'layout_c': LayoutTag[instance_layout_C],
+      'element_d': DataTypeTag[operation.D.element],
+      'layout_d': LayoutTag[instance_layout_D],
       'element_accumulator': DataTypeTag[operation.accumulator_type()],
-      'opcode_class': OpcodeClassTag[operation.tile_description.math_instruction.opcode_class],
-      'arch': "cutlass::arch::Sm%d" % operation.arch,
-      'threadblock_shape_m': str(operation.tile_description.threadblock_shape[0]),
-      'threadblock_shape_n': str(operation.tile_description.threadblock_shape[1]),
-      'threadblock_shape_k': str(operation.tile_description.threadblock_shape[2]),
+      'opcode_class_main': OpcodeClassTag[opcode_class_main],
+      'opcode_class_epi': OpcodeClassTag[opcode_class_epi],
+      'arch': "cutlass::arch::PPU0015",
+      'tile_shape_epi_m': str(tile_shape_epi_m),
+      'tile_shape_epi_n': str(tile_shape_epi_n),
+      'tile_shape_epi_k': str(tile_shape_epi_k),
+      'tile_shape_main_m': str(tile_shape_main_m),
+      'tile_shape_main_n': str(tile_shape_main_n),
+      'tile_shape_main_k': str(tile_shape_main_k),
       'warp_shape_m': str(warp_shape[0]),
       'warp_shape_n': str(warp_shape[1]),
       'warp_shape_k': str(warp_shape[2]),
-      'instruction_shape_m': str(operation.tile_description.math_instruction.instruction_shape[0]),
-      'instruction_shape_n': str(operation.tile_description.math_instruction.instruction_shape[1]),
-      'instruction_shape_k': str(operation.tile_description.math_instruction.instruction_shape[2]),
+      'instruction_shape_m': str(instruction_shape[0]),
+      'instruction_shape_n': str(instruction_shape[1]),
+      'instruction_shape_k': str(instruction_shape[2]),
+      'kernel_schedule' : kernel_sch_str,
+      'epilogue_schedule' : str(epilogue_schedule_type),
+      'epi_tile_mn' : epi_tile_mn,
       'epilogue_functor': epilogue_functor,
-      'swizzling_functor': SwizzlingFunctorTag[operation.swizzling_functor],
       'stages': str(operation.tile_description.stages),
-      'align_a': str(operation.A.alignment),
-      'align_b': str(operation.B.alignment),
+      # aiu ld use alignment 1
+      'align_a': str(1),
+      'align_b': str(1),
+      'align_c': str(operation.C.alignment),
+      'align_d': str(operation.C.alignment),
       'transform_a': ComplexTransformTag[operation.A.complex_transform],
       'transform_b': ComplexTransformTag[operation.B.complex_transform],
-      'scheduler_mode': GroupScheduleModeTag[operation.scheduler_mode],
-      'math_operation': MathOperationTag[operation.tile_description.math_instruction.math_operation]
+      'math_operation': MathOperationTag[operation.tile_description.math_instruction.math_operation],
+      'epilogue_vector_length': str(epilogue_vector_length),
+      'element_epilogue': str(DataTypeTag[operation.element_epilogue]),
+      'tile_scheduler': str(TileSchedulerTag[operation.tile_scheduler]),
     }
 
     return SubstituteTemplate(self.gemm_template, values)
 
+
 ###################################################################################################
+
 #
 # Emitters functions for all targets
 #
@@ -1180,27 +988,18 @@ class EmitGemmConfigurationLibrary:
 
     self.instance_emitter = {
       GemmKind.Gemm: EmitGemmInstance,
-      GemmKind.Sparse: EmitSparseGemmInstance,
       GemmKind.Universal: EmitGemmUniversalInstance,
       GemmKind.Universal3x: EmitGemmUniversal3xInstance,
-      GemmKind.SparseUniversal3x: EmitGemmUniversal3xInstance,
-      GemmKind.PlanarComplex: EmitGemmPlanarComplexInstance,
-      GemmKind.PlanarComplexArray: EmitGemmPlanarComplexArrayInstance,
-      GemmKind.Grouped: EmitGemmGroupedInstance
+      GemmKind.PPU0015Universal3x: EmitPPU0015GemmUniversal3xInstance,
     }
 
     self.gemm_kind_wrappers = {
       GemmKind.Gemm: 'GemmOperation',
-      GemmKind.Sparse: 'GemmSparseOperation',
       GemmKind.Universal: 'GemmUniversalOperation',
+      # PPU supports universal3x
       GemmKind.Universal3x: 'GemmUniversal3xOperation',
-      GemmKind.SparseUniversal3x: 'SparseGemmUniversal3xOperation',
-      GemmKind.PlanarComplex: 'GemmPlanarComplexOperation',
-      GemmKind.PlanarComplexArray: 'GemmPlanarComplexArrayOperation',
-      GemmKind.Grouped: 'GemmGroupedOperation'
+      GemmKind.PPU0015Universal3x: 'GemmUniversal3xOperation',
     }
-
-    self.wmma_guard_start = "#if defined(CUTLASS_ARCH_WMMA_SM${sm_number}_ENABLED)"
 
     self.separator = """
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1248,14 +1047,16 @@ void initialize_${configuration_name}(Manifest &manifest) {
     self.configuration_file.write(self.separator)
 
     self.includes = collections.OrderedDict([
+      ("cute/tensor.hpp", None),
       ("cutlass/cutlass.h", None),
       ("cutlass/library/library.h", None),
       ("cutlass/library/manifest.h", None),
       ("library_internal.h", None),
-      ("gemm_operation.h", None),
+      # gemm_operation.h based on cutlass2
+      # ("gemm_operation.h", None),
       ("gemm_operation_3x.hpp", None),
-      ("sparse_gemm_operation_3x.hpp", None),
-      ("cutlass/arch/wmma.h", None),
+      # todo: PPU1.0 support sparse gemm for profiler
+      # ("sparse_gemm_operation_3x.hpp", None),
       ("cutlass/numeric_types.h", None)
     ])
     self.instance_definitions = []
@@ -1281,10 +1082,8 @@ void initialize_${configuration_name}(Manifest &manifest) {
       'configuration_name': self.configuration_name,
       'operation_name': operation.procedural_name(),
       'gemm_kind': self.gemm_kind_wrappers[operation.gemm_kind],
-      'compile_guard_start': SubstituteTemplate(self.wmma_guard_start, {'sm_number': str(operation.arch)}) \
-        if operation.tile_description.math_instruction.opcode_class == OpcodeClass.WmmaTensorOp else "",
-      'compile_guard_end': "#endif" \
-        if operation.tile_description.math_instruction.opcode_class == OpcodeClass.WmmaTensorOp else ""
+      'compile_guard_start': "",
+      'compile_guard_end': ""
       }))
 
   def __exit__(self, exception_type, exception_value, traceback):

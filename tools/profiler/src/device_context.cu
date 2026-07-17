@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 /* \file
    \brief
 */
@@ -176,41 +178,6 @@ DeviceAllocation *DeviceContext::allocate_and_initialize_tensor(
   return allocation;
 }
 
-/// Allocates memory for sparse meta data
-DeviceAllocation *DeviceContext::allocate_and_initialize_sparsemeta_tensor(
-  Options const &options,
-  std::string const &name,
-  library::NumericTypeID type,
-  library::LayoutTypeID layout_id,
-  library::NumericTypeID type_a,
-  std::vector<int> const &extent,
-  std::vector<int64_t> const &stride,
-  int batch_count,
-  int seed_shift,
-  size_t device_index) {
-
-  DeviceAllocation *allocation =
-      allocate_tensor(options, name, type, layout_id, extent, stride,
-                      batch_count, device_index);
-
-  if (options.initialization.enabled) {
-    // TF32 has 4bit meta data.  The rest has 2bit.
-    int MetaSizeInBits = (cutlass::library::sizeof_bits(type_a) == 32) ? 4 : 2;
-
-    if (options.initialization.provider == library::Provider::kReferenceDevice) {
-      allocation->initialize_random_sparsemeta_device(
-        options.initialization.seed + seed_shift,
-        MetaSizeInBits);
-    }
-    else if (options.initialization.provider == library::Provider::kReferenceHost) {
-      allocation->initialize_random_sparsemeta_host(
-        options.initialization.seed + seed_shift,
-        MetaSizeInBits);
-    }
-  }
-
-  return allocation;
-}
 /// Clears named allocations (but does not necessarily free memory)
 void DeviceContext::clear() {
   allocations_.clear();

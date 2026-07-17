@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
 #pragma once
 
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
@@ -35,16 +37,7 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "cutlass/gemm/collective/sm70_mma_twostage.hpp"
-#include "cutlass/gemm/collective/sm80_mma_multistage.hpp"
-#include "cutlass/gemm/collective/sm90_mma_multistage_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_multistage_gmma_rs_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_rs_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_rs_warpspecialized_mixed_input.hpp" 
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_sparse_mma_tma_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_array_tma_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8.hpp"
+// PPU supports async cp, will use async.cp mma multistage mainloop in include/cutlass/gemm/config/gemm_configs.hpp
+#include "cutlass/gemm/collective/ppu_mma_multistage.hpp" 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,4 +1,5 @@
 /***************************************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved. 
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -28,14 +29,19 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
+
+#include <vector>
+// NOTE: this header used to depend on thrust::host_vector / thrust::device_vector,
+// but the device toolchain ships an incomplete thrust port. Switch to std::vector
+// for host buffers and cutlass::DeviceAllocation (RAII over the device runtime
+// alloc/free/memcpy entry points) for device buffers.
+#include "cutlass/util/device_memory.h"
 
 #include <cute/tensor.hpp>
 
 #include "cutlass/util/print_error.hpp"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/helper_cuda.hpp"
+#include "cutlass/util/PPU_Clock.hpp"
+#include "cutlass/util/helper_hggc.hpp"
 
 // This is a simple tutorial showing several ways to partition a tensor into tiles then
 // perform efficient, coalesced copies. This example also shows how to vectorize accesses
@@ -48,7 +54,7 @@
 // (M, N) denotes a statically sized tile, and m' and n' denote the number of such tiles
 // within the tensor.
 //
-// Each statically sized tile is mapped to a CUDA threadblock which performs efficient
+// Each statically sized tile is mapped to a device threadblock which performs efficient
 // loads and stores to Global Memory.
 //
 // `copy_kernel()` uses `cute::local_partition()` to partition the tensor and map
@@ -136,23 +142,25 @@ int main(int argc, char** argv)
   // Allocate and initialize
   //
 
-  thrust::host_vector<Element> h_S(size(tensor_shape));
-  thrust::host_vector<Element> h_D(size(tensor_shape));
+  std::vector<Element> h_S(size(tensor_shape));
+  std::vector<Element> h_D(size(tensor_shape));
 
   for (size_t i = 0; i < h_S.size(); ++i) {
     h_S[i] = static_cast<Element>(i);
     h_D[i] = Element{};
   }
 
-  thrust::device_vector<Element> d_S = h_S;
-  thrust::device_vector<Element> d_D = h_D;
+  cutlass::DeviceAllocation<Element> d_S(h_S.size());
+  cutlass::DeviceAllocation<Element> d_D(h_D.size());
+  d_S.copy_from_host(h_S.data(), h_S.size());
+  d_D.copy_from_host(h_D.data(), h_D.size());
 
   //
   // Make tensors
   //
 
-  Tensor tensor_S = make_tensor(make_gmem_ptr(thrust::raw_pointer_cast(d_S.data())), make_layout(tensor_shape));
-  Tensor tensor_D = make_tensor(make_gmem_ptr(thrust::raw_pointer_cast(d_D.data())), make_layout(tensor_shape));
+  Tensor tensor_S = make_tensor(make_gmem_ptr(d_S.get()), make_layout(tensor_shape));
+  Tensor tensor_D = make_tensor(make_gmem_ptr(d_D.get()), make_layout(tensor_shape));
 
   //
   // Tile tensors
@@ -175,7 +183,7 @@ int main(int argc, char** argv)
   // Tile the tensor (m, n) ==> ((M, N), m', n') where (M, N) is the static tile
   // shape, and modes (m', n') correspond to the number of tiles.
   //
-  // These will be used to determine the CUDA kernel grid dimensions.
+  // These will be used to determine the device kernel grid dimensions.
   Tensor tiled_tensor_S = tiled_divide(tensor_S, block_shape);      // ((M, N), m', n')
   Tensor tiled_tensor_D = tiled_divide(tensor_D, block_shape);      // ((M, N), m', n')
 
@@ -223,9 +231,9 @@ int main(int argc, char** argv)
     tiled_tensor_D,
     tiled_copy);
 
-  cudaError result = cudaDeviceSynchronize();
-  if (result != cudaSuccess) {
-    std::cerr << "CUDA Runtime error: " << cudaGetErrorString(result) << std::endl;
+  hggcError result = hggcDeviceSynchronize();
+  if (result != hggcSuccess) {
+    std::cerr << "device Runtime error: " << hggcGetErrorString(result) << std::endl;
     return -1;
   }
 
@@ -233,7 +241,8 @@ int main(int argc, char** argv)
   // Verify
   //
 
-  h_D = d_D;
+  h_D.assign(h_D.size(), Element{});
+  d_D.copy_to_host(h_D.data(), h_D.size());
 
   int32_t errors = 0;
   int32_t const kErrorLimit = 10;
