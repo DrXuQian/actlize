@@ -38,6 +38,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/utils.h"
 
 #include "cute/tensor.hpp"
 
@@ -57,7 +58,8 @@ class GemmUniversal<
   CollectiveEpilogue_,
   TileScheduler_,
   cute::enable_if_t<cute::is_base_of_v<KernelAiuMultistageMixedInput, typename CollectiveMainloop_::DispatchPolicy::Schedule>
-    && !cute::is_same_v<TileScheduler_, SplitKSerialScheduler>>>
+    && !cute::is_same_v<TileScheduler_, SplitKSerialScheduler>
+    && !isGroupProblemShape_v<ProblemShape_>>>
 {
 public:
   //
