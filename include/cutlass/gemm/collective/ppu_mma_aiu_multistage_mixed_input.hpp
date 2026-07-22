@@ -629,7 +629,11 @@ private:
     if constexpr (kCon != 1) {
       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B),
         make_shape(N, make_shape(kCon, K / kCon), L),
-        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N), cute::Int<0>{})
+        // GROUPED FIX: interleaved desc base = (uint8_t*)raw_pointer_cast(mB_nk.data()) treats the int4
+        // ELEMENT L-stride as a BYTE count (no /2), so the stride must be in bytes: one expert weight is
+        // N*K int4 = N*K/2 bytes. (Was Int<0> -> every expert read plane 0; N*K -> every expert jumped 2
+        // experts and e>=2 read OOB garbage. N*K/2 lands each expert exactly. No effect on L=1: l_coord=0.)
+        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N), int64_t(N) * int64_t(K) / 2)
       );
       Tensor mB_nk = mB_nkl(_,_,l_coord);
       auto layout_counting = make_layout(
