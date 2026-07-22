@@ -947,7 +947,8 @@ private:
         for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
           int atom_idx = k_block * K_ATOM_PER_COPY + i;
           int g = atom_idx / APG_;                                      // this atom's scale group within the tile
-          copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
+          if (atom_idx % APG_ == 0)                                     // reload only at a group's first atom
+            copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
           cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, atom_idx), cute::multiplies{});
         }
@@ -974,9 +975,11 @@ private:
         for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
           int atom_idx = k_block * K_ATOM_PER_COPY + i;
           int g = atom_idx / APG_;
-          const int sk = read_stage * int(Scale_TileK) + g;
-          copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
-          copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+          if (atom_idx % APG_ == 0) {                                   // reload only at a group's first atom
+            const int sk = read_stage * int(Scale_TileK) + g;
+            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+          }
           cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, atom_idx), cute::multiplies{});
           cute::transform(tCrB_mma(_, _, atom_idx), cute::get<3>(partitioned_extra_info)(_, _, 0),
