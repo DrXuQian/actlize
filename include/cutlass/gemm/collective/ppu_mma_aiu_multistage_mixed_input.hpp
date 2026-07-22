@@ -578,7 +578,8 @@ public:
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
-      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY);
+      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
+          copy_partitions_extra_info, smem_pipe_read);
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -605,7 +606,8 @@ public:
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY);
+        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
+          copy_partitions_extra_info, smem_pipe_read);
 
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
@@ -878,8 +880,14 @@ private:
 
     copy(smem_tiled_copy_B, tCsB(_,_,k_block,read_stage), tCrB_copy_view(_,_,k_block));
 
-    auto GroupK= size<2>(tCrB_copy_view) / Scale_TileK;
-    if (k_block % GroupK == 0) {
+    // COARSE scale path: gs spans >= one full B copy step (Scale_TileK <= K_BLOCK_MAX), so one scale group
+    // covers >=1 whole copy steps -> load it here, once per GroupK steps. The FINE case (gs < copy-step K, e.g.
+    // gs=32 with a 64-K single-step copy -> Scale_TileK > K_BLOCK_MAX) makes GroupK=0 (a div-by-zero) and one
+    // group can't cover the whole step; there the scale is loaded PER mma-atom in transform_B_kblock instead.
+    constexpr int KBM_ = decltype(cute::size<2>(tCrB_copy_view))::value;
+    if constexpr (int(Scale_TileK) <= KBM_) {
+     auto GroupK= size<2>(tCrB_copy_view) / Scale_TileK;
+     if (k_block % GroupK == 0) {
       // We are starting a new group k-tile so copy the scale
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
         // nothing to do
@@ -917,21 +925,30 @@ private:
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
         assert(false);
       }
-    }
+     }  // if (k_block % GroupK == 0)
+    }   // if constexpr (Scale_TileK <= K_BLOCK_MAX)  [COARSE]
   }
   /// Utilities to transform B.
+  // FINE-grained scale (gs < B-copy-step K, i.e. Scale_TileK > K_BLOCK_MAX): a single copy step's K_ATOM_PER_COPY
+  // mma atoms straddle MORE than one scale group, so one pre-loaded scale reg can't cover the step (and the coarse
+  // GroupK = K_BLOCK_MAX/Scale_TileK is 0). Here each mma atom reloads ITS group's scale straight from smem:
+  // atom `a` (0..mma_K_atoms) belongs to group a/(mma_K_atoms/Scale_TileK), at smem slot read_stage*Scale_TileK+g.
+  // This needs tiled_copy_and_views (smem_tiled_copy_S + reg-copy dst views) + read_stage, so both are passed in.
   template <typename RealInternalElementB,
             class TCrB_load,
             class TCrB_mma,
             int K_ATOM_PER_COPY,
-            class... Ts>
+            class... Ts,
+            class CopyViews>
   CUTLASS_DEVICE
   void transform_B_kblock(
     TCrB_load const& tCrB_load,
     TCrB_mma& tCrB_mma,
     cute::tuple<Ts...> const& partitioned_extra_info,
     int const k_block,
-    cute::Int<K_ATOM_PER_COPY> k_atom) {
+    cute::Int<K_ATOM_PER_COPY> k_atom,
+    CopyViews const& tiled_copy_and_views,
+    int const read_stage) {
 
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
     Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
@@ -939,25 +956,67 @@ private:
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
     convert_tensor(cvt_in, cvt_out, CPY_VEC{});
 
+    constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
+    constexpr int KBM_    = MMA_KA_ / K_ATOM_PER_COPY;                  // K_BLOCK_MAX (copy steps)
+    constexpr bool FINE   = (int(Scale_TileK) > KBM_);                  // gs < copy-step K -> per-atom scale
+    constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;    // mma atoms per scale group (FINE only)
+
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       // do nothing
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       auto tCrS = cute::get<1>(partitioned_extra_info);
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-        int atom_idx = k_block * K_ATOM_PER_COPY + i;
-        cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
+      if constexpr (!FINE) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
+          int atom_idx = k_block * K_ATOM_PER_COPY + i;
+          cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
+        }
+      } else {
+        // FINE: write via tCrS_copy_view (a retile VIEW of the ORIGINAL fragment) then read the ORIGINAL back --
+        // NOT the local `tCrS` copy above (make_fragment_like is owning, so `auto tCrS` snapshots stale rmem).
+        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+        auto tCsS              = cute::get<0>(partitioned_extra_info);
+        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
+          int atom_idx = k_block * K_ATOM_PER_COPY + i;
+          int g = atom_idx / APG_;                                      // this atom's scale group within the tile
+          copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
+          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
+        }
       }
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       auto tCrS = cute::get<1>(partitioned_extra_info);
       auto tCrZ = cute::get<3>(partitioned_extra_info);
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-        int atom_idx = k_block * K_ATOM_PER_COPY + i;
-        cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
-        cute::transform(tCrB_mma(_, _, atom_idx), tCrZ(_, _, 0), tCrB_mma(_, _, atom_idx), cute::plus{});
+      if constexpr (!FINE) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
+          int atom_idx = k_block * K_ATOM_PER_COPY + i;
+          cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
+          cute::transform(tCrB_mma(_, _, atom_idx), tCrZ(_, _, 0), tCrB_mma(_, _, atom_idx), cute::plus{});
+        }
+      } else {
+        // FINE: see ConvertAndScale note -- write via the copy VIEWs, read the ORIGINAL fragments back.
+        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+        auto tCsS              = cute::get<0>(partitioned_extra_info);
+        auto tCsZ              = cute::get<2>(partitioned_extra_info);
+        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
+        auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
+          int atom_idx = k_block * K_ATOM_PER_COPY + i;
+          int g = atom_idx / APG_;
+          const int sk = read_stage * int(Scale_TileK) + g;
+          copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+          copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
+          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<3>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, atom_idx), cute::plus{});
+        }
       }
     }
     else {
