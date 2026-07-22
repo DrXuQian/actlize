@@ -283,6 +283,7 @@ public:
     NonVoidStrideScale dS{};
     int group_size = 0;
     ElementZero const* ptr_Z = nullptr;
+    int const* group_row_offsets = nullptr;   // ragged grouped: per-expert cumulative A row start; null=uniform
   };
 
   // Device side kernel params
@@ -301,6 +302,7 @@ public:
     int group_size = 0;
     int64_t scale_k = 0;
     int reload_factor = 0;
+    int const* group_row_offsets = nullptr;
   };
 
   GmemTiledCopyA gmem_tiled_copy_A;
@@ -329,6 +331,7 @@ public:
       p.dA = args.dB;
       p.dB = args.dA;
     }
+    p.group_row_offsets = args.group_row_offsets;
 
     if constexpr (ModeHasScales) {
       p.gmem_tiled_copy_scale = make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, NonVoidElementScale>{},
@@ -363,8 +366,13 @@ public:
     // A init
     using TilerA = typename GmemTiledCopyA::Tiler_MN;
     gmem_tiled_copy_A.desc_.template init<RealInternalElementA, false, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, mainloop_params.dA);
-    Tensor mA_mkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_A), make_shape(M,K,L), mainloop_params.dA);   // (m,k,l)
-    Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,l_coord));                                                   // (m,k)
+    // RAGGED grouped: expert l_coord's A starts group_row_offsets[l_coord] rows in (M is that expert's M_e).
+    // When null (batched/uniform) fall back to the uniform l_coord*M offset -> identical to the original.
+    int64_t a_row_off = mainloop_params.group_row_offsets ? int64_t(mainloop_params.group_row_offsets[l_coord])
+                                                          : int64_t(l_coord) * int64_t(M);
+    Tensor mA_mkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_A + a_row_off * K),
+                                make_shape(M,K,cute::Int<1>{}), mainloop_params.dA);                            // (m,k,1)
+    Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,0));                                                         // (m,k)
     Tensor gA = local_tile(mA_mk, TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});                    // (BLK_M,BLK_K,k)
 
     // B init (include init aiu desc)
