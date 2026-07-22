@@ -452,7 +452,8 @@ struct CollectiveBuilder<
        cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperativeMixedInput> ||
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputPerCol> ||
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs128> ||
-       cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs64>)>
+       cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs64> ||
+       cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs32>)>
 > {
 private:
   using ScaleA = detail::deduce_mixed_width_dtype_t<1, ElementPairA_>;

@@ -143,6 +143,7 @@ struct KernelAiuMultistageMixedInput { };
 struct KernelAiuMultistageMixedInputPerCol { };
 struct KernelAiuMultistageMixedInputFinegrainedGs128 { };
 struct KernelAiuMultistageMixedInputFinegrainedGs64 { };
+struct KernelAiuMultistageMixedInputFinegrainedGs32 { };  // gs=32 (Q4_0/Q4_1/Q4_K-as-AWQ)
 struct KernelAiuMultistageBatchArray { };
 struct KernelAiuMultistageBatchArrayOverlapPrologue { };
 struct KernelAiuMultistageStreamK { };
@@ -274,6 +275,15 @@ template<int Stages_, class kContinous_>
 struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs64> {
   constexpr static int Stages = Stages_;
   constexpr static int StaticGroupSize = 64;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs32> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 32;
   using kContinous = kContinous_;
   using Schedule = KernelAiuMultistageMixedInput;
   using ClusterShape = Shape<_1,_1,_1>;
