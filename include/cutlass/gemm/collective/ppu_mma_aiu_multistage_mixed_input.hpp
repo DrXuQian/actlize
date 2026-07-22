@@ -47,13 +47,6 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if defined(PPU_SCALE_DBG)
-// TEMPORARY gs=32 GroupK=2 debug: block0/thread0 records, at each intra-tile scale reload, the tuple
-// (k_block, scale_k_idx, smem-source value, reg-dest value). Lets the host see whether the scale reg reads 0
-// because the smem slot was never loaded (source==0) or the reg copy read the wrong slot (source!=0, dest==0).
-namespace cutlass_ppu_scale_dbg { __device__ float buf[64]; __device__ int cnt; __device__ float meta[8]; }
-#endif
-
 namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -560,14 +553,6 @@ public:
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrB_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrB_mma) / size<2>(tCrB_copy_view);
-#if defined(PPU_SCALE_DBG)
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
-      cutlass_ppu_scale_dbg::meta[0] = float(int(Scale_TileK));
-      cutlass_ppu_scale_dbg::meta[1] = float(int(K_BLOCK_MAX));
-      cutlass_ppu_scale_dbg::meta[2] = float(int(size<2>(tCrB_mma)));
-      cutlass_ppu_scale_dbg::meta[3] = float(int(K_ATOM_PER_COPY));
-    }
-#endif
 
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
@@ -644,14 +629,6 @@ public:
 
     cp_async_wait<0>();
     __syncthreads();
-#if defined(PPU_SCALE_DBG)
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
-      cutlass_ppu_scale_dbg::meta[4] = float(accum(0));           // first accumulator element after mainloop
-      cutlass_ppu_scale_dbg::meta[5] = float(int(size(accum)));   // accumulator fragment size
-      float s = 0.f; for (int i = 0; i < int(size(accum)); ++i) s += float(accum(i));
-      cutlass_ppu_scale_dbg::meta[6] = s;                         // sum over this thread's accumulators
-    }
-#endif
   }
 
 private:
@@ -898,18 +875,6 @@ private:
         auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
         auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
         copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
-#if defined(PPU_SCALE_DBG)
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
-          int di = cutlass_ppu_scale_dbg::cnt;
-          if (di < 16) {
-            cutlass_ppu_scale_dbg::buf[di*4+0] = float(k_block);
-            cutlass_ppu_scale_dbg::buf[di*4+1] = float(scale_k_idx);
-            cutlass_ppu_scale_dbg::buf[di*4+2] = float(tCsS(0,0,0,scale_k_idx));   // smem source slot
-            cutlass_ppu_scale_dbg::buf[di*4+3] = float(tCrS_copy_view(0));         // reg dest after copy
-            cutlass_ppu_scale_dbg::cnt = di + 1;
-          }
-        }
-#endif
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           // Nothing extra to do
         } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
