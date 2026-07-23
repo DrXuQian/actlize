@@ -565,8 +565,9 @@ public:
       if constexpr (cute::is_same_v<RealInternalElementB, cutlass::uint2b_t>) {
         if (cute::thread0()) {
           int rs = smem_pipe_read;
-          printf("W2DBG smem sB(n,0): N0=%d N8=%d N16=%d N24=%d (expect 0 1 0 1)\n",
-                 int(sB(0,0,rs)), int(sB(8,0,rs)), int(sB(16,0,rs)), int(sB(24,0,rs)));
+          uint8_t const* sp = reinterpret_cast<uint8_t const*>(cute::raw_pointer_cast(sB.data()));
+          auto v = [&](int n){ int o = sB.layout()(n, 0, rs); return int((sp[o/4] >> ((o%4)*2)) & 0x3); };  // uint2 @ (n,0,rs)
+          printf("W2DBG smem sB(n,0): N0=%d N8=%d N16=%d N24=%d (expect 0 1 0 1)\n", v(0), v(8), v(16), v(24));
         }
       }
       // Prefetch the first rmem from the first k-tile
