@@ -918,6 +918,18 @@ private:
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
     Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
 
+    // W2A16 LAYOUT PROBE (uint2b_t only; inert for int4). Dumps the fragment layouts to see how the 4 unpacked
+    // int2->fp16 (per int8) map into tCrB_mma -> pin the sigma_n=n&~8 placement bug. Remove after diagnosis.
+    if constexpr (cute::is_same_v<RealInternalElementB, cutlass::uint2b_t>) {
+      if (cute::thread0() && k_block == 0) {
+        printf("W2DBG K_ATOM_PER_COPY=%d\n", int(K_ATOM_PER_COPY));
+        printf("W2DBG tCrB_load.layout= "); cute::print(tCrB_load.layout()); printf("\n");
+        printf("W2DBG cvt_in.layout   = "); cute::print(cvt_in.layout());    printf("\n");
+        printf("W2DBG tCrB_mma.layout = "); cute::print(tCrB_mma.layout());  printf("\n");
+        printf("W2DBG cvt_out.target  = "); cute::print(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).layout()); printf("\n");
+      }
+    }
+
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
     convert_tensor(cvt_in, cvt_out, CPY_VEC{});
 
