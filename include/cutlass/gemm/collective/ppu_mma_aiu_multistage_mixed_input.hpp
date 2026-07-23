@@ -931,18 +931,16 @@ private:
 
     // LAYOUT PROBE for BOTH int4 (reference, works) and int2 (broken) -> compare fragment layouts to pin the
     // int2 N-half bug. Fires once (thread0, k_block==0). Tag = element type. Remove after diagnosis.
-    if constexpr (cute::is_same_v<RealInternalElementB, cutlass::uint2b_t> || cute::is_same_v<RealInternalElementB, cutlass::int4b_t>) {
-      if (cute::thread0() && k_block == 0) {
-        printf("W2DBG elem=%s K_ATOM_PER_COPY=%d\n", cute::is_same_v<RealInternalElementB, cutlass::uint2b_t> ? "int2" : "int4", int(K_ATOM_PER_COPY));
-        printf("W2DBG tCrB_load.layout= "); cute::print(tCrB_load.layout()); printf("\n");
-        printf("W2DBG cvt_in.layout   = "); cute::print(cvt_in.layout());    printf("\n");
-        printf("W2DBG tCrB_mma.layout = "); cute::print(tCrB_mma.layout());  printf("\n");
-        printf("W2DBG cvt_out.target  = "); cute::print(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).layout()); printf("\n");
-        // value-level: is tCrB_load's mode1 (the 2 N-halves, stride 32 int8) distinct, or aliased for int2?
-        auto* lp = reinterpret_cast<int8_t const*>(cute::raw_pointer_cast(tCrB_load.data()));
-        printf("W2DBG load m1=0: %d %d %d %d | m1=1: %d %d %d %d\n",
-               int(lp[0]),int(lp[1]),int(lp[2]),int(lp[3]), int(lp[32]),int(lp[33]),int(lp[34]),int(lp[35]));
-      }
+    // UNCONDITIONAL probe (fires for every dtype) to settle why int4 didn't hit this transform: prints the
+    // element width the B side actually sees + SwapAB/IsATransformed. If int4 shows elemB_bits=16 (=half) it is
+    // SwapAB'd (narrow int4 on the A side, dequant via TransformA) -> a DIFFERENT path than int2's B-side one.
+    if (cute::thread0() && k_block == 0) {
+      printf("W2DBG elemB_bits=%d SwapAB=%d IsATransformed=%d K_ATOM_PER_COPY=%d\n",
+             int(cute::sizeof_bits<RealInternalElementB>::value), int(SwapAB), int(IsATransformed), int(K_ATOM_PER_COPY));
+      printf("W2DBG tCrB_load.layout= "); cute::print(tCrB_load.layout()); printf("\n");
+      printf("W2DBG cvt_in.layout   = "); cute::print(cvt_in.layout());    printf("\n");
+      printf("W2DBG tCrB_mma.layout = "); cute::print(tCrB_mma.layout());  printf("\n");
+      printf("W2DBG cvt_out.target  = "); cute::print(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).layout()); printf("\n");
     }
 
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
