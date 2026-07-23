@@ -356,6 +356,72 @@ struct MixGemmNumericArrayConverter<DstType, int4b_t, 32>
     }
 };
 
+// ============================ W2A16 : uint2b_t -> fp16 ============================
+// Q2 base plane (also the high plane of Q6, low plane of Q3). q2 in [0,3] UNSIGNED (no +bias:
+// the per-group affine 'zero' term absorbs the offset). Correctness-first: plain shift-extract,
+// NO lop3 magic-trick (perf later). Numeric validated in low_bit/w2a16_smoke.cu (bad=0 on ppu001).
+template <>
+struct MixGemmNumericArrayConverter<half_t, uint2b_t, 16>   // 16 x uint2 = 32 bits -> 16 half
+{
+    using result_type = Array<half_t, 16>;
+    using source_type = Array<uint2b_t, 16>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        result_type result;
+        uint32_t const bits = reinterpret_cast<uint32_t const&>(source);   // 16 x 2-bit, LSB-first
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 16; ++i)
+            result[i] = half_t(float((bits >> (2 * i)) & 0x3u));           // elt i = bits[2i:2i+2]
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s) { return convert(s); }
+};
+
+// Wide converter used by convert_tensor (CPY_VEC = 4*32/2 = 64 for uint2). Composes base-16 x4.
+template <>
+struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
+{
+    using result_type = Array<half_t, 64>;
+    using source_type = Array<uint2b_t, 64>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        // DERIVED b16-level reshuffle (not identity). The swzl (ppu.tc01.ldmatrix.*.swzl.*.b16) is byte/b16-level
+        // and IDENTICAL for int4b_t and uint2b_t: both drive PPU0010_TSM_LD_SWZL<int8_t,...>, and the per-lane
+        // byte->fragment map in ppu_tsm_ld_swzl_sim (copy_ppu0010_aiu.hpp) depends only on CUBE_H/lane/coord, NOT
+        // on the sub-byte width (CUBE_W). So this MIRRORS the int4b_t,32 converter's reshuffle (VREG order
+        // src[1]->out[2], src[2]->out[1]; b16 swap [1]<->[2],[5]<->[6]); the ONLY change is each b16 chunk is
+        // 8 halves for uint2 (int4 had 4). The WITHIN-b16 order of the 8 uint2 per b16 is left sequential in the
+        // base-16 converter and is meant to be fixed by the OFFLINE pack; that fine ordering still needs a small
+        // box probe (b16-internal 8-value order only). Verify the whole thing on ppu001.
+        MixGemmNumericArrayConverter<half_t, uint2b_t, 16> convert_vector_;
+        result_type result;
+        using vec_result = Array<half_t, 16>;                 // one vreg = 16 halves
+        using vec_source = Array<uint2b_t, 16>;
+        vec_result*       result_ptr = reinterpret_cast<vec_result*>(&result);
+        vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
+        // VREG reorder (swap middle two vregs) — identical to int4b_t,32 because the swzl is the same
+        result_ptr[0] = convert_vector_(source_ptr[0]);
+        result_ptr[2] = convert_vector_(source_ptr[1]);
+        result_ptr[1] = convert_vector_(source_ptr[2]);
+        result_ptr[3] = convert_vector_(source_ptr[3]);
+        // b16 swap — same pattern as int4, but on 8-half chunks (uint2 b16 = 8 halves, int4 was 4)
+        using vec_b16 = Array<half_t, 8>;
+        vec_b16* b16 = reinterpret_cast<vec_b16*>(&result);
+        vec_b16 tmp_b16 = b16[1]; b16[1] = b16[2]; b16[2] = tmp_b16;
+        tmp_b16 = b16[5]; b16[5] = b16[6]; b16[6] = tmp_b16;
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s) { return convert(s); }
+};
+
 } // namespace cutlass
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
