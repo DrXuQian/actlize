@@ -90,6 +90,13 @@ struct AiuDesc {
       dim_w /= 2;
       cube_w /= 2;
     }
+    else if constexpr (sizeof_bits<Element>::value == 2) {
+      // W2A16: 4 uint2/byte. The .b8 AIU load wants dim_w/cube_w in BYTES; convert from elements by /4
+      // (int4 above is /2). Without this, cube_w stays in element units -> 4x too big -> "AIU_ld TSM size out
+      // of range" + illegal address.
+      dim_w /= 4;
+      cube_w /= 4;
+    }
 #else
     if constexpr (!Trans) {
       dim_h = MN;
