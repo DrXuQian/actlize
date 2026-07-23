@@ -927,6 +927,10 @@ private:
         printf("W2DBG cvt_in.layout   = "); cute::print(cvt_in.layout());    printf("\n");
         printf("W2DBG tCrB_mma.layout = "); cute::print(tCrB_mma.layout());  printf("\n");
         printf("W2DBG cvt_out.target  = "); cute::print(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).layout()); printf("\n");
+        // value-level: is tCrB_load's mode1 (the 2 N-halves, stride 32 int8) distinct, or aliased for int2?
+        auto* lp = reinterpret_cast<int8_t const*>(cute::raw_pointer_cast(tCrB_load.data()));
+        printf("W2DBG load m1=0: %d %d %d %d | m1=1: %d %d %d %d\n",
+               int(lp[0]),int(lp[1]),int(lp[2]),int(lp[3]), int(lp[32]),int(lp[33]),int(lp[34]),int(lp[35]));
       }
     }
 
