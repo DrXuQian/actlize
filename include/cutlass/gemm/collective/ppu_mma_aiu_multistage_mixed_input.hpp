@@ -436,6 +436,13 @@ public:
     int warp_idx = canonical_warp_idx_sync();
     int aiu_warp_group_thread_idx = warp_idx * 32;
 
+    // W2DBG ENTRY probe (unconditional): fires the moment ANY dtype enters THIS mixed-input collective. If int4
+    // never prints this, int4 W4A16 uses a DIFFERENT collective than int2 -- the divergence we're chasing.
+    if (cute::thread0()) {
+      printf("W2DBG-ENTRY mixed_input collective: elemB_bits=%d SwapAB=%d IsATransformed=%d\n",
+             int(cute::sizeof_bits<RealInternalElementB>::value), int(SwapAB), int(IsATransformed));
+    }
+
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
     auto k_iter_shape = cute::shape<2>(gB);
