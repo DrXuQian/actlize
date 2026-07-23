@@ -291,6 +291,42 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
   }
 };
 
+// W2A16: 2-bit bulk load. Mirror of the ==4 spec (same byte-level .b8 AIU instr); only the element->byte coord
+// scaling changes: 4 uint2/byte -> coord_w /= 4 (int4 used /2). Trans=false only (B is non-transposed).
+template <class NumBitsPerTMA, typename Element, bool Swzl>
+struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<sizeof_bits<Element>::value == 2>>
+: PPU_AIU_LOAD_BASE
+{
+  CUTE_HOST_DEVICE static void
+  copy(void *smem_ptr, const void *gmem_ptr, AiuDesc desc, int coord_w, int coord_h, int coord_n = 0)
+  {
+    coord_w /= 4;   // 4 uint2 / byte
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    if constexpr(Swzl) {
+      asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b8 [%0], [%1], "
+        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
+        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 1),
+          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
+          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
+          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
+      );
+    } else {
+      asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.2d.b8 [%0], [%1], "
+        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
+        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 1),
+          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
+          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
+          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
+      );
+    }
+#else
+    CUTE_INVALID_CONTROL_PATH("Support for AIU_LOAD has not been enabled for Trans=false,b2");
+#endif
+  }
+};
+
 template<typename Element, int CUBE_H, int CUBE_W, bool SWAP>
 CUTE_HOST_DEVICE static void
 ppu_tsm_ld_swzl_sim(void *frag_ptr, void *smem_base, int coord_w, int coord_h, int stage) {
