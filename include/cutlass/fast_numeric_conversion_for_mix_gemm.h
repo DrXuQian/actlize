@@ -410,11 +410,12 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
         result_ptr[2] = convert_vector_(source_ptr[1]);
         result_ptr[1] = convert_vector_(source_ptr[2]);
         result_ptr[3] = convert_vector_(source_ptr[3]);
-        // NO b16 swap for uint2. int4's swap [1<->2,5<->6] on 4-half chunks swaps HALF-atoms (int4: 2 chunks =
-        // 1 mma-K-atom, 8 chunks / 4 atoms). uint2 has 1 b16-chunk (8 fp16) = 1 whole K-atom (8 chunks / 8
-        // atoms), so the same index-swap would swap WHOLE atoms 1<->2,5<->6 -> misplaces the 2nd K-atom into
-        // N's upper 8 columns (observed sigma_n(n)=n&~8). Hypothesis: uint2's 8 chunks are already 1:1 with the
-        // 8 K-atoms in natural order, so no swap. VERIFY on box via the q2-N readout (expect sigma_n(n)=n).
+        // b16 swap [1<->2,5<->6] on 8-half chunks — mirrors int4b_t,32. (Removing it did NOT change sigma_n, so
+        // it only affects K-atom order, not the N-alias; kept for K correctness.)
+        using vec_b16 = Array<half_t, 8>;
+        vec_b16* b16 = reinterpret_cast<vec_b16*>(&result);
+        vec_b16 tmp_b16 = b16[1]; b16[1] = b16[2]; b16[2] = tmp_b16;
+        tmp_b16 = b16[5]; b16[5] = b16[6]; b16[6] = tmp_b16;
         return result;
     }
 
