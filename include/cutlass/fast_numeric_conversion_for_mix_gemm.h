@@ -405,16 +405,16 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
         using vec_source = Array<uint2b_t, 16>;
         vec_result*       result_ptr = reinterpret_cast<vec_result*>(&result);
         vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
-        // VREG reorder (swap middle two vregs) — identical to int4b_t,32 because the swzl is the same
+        // VREG reorder (swap middle two vregs) — validated via the swzl word-map (width-independent).
         result_ptr[0] = convert_vector_(source_ptr[0]);
         result_ptr[2] = convert_vector_(source_ptr[1]);
         result_ptr[1] = convert_vector_(source_ptr[2]);
         result_ptr[3] = convert_vector_(source_ptr[3]);
-        // b16 swap — same pattern as int4, but on 8-half chunks (uint2 b16 = 8 halves, int4 was 4)
-        using vec_b16 = Array<half_t, 8>;
-        vec_b16* b16 = reinterpret_cast<vec_b16*>(&result);
-        vec_b16 tmp_b16 = b16[1]; b16[1] = b16[2]; b16[2] = tmp_b16;
-        tmp_b16 = b16[5]; b16[5] = b16[6]; b16[6] = tmp_b16;
+        // NO b16 swap for uint2. int4's swap [1<->2,5<->6] on 4-half chunks swaps HALF-atoms (int4: 2 chunks =
+        // 1 mma-K-atom, 8 chunks / 4 atoms). uint2 has 1 b16-chunk (8 fp16) = 1 whole K-atom (8 chunks / 8
+        // atoms), so the same index-swap would swap WHOLE atoms 1<->2,5<->6 -> misplaces the 2nd K-atom into
+        // N's upper 8 columns (observed sigma_n(n)=n&~8). Hypothesis: uint2's 8 chunks are already 1:1 with the
+        // 8 K-atoms in natural order, so no swap. VERIFY on box via the q2-N readout (expect sigma_n(n)=n).
         return result;
     }
 
