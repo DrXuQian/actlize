@@ -559,6 +559,16 @@ public:
       // Wait until our first prefetched tile is loaded in
       cp_async_wait<DispatchPolicy::Stages-2>();
       __syncthreads();
+      // W2A16 SMEM PROBE (uint2 only): after the AIU load fills sB, read N=0/8/16/24 rows directly (shared smem,
+      // not thread-limited). With q2=(n>>3)&1 -> sB(n,0)=(n>>3)&1 -> expect 0 1 0 1. If N8/N24 read 0 -> the AIU
+      // LOAD aliased N>=8 to N<8 (load bug); if 1 -> load OK, alias is in the swzl smem->reg read. Remove after.
+      if constexpr (cute::is_same_v<RealInternalElementB, cutlass::uint2b_t>) {
+        if (cute::thread0()) {
+          int rs = smem_pipe_read;
+          printf("W2DBG smem sB(n,0): N0=%d N8=%d N16=%d N24=%d (expect 0 1 0 1)\n",
+                 int(sB(0,0,rs)), int(sB(8,0,rs)), int(sB(16,0,rs)), int(sB(24,0,rs)));
+        }
+      }
       // Prefetch the first rmem from the first k-tile
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
