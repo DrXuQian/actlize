@@ -109,6 +109,19 @@ public:
       decltype(make_shape(shape<1>(TileShape{}), Int<1>{})), TileShape_Scale>;
   using ElementA = detail::deduce_mixed_width_dtype_t<0, ElementAOptionalTuple>;
   using ElementB = detail::deduce_mixed_width_dtype_t<0, ElementBOptionalTuple>;
+  // ---- B BIT-PLANE CONCAT (Q3 = int2+int1, Q5 = int4+int1, Q6 = int4+int2) --------------------------------
+  // A SECOND, denser-or-sparser B plane, passed as the 4th member of the B tuple:
+  //     cute::tuple<ElementB, ElementScale, ElementZero, PlaneB2>
+  // so no new template parameter is needed (this collective is a partial specialization and cannot take extra
+  // defaulted params). Absent 4th member => PlaneB2 = void => HasPlane2 = false => every plane-2 code path below
+  // is `if constexpr`-guarded off and the existing single-plane instantiations are bit-identical.
+  // The two planes' ALREADY-VALIDATED offline relayouts happen to align: int2's split-at-8 and int1's split-at-16
+  // both make "pair t" == element pair (2t, 2t+1) with the two elements 16 BITS apart in their own register
+  // (int2 at bit offsets 2t/2t+16, int1 at t/t+16) -- so the combine needs no new bit derivation, only different
+  // shift strides (2t vs t) plus reg pairing int2[v] <-> int1[v>>1] half (v&1) i.e. int1 pair t + 8*(v&1).
+  using PlaneB2 = detail::deduce_mixed_width_dtype_t<3, ElementBOptionalTuple>;
+  static constexpr bool HasPlane2 = !cute::is_void_v<PlaneB2>;
+  using NonVoidPlaneB2 = cute::conditional_t<HasPlane2, PlaneB2, ElementB>;   // keeps sizeof_bits<> well-formed
   static constexpr bool IsATransformed = cute::is_tuple<ElementAOptionalTuple>::value;
   using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
@@ -279,6 +292,9 @@ public:
     StrideA dA{};
     ElementB const* ptr_B = nullptr;
     StrideB dB{};
+    // Bit-plane concat: the 2nd (high) plane. Same logical [N][K] extent, so dB is reused (strides are in
+    // ELEMENTS); only the byte footprint differs. Ignored unless HasPlane2.
+    NonVoidPlaneB2 const* ptr_B2 = nullptr;
     ElementScale const* ptr_S = nullptr;
     NonVoidStrideScale dS{};
     int group_size = 0;
@@ -295,6 +311,7 @@ public:
     InternalStrideA dA{};
     RealInternalElementB const* ptr_B = nullptr;
     InternalStrideB dB{};
+    NonVoidPlaneB2 const* ptr_B2 = nullptr;   // bit-plane concat: 2nd plane (unused unless HasPlane2)
 
     NonVoidElementScale const* ptr_S = nullptr;
     NonVoidElementZero const* ptr_Z = nullptr;
@@ -330,6 +347,11 @@ public:
       p.ptr_B = reinterpret_cast<RealInternalElementB const*>(args.ptr_A);
       p.dA = args.dB;
       p.dB = args.dA;
+    }
+    if constexpr (HasPlane2) {
+      // Bit-plane concat only makes sense for the narrow-B (non-swapped) case; the 2nd plane rides the same dB.
+      static_assert(!SwapAB, "B bit-plane concat (PlaneB2) requires the narrow operand to be B (SwapAB=false)");
+      p.ptr_B2 = args.ptr_B2;
     }
     p.group_row_offsets = args.group_row_offsets;
 
