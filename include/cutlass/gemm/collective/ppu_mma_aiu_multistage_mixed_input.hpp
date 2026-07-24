@@ -918,8 +918,20 @@ private:
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
     Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
 
-    // LAYOUT PROBE for BOTH int4 (reference, works) and int2 (broken) -> compare fragment layouts to pin the
-    // int2 N-half bug. Fires once (thread0, k_block==0). Tag = element type. Remove after diagnosis.
+    // REGISTER PROBE (uint2 only, thread0, k_block==0): dump the raw int2 the swzl delivered to tCrB_load, to
+    // see if the HIGH N-half (controlled probe tags it 2) is even present in the register. If counts show
+    // ~256 ones and 0 twos -> high-N lost at AIU/swzl (upstream of the convert). Remove after diagnosis.
+    if constexpr (cute::is_same_v<RealInternalElementB, cutlass::uint2b_t>) {
+      if (cute::thread0() && k_block == 0) {
+        auto* p = reinterpret_cast<uint8_t const*>(cute::raw_pointer_cast(tCrB_load.data()));
+        int cnt[4] = {0,0,0,0};
+        for (int b = 0; b < 64; ++b) for (int c = 0; c < 4; ++c) cnt[(p[b] >> (2*c)) & 3]++;
+        printf("W2DBG tCrB_load(thr0) int2 tag counts: v0=%d v1=%d v2=%d v3=%d (of 256)\n", cnt[0],cnt[1],cnt[2],cnt[3]);
+        printf("W2DBG tCrB_load(thr0) first 64 int2: ");
+        for (int b = 0; b < 16; ++b) { for (int c = 0; c < 4; ++c) printf("%d", (p[b] >> (2*c)) & 3); printf(" "); }
+        printf("\n");
+      }
+    }
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
     convert_tensor(cvt_in, cvt_out, CPY_VEC{});
 
