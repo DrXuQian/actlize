@@ -97,6 +97,12 @@ struct AiuDesc {
       dim_w /= 4;
       cube_w /= 4;
     }
+    else if constexpr (sizeof_bits<Element>::value == 1) {
+      // W1A16: 8 uint1/byte. Convert dim_w/cube_w from elements to BYTES by /8 (int2 is /4, int4 is /2).
+      // Without this the .b8 AIU load's TSM size is 8x too big -> "AIU_ld TSM size out of range".
+      dim_w /= 8;
+      cube_w /= 8;
+    }
 #else
     if constexpr (!Trans) {
       dim_h = MN;
