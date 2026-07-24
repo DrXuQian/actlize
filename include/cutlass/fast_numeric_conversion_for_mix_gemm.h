@@ -391,40 +391,33 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
     CUTLASS_DEVICE
     static result_type convert(source_type const& source)
     {
-        // DERIVED b16-level reshuffle (not identity). The swzl (ppu.tc01.ldmatrix.*.swzl.*.b16) is byte/b16-level
-        // and IDENTICAL for int4b_t and uint2b_t: both drive PPU0010_TSM_LD_SWZL<int8_t,...>, and the per-lane
-        // byte->fragment map in ppu_tsm_ld_swzl_sim (copy_ppu0010_aiu.hpp) depends only on CUBE_H/lane/coord, NOT
-        // on the sub-byte width (CUBE_W). So this MIRRORS the int4b_t,32 converter's reshuffle (VREG order
-        // src[1]->out[2], src[2]->out[1]; b16 swap [1]<->[2],[5]<->[6]); the ONLY change is each b16 chunk is
-        // 8 halves for uint2 (int4 had 4). The WITHIN-b16 order of the 8 uint2 per b16 is left sequential in the
-        // base-16 converter and is meant to be fixed by the OFFLINE pack; that fine ordering still needs a small
-        // box probe (b16-internal 8-value order only). Verify the whole thing on ppu001.
-        // int2's 4 swzl vregs split by N-half: src0,src2 = low N-half (n%16<8), src1,src3 = high N-half
-        // (n%16>=8). The mma B-atom's 8 fp16 are frag[0..3]=low-N, frag[4..7]=high-N (verified via the atom's
-        // BLayout coord map: v0..3=(n0,k{0,1,8,9}), v4..7=(n8,k{0,1,8,9})). The OLD int4-mirrored reorder
-        // (result_ptr[0,2,1,3]) concatenated the two low vregs then the two high vregs, so each 8-fp16 atom
-        // got the NEXT atom's low-N in its high-N slots -> every high-N read the low half (sigma_n=n&~8).
-        // FIX: interleave low/high vregs at 4-fp16 (per-atom N-half) granularity. atoms 0-3 pair vregs (0,1);
-        // atoms 4-7 pair vregs (2,3). Each atom: frag[0..3] from the low vreg, frag[4..7] from the high vreg.
-        MixGemmNumericArrayConverter<half_t, uint2b_t, 16> convert_vector_;
+        // STAGE-1 PERF (keeps the VALIDATED N-half order; offline pack still identity). The old body built a
+        // 64-half vconv[4] temp (4x base-16, each int->float->half) then did 64 scalar half copies to interleave
+        // the N-halves -> ~128 live halves = register SPILL at the 64x64 tile (int2 hit 2.3% MFU vs int4's 53.8%,
+        // and 64x64 was 7x SLOWER than 32x32 -- the tell-tale spill signature). This fused version writes result
+        // DIRECTLY (no vconv temp -> ~half the live registers) and extracts each crumb with the fp16 magic-OR
+        // (0x6400|crumb == fp16(1024+crumb)) instead of int->float->half, then ONE vectorized f16x2 subtract of
+        // 1024 over all 32 half2. Same crumb->slot map as the validated code, so correctness is unchanged:
+        //   src0,src1 = low-N (n%16<8), src2,src3 = high-N (n%16>=8)  [MEASURED via the tCrB_load probe];
+        //   atom a (g=a/4, j=a%4): frag[8a+0..3] <- crumbs 4j..4j+3 of vreg g    (low-N),
+        //                          frag[8a+4..7] <- crumbs 4j..4j+3 of vreg g+2  (high-N).
+        // (Full win = move the interleave OFFLINE like int4 so runtime is pure magic -- that's Stage 2.)
         result_type result;
-        using vec_source = Array<uint2b_t, 16>;
-        vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
-        Array<half_t,16> vconv[4] = { convert_vector_(source_ptr[0]), convert_vector_(source_ptr[1]),
-                                      convert_vector_(source_ptr[2]), convert_vector_(source_ptr[3]) };
-        // MEASURED register layout (tCrB_load probe): the swzl delivers each mode0 block as [low-N 32 | high-N 32]
-        // CONTIGUOUS, i.e. src0,src1 = low-N (n%16<8), src2,src3 = high-N (n%16>=8) -- NOT the v-parity the sim
-        // suggested. So low-N vreg = vconv[g], high-N vreg = vconv[g+2] (g=0 -> atoms 0-3 use v0/v2; g=1 ->
-        // atoms 4-7 use v1/v3). Each atom: frag[0..3] <- low-N vreg's 4-slice, frag[4..7] <- high-N vreg's.
-        half_t* r = reinterpret_cast<half_t*>(&result);
+        uint32_t const* s  = reinterpret_cast<uint32_t const*>(&source);   // 4 swzl vregs, 16 crumbs each
+        uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 32 half2 (uint32 view, consistent)
+        static constexpr uint32_t MAG = 0x64006400u;                       // half2{1024,1024}: magic base + subtrahend
         CUTLASS_PRAGMA_UNROLL
         for (int a = 0; a < 8; ++a) {
-          int g = a / 4, j = a % 4;
-          const half_t* lo = reinterpret_cast<const half_t*>(&vconv[g]);       // low-N  vreg (src0/src1)
-          const half_t* hi = reinterpret_cast<const half_t*>(&vconv[g + 2]);   // high-N vreg (src2/src3)
-          CUTLASS_PRAGMA_UNROLL
-          for (int p = 0; p < 4; ++p) { r[8*a + p] = lo[4*j + p]; r[8*a + 4 + p] = hi[4*j + p]; }
+          int g = a / 4, sh = 8 * (a % 4);           // crumbs 4j..4j+3 of a vreg start at bit 8j
+          uint32_t lo = s[g] >> sh, hi = s[g + 2] >> sh;
+          h2[4*a + 0] = (0x6400u | ( lo       & 3u)) | ((0x6400u | ((lo >> 2) & 3u)) << 16); // frag[8a+0..1] low-N
+          h2[4*a + 1] = (0x6400u | ((lo >> 4) & 3u)) | ((0x6400u | ((lo >> 6) & 3u)) << 16); // frag[8a+2..3] low-N
+          h2[4*a + 2] = (0x6400u | ( hi       & 3u)) | ((0x6400u | ((hi >> 2) & 3u)) << 16); // frag[8a+4..5] high-N
+          h2[4*a + 3] = (0x6400u | ((hi >> 4) & 3u)) | ((0x6400u | ((hi >> 6) & 3u)) << 16); // frag[8a+6..7] high-N
         }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 32; ++i)                 // one vectorized subtract: (1024+crumb) - 1024 = crumb
+          asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h2[i]) : "r"(h2[i]), "r"(MAG));
         return result;
     }
 
