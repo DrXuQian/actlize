@@ -1077,8 +1077,12 @@ private:
       uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, ii).data()));
       uint32_t*       o_p  = reinterpret_cast<uint32_t*>(raw_pointer_cast(cvt_out(_, ii).data()));
       // same N-chunk of plane 2, offset to the half of its 128 codes that THIS k_block owns
+      // STRIDE 1, not 2: the high fragment's delivered vreg index decomposes as (k_block parity) + 2*(N-half), so
+      // the two vregs a given low k_block owns are 2 APART (kb and kb+2), not adjacent. Offset by kb here; the
+      // converter then indexes hi[2*(v>>1)]. DERIVED from the two validated single-plane converters -- see the
+      // derivation block above MixGemm2Plane_uint2_uint1 in fast_numeric_conversion_for_mix_gemm.h.
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
-                           + 2 * (k_block % P2_DIV_);
+                           + (k_block % P2_DIV_);
       MixGemm2Plane_uint2_uint1::convert(lo_p, hi_p, o_p);
     }
 
