@@ -488,6 +488,58 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
     result_type operator()(source_type const& s) { return convert(s); }
 };
 
+// ================= TWO-PLANE (bit-plane concat) convert: low plane + high plane -> ONE fp16 =================
+// Produces fp16 of the COMBINED integer  q = low + 2^bl * high  (Q3: bl=2 -> q in 0..7). The collective's affine
+// then applies dl*q + zero, with the format's center folded into zero (Q3_K: zero = -4*dl).
+//
+// The concat MUST happen in the fp16 domain, not the packed domain: the low plane's codes are densely packed at
+// bl-bit spacing, so there is no bit gap to OR the high bit into (leaving one == padding, which is the route we
+// rejected because it costs 33% memory).
+//
+// Index relation is VERIFIED (scratchpad/xplane.py, bad=0/4096) end-to-end through subbyte_transpose +
+// interleave-256 + both existing relayouts:
+//     high-plane register  = low-plane register v >> 1        (int1 packs 2x the elements per uint32)
+//     high-plane pair index = low pair t + 8*(v & 1)
+// Both planes keep their ALREADY-VALIDATED offline relayouts -- no new bit derivation.
+//
+// Placement trick that keeps ONE correction per half2: the low code sits at mantissa base b = 2*(t%4) (the four
+// int2 masks 0x03/0x0c/0x30/0xc0), so the high bit is placed at mantissa b+2, i.e. it contributes exactly
+// 4 * 2^b == 2^bl * 2^b. The single per-mask fma (2^-b, -2^(10-b)) then yields (low + 4*high) directly.
+struct MixGemm2Plane_uint2_uint1
+{
+    // lo: 4 swzl vregs (64 crumbs). hi: 2 vregs (the matching 64 bits; vreg v uses hi[v>>1], half v&1).
+    // out: 32 half2 (= 64 fp16), laid out exactly like the validated single-plane uint2 converter.
+    CUTLASS_DEVICE
+    static void convert(uint32_t const* lo, uint32_t const* hi, uint32_t* h2)
+    {
+        #define _E2(dst, losrc, MASK, MUL, ADD, HISRC, HISH, HIPOS) do {                                   \
+            uint32_t _x;                                                                                   \
+            asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x)                                       \
+                         : "r"(losrc), "n"(MASK), "n"(0x64006400u), "n"(0xEAu));                           \
+            _x |= (((HISRC) >> (HISH)) & 0x00010001u) << (HIPOS);   /* high bit -> mantissa b+2 */          \
+            asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x)                                     \
+                         : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD)));                            \
+            (dst) = _x; } while (0)
+        CUTLASS_PRAGMA_UNROLL
+        for (int v = 0; v < 4; ++v) {
+          uint32_t reg = lo[v], r8 = reg >> 8;
+          uint32_t hreg = hi[v >> 1];
+          int hs   = 8 * (v & 1);                 // which half of the high register serves this low register
+          int base = 16 * (v & 1) + 2 * (v >= 2); // same N-half placement as the single-plane uint2 converter
+          //   pair t : low mask (mantissa base b=2*(t%4)), level reg/r8 for t<4 / t>=4, high bit at b+2
+          _E2(h2[base + 0 ], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u, hreg, hs + 0, 2);   // t=0 b=0
+          _E2(h2[base + 1 ], reg, 0x000c000cu, 0x34003400u, 0xdc00dc00u, hreg, hs + 1, 4);   // t=1 b=2
+          _E2(h2[base + 4 ], reg, 0x00300030u, 0x2c002c00u, 0xd400d400u, hreg, hs + 2, 6);   // t=2 b=4
+          _E2(h2[base + 5 ], reg, 0x00c000c0u, 0x24002400u, 0xcc00cc00u, hreg, hs + 3, 8);   // t=3 b=6
+          _E2(h2[base + 8 ], r8,  0x00030003u, 0x3c003c00u, 0xe400e400u, hreg, hs + 4, 2);   // t=4 b=0
+          _E2(h2[base + 9 ], r8,  0x000c000cu, 0x34003400u, 0xdc00dc00u, hreg, hs + 5, 4);   // t=5 b=2
+          _E2(h2[base + 12], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u, hreg, hs + 6, 6);   // t=6 b=4
+          _E2(h2[base + 13], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u, hreg, hs + 7, 8);   // t=7 b=6
+        }
+        #undef _E2
+    }
+};
+
 } // namespace cutlass
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
