@@ -50,6 +50,25 @@
 namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// B BIT-PLANE CONCAT plumbing: a marker that lets the builder hand the mainloop TWO B-side atoms
+// (GmemTiledCopy / SmemCopyAtom / SmemLayoutAtom) through the EXISTING single template parameters, because this
+// mainloop is a partial specialization and cannot take extra defaulted parameters.
+//
+// A dedicated wrapper is required -- do NOT use cute::is_tuple to detect "two atoms": a cute Layout (which is what
+// SmemLayoutAtomB_ is) is itself tuple-like, so is_tuple would be a false positive. BPlanes is unambiguous.
+template <class T0, class T1>
+struct BPlanes {};
+
+namespace bplane_detail {
+  template <class T> struct first        { using type = T; };
+  template <class T0, class T1> struct first<BPlanes<T0, T1>> { using type = T0; };
+  template <class T> struct second       { using type = void; };
+  template <class T0, class T1> struct second<BPlanes<T0, T1>> { using type = T1; };
+}
+template <class T> using bplane_first_t  = typename bplane_detail::first<T>::type;
+template <class T> using bplane_second_t = typename bplane_detail::second<T>::type;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
   typename Arch,
@@ -153,7 +172,9 @@ public:
   using ElementAccumulator = typename TiledMma::ValTypeC;
 
   using GmemTiledCopyA = GmemTiledCopyA_;
-  using GmemTiledCopyB = GmemTiledCopyB_;
+  // B-side atoms may arrive as BPlanes<plane0, plane1> for the bit-plane concat; plain type => plane1 is void.
+  using GmemTiledCopyB  = bplane_first_t<GmemTiledCopyB_>;
+  using GmemTiledCopyB2 = bplane_second_t<GmemTiledCopyB_>;
 
   constexpr static int Scale_TileN = shape<0>(ScaleTileShape{});
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
@@ -169,10 +190,20 @@ public:
                     Layout<Shape < _8,_1>>{}));
 
   using SmemLayoutAtomA = SmemLayoutAtomA_;
-  using SmemLayoutAtomB = SmemLayoutAtomB_;
+  using SmemLayoutAtomB  = bplane_first_t<SmemLayoutAtomB_>;
+  using SmemLayoutAtomB2 = bplane_second_t<SmemLayoutAtomB_>;
 
   using SmemCopyAtomA = SmemCopyAtomA_;
-  using SmemCopyAtomB = SmemCopyAtomB_;
+  using SmemCopyAtomB  = bplane_first_t<SmemCopyAtomB_>;
+  using SmemCopyAtomB2 = bplane_second_t<SmemCopyAtomB_>;
+  // PlaneB2 (4th B-tuple member) and the BPlanes-wrapped B atoms must be supplied TOGETHER -- a half-configured
+  // concat would silently load one plane and combine garbage, so make it a compile error.
+  static_assert(HasPlane2 == !cute::is_void_v<GmemTiledCopyB2>,
+                "B bit-plane concat: supply PlaneB2 (4th B-tuple member) AND BPlanes<> for GmemTiledCopyB");
+  static_assert(HasPlane2 == !cute::is_void_v<SmemCopyAtomB2>,
+                "B bit-plane concat: SmemCopyAtomB must also be BPlanes<plane0,plane1>");
+  static_assert(HasPlane2 == !cute::is_void_v<SmemLayoutAtomB2>,
+                "B bit-plane concat: SmemLayoutAtomB must also be BPlanes<plane0,plane1>");
   using SmemCopyAtomScale = Copy_Atom<cute::DefaultCopy, NonVoidElementScale>;
 
   // We must ensure the type to be scaled goes to RF
@@ -220,6 +251,14 @@ public:
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
+      make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+
+  // Bit-plane concat: plane 2 covers the SAME logical (N,K,Stages) extent -- only its element width (and hence the
+  // byte footprint and its own atom) differ. HasPlane2 implies !SwapAB, so use the atom directly. When there is no
+  // plane 2 we still fall back to a well-formed atom so cosize_v<> below stays valid (the storage is then 0-sized).
+  using SmemLayoutAtomB2NonVoid = cute::conditional_t<HasPlane2, SmemLayoutAtomB2, InternalSmemLayoutAtomB>;
+  using SmemLayoutB2 = decltype(tile_to_shape(
+      SmemLayoutAtomB2NonVoid{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
@@ -283,6 +322,10 @@ public:
     static constexpr int zero_elements = elements_per_smem_zero();
     cute::ArrayEngine<RealInternalElementA, cute::cosize_v<SmemLayoutA>> smem_a;
     cute::ArrayEngine<RealInternalElementB, cute::cosize_v<SmemLayoutB>> smem_b;
+    // Bit-plane concat: 2nd plane. 0 elements when absent (same trick the scale/zero storage already uses), so
+    // single-plane SharedStorage keeps its exact size and the existing smem/occupancy math is untouched.
+    static constexpr int plane2_elements = HasPlane2 ? cute::cosize_v<SmemLayoutB2> : 0;
+    cute::ArrayEngine<NonVoidPlaneB2, plane2_elements> smem_b2;
     cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
     cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
   };
