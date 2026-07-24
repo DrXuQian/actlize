@@ -1047,15 +1047,22 @@ private:
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
     Tensor cvt_hi  = recast<PlaneB2>(tCrB2_load(_, _, k_block / P2_DIV_));
 
-    // One call of the 2-plane converter consumes exactly 4 low vregs (64 low codes) + the matching 2 high vregs.
-    // Assert the fragment is exactly that, rather than silently converting only part of it.
-    static_assert(decltype(cute::size(cvt_in))::value == 64,
-      "2-plane convert currently expects a 64-code low fragment per k_block (Q3 config); generalize the loop below "
-      "before using a shape where CPY_VEC != 64");
-    uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(cvt_in.data());
-    uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(cvt_hi.data()) + 2 * (k_block % P2_DIV_);
-    uint32_t*       out_p = reinterpret_cast<uint32_t*>(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data());
-    MixGemm2Plane_uint2_uint1::convert(lo_p, hi_p, out_p);
+    // One call of the 2-plane converter consumes 4 low vregs (64 low codes) + the matching 2 high vregs, so a
+    // k_block that holds more than 64 codes is walked in ITERS chunks (the single-plane path does the same thing
+    // inside convert_tensor's NumIterations loop).
+    constexpr int LOW_PER_KB  = decltype(cute::size(cvt_in))::value;      // low codes in one plane-1 k_block
+    constexpr int ITERS       = LOW_PER_KB / 64;
+    constexpr int HI_VREG_KB  = LOW_PER_KB / 32;                          // high vregs a k_block needs (32 bits each)
+    static_assert(LOW_PER_KB % 64 == 0, "low fragment per k_block must be a multiple of 64 codes");
+    // NOTE data() on a sub-byte tensor yields a cute::subbyte_iterator, not a pointer -> raw_pointer_cast first.
+    uint32_t const* lo_p  = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in.data()));
+    uint32_t const* hi_p  = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi.data()))
+                          + HI_VREG_KB * (k_block % P2_DIV_);             // which slice of plane 2's step
+    uint32_t*       out_p = reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data()));
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < ITERS; ++i) {
+      MixGemm2Plane_uint2_uint1::convert(lo_p + 4 * i, hi_p + 2 * i, out_p + 32 * i);
+    }
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
     constexpr int KBM_    = MMA_KA_ / K_ATOM_PER_COPY;                  // K_BLOCK_MAX (copy steps)
