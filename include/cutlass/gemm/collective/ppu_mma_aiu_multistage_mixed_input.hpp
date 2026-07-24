@@ -367,6 +367,9 @@ public:
 
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
+  // Bit-plane concat: plane 2's own AIU tiled copy (carries its own desc_). GmemTiledCopyB2 is void when absent,
+  // and cute copy objects are empty types, so this costs nothing in the single-plane build.
+  cute::conditional_t<HasPlane2, GmemTiledCopyB2, cute::tuple<>> gmem_tiled_copy_B2;
   int64_t scale_residue_n = 0;
   int64_t scale_residue_k = 0;
   bool scale_valid = true;
@@ -444,8 +447,11 @@ public:
     auto mB_nk = load_init_B(mainloop_params, N, K, L, l_coord);                                                // (n,k)
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});                    // (BLK_N,BLK_K,k)
 
+    // Bit-plane concat: empty tuple unless HasPlane2, appended to every return below.
+    auto plane2 = load_init_plane2(mainloop_params, N, K, L, l_coord, blk_coord_mnkl);
+
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      return cute::make_tuple(gA, gB);
+      return cute::tuple_cat(cute::make_tuple(gA, gB), plane2);
     }
     else if constexpr (ModeHasScales) {
       auto scale_k = mainloop_params.scale_k;
@@ -457,13 +463,13 @@ public:
       scale_residue_n = N - size<0>(gB) * n_coord;
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(gA, gB, gS);
+        return cute::tuple_cat(cute::make_tuple(gA, gB, gS), plane2);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor mZ_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_Z), make_shape(N,scale_k,L));    // (n,scale_k,l)
         Tensor mZ_nk = mZ_nkl(_,_,l_coord);
         Tensor gZ = local_tile(mZ_nk, ScaleTileShape{}, make_coord(n_coord, _));
-        return cute::make_tuple(gA, gB, gS, gZ);
+        return cute::tuple_cat(cute::make_tuple(gA, gB, gS, gZ), plane2);
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
@@ -726,6 +732,54 @@ private:
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
             nullptr, N, K, mainloop_params.dB);
       return mB_nk;
+    }
+  }
+
+  // ---- bit-plane concat: plane 2's gmem tensor + AIU descriptor -------------------------------------------
+  // Exact mirror of load_init_B with ptr_B2 / PlaneB2 / gmem_tiled_copy_B2 (note the per-expert L-stride uses
+  // PlaneB2's OWN bit width, since that byte count is what the interleaved desc treats as the plane stride).
+  // Only instantiated under HasPlane2, so the void GmemTiledCopyB2 is never referenced in single-plane builds.
+  CUTLASS_DEVICE
+  auto load_init_B2(Params const& mainloop_params, int N, int K, int L, int l_coord) {
+    auto kCon = kContinous{};
+    using TilerB2 = typename GmemTiledCopyB2::Tiler_MN;
+    if constexpr (kCon != 1) {
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2),
+        make_shape(N, make_shape(kCon, K / kCon), L),
+        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N),
+                    int64_t(N) * int64_t(K) * sizeof_bits<NonVoidPlaneB2>::value / 8)
+      );
+      Tensor mB_nk = mB_nkl(_,_,l_coord);
+      auto layout_counting = make_layout(
+        mB_nk.shape(),
+        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N}))
+      );
+      Tensor mB_nk_counting = make_counting_tensor(layout_counting);
+      gmem_tiled_copy_B2.desc_.template init<NonVoidPlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
+            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N * K / kCon, kCon, mB_nk.stride());
+      return mB_nk_counting;
+    } else {
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2), make_shape(N,K,L), mainloop_params.dB);
+      Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
+      gmem_tiled_copy_B2.desc_.template init<NonVoidPlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
+            nullptr, N, K, mainloop_params.dB);
+      return mB_nk;
+    }
+  }
+
+  // A 1-tuple holding plane 2's gB2, or an EMPTY tuple when there is no plane 2, so load_init's returns can just
+  // tuple_cat it on. Appending is safe: both kernels only index get<0>/get<1> (A,B), static_assert size>=2, and
+  // forward the rest opaquely -- so the tuple's tail is free real estate.
+  template <class BlkCoord>
+  CUTLASS_DEVICE
+  auto load_init_plane2(Params const& mainloop_params, int N, int K, int L, int l_coord,
+                        BlkCoord const& blk_coord_mnkl) {
+    if constexpr (HasPlane2) {
+      auto mB2_nk = load_init_B2(mainloop_params, N, K, L, l_coord);
+      return cute::make_tuple(local_tile(mB2_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{}));
+    }
+    else {
+      return cute::make_tuple();
     }
   }
 
