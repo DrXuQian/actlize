@@ -640,6 +640,12 @@ public:
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrB_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrB_mma) / size<2>(tCrB_copy_view);
+    // ONE plane-2 k_block feeds P2_DIV plane-1 k_blocks: plane 2 is the DENSER plane (same BYTES per copy, 2x the
+    // codes at half the bit width), so its CPY_K is P2_DIV times smaller. transform_B_kblock derives the same
+    // ratio to pick which half of the plane-2 registers a given plane-1 k_block owns.
+    constexpr int P2_DIV = decltype(cute::size<2>(tCrB_copy_view))::value
+                         / decltype(cute::size<2>(tCrB2_copy_view))::value;
+    static_assert(P2_DIV >= 1, "plane 2's CPY_K must not exceed plane 1's");
 
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
@@ -649,6 +655,10 @@ public:
       // Prefetch the first rmem from the first k-tile
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
+      // Plane 2's smem->rmem swzl read. WITHOUT this the plane-2 registers stay untouched (read as zero), the
+      // converter's high-bit OR contributes nothing, and D degenerates to the low plane exactly -- which is what
+      // the controlled-input probe measured (rung1 got == exp-4 for high=ALL ONES, decoded index identically 0).
+      copy(smem_tiled_copy_B2, tCsB2(_,_,Int<0>{},smem_pipe_read), tCrB2_copy_view(_,_,Int<0>{}));
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
@@ -677,6 +687,10 @@ public:
         auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
+        // Plane 2 (see the prologue site). Re-reading the same plane-2 k_block on each of the P2_DIV plane-1
+        // k_blocks it serves is idempotent; gate it on (k_block_next % P2_DIV == 0) once this MATCHes.
+        copy(smem_tiled_copy_B2, tCsB2(_,_,Int<decltype(k_block_next)::value / P2_DIV>{},smem_pipe_read),
+             tCrB2_copy_view(_,_,Int<decltype(k_block_next)::value / P2_DIV>{}));
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
         transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
