@@ -44,7 +44,13 @@ namespace detail {
 
 template <size_t I, class Tuple>
 struct deduce_mixed_width_dtype {
-static_assert(I >= 0u && I <= 2u, "Valid indices are 0, 1, and 2, which represent Operand, Scale, and Bias, respectively.");
+// Index 3 added for the PPU B BIT-PLANE CONCAT (Q3=int2+int1, Q5=int4+int1, Q6=int4+int2): the 4th member of the
+// B element tuple carries the SECOND B plane's element type, which is how the 2-plane mainloop
+// (ppu_mma_aiu_mixed_input_2plane.hpp) gets it -- CollectiveMma's template parameter list is fixed by its primary
+// template, so an extra parameter is impossible. The body below already returns void for any out-of-range index,
+// so this only relaxes the guard; indices 0/1/2 behave exactly as before.
+static_assert(I >= 0u && I <= 3u,
+  "Valid indices are 0, 1, 2 (Operand, Scale, Bias) and 3 (second B bit plane, PPU bit-plane concat).");
 
 private:
   using underlying_tuple = cute::conditional_t<cute::is_tuple<Tuple>::value, Tuple, cute::tuple<Tuple>>;
