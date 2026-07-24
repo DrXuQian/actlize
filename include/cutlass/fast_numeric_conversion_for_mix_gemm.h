@@ -523,8 +523,20 @@ struct MixGemm2Plane_uint2_uint1
         CUTLASS_PRAGMA_UNROLL
         for (int v = 0; v < 4; ++v) {
           uint32_t reg = lo[v], r8 = reg >> 8;
+          // WHICH high vreg, and which half of it, serves low vreg v. Note (v>>1) and (v>=2) are the SAME 0/1
+          // quantity, so there are exactly TWO ways to assign the two roles (N-half selects the vreg, K-half selects
+          // the half) -- and getting them backwards misplaces exactly HALF the high bits, uniformly in k and n.
+          // That is precisely what rung8 measured: with a strong random witness, 25% of recovered high bits differ,
+          // and a wrong-source read coincides 50% of the time, so 25% observed == 50% actually mis-sourced, spread
+          // evenly across every n%16 and k%16 bucket (no candidate permutation fit, because a half/half role swap is
+          // not a permutation of k or n). HIMAP=0 is the original assignment, kept for A/B.
+#if defined(MIXGEMM_2PLANE_HIMAP) && (MIXGEMM_2PLANE_HIMAP == 0)
           uint32_t hreg = hi[v >> 1];
-          int hs   = 8 * (v & 1);                 // which half of the high register serves this low register
+          int hs   = 8 * (v & 1);
+#else
+          uint32_t hreg = hi[v & 1];
+          int hs   = 8 * (v >> 1);
+#endif
           int base = 16 * (v & 1) + 2 * (v >= 2); // same N-half placement as the single-plane uint2 converter
           //   pair t : low mask (mantissa base b=2*(t%4)), level reg/r8 for t<4 / t>=4, high bit at b+2
           _E2(h2[base + 0 ], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u, hreg, hs + 0, 2);   // t=0 b=0
