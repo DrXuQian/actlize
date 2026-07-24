@@ -648,7 +648,7 @@ public:
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
-      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
+      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
     }
 
@@ -676,7 +676,7 @@ public:
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
+        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
 
         // Copy gmem to smem before computing gemm on each k-pipe
@@ -1017,6 +1017,7 @@ private:
   // This needs tiled_copy_and_views (smem_tiled_copy_S + reg-copy dst views) + read_stage, so both are passed in.
   template <typename RealInternalElementB,
             class TCrB_load,
+            class TCrB2_load,
             class TCrB_mma,
             int K_ATOM_PER_COPY,
             class... Ts,
@@ -1024,6 +1025,7 @@ private:
   CUTLASS_DEVICE
   void transform_B_kblock(
     TCrB_load const& tCrB_load,
+    TCrB2_load const& tCrB2_load,
     TCrB_mma& tCrB_mma,
     cute::tuple<Ts...> const& partitioned_extra_info,
     int const k_block,
@@ -1031,11 +1033,27 @@ private:
     CopyViews const& tiled_copy_and_views,
     int const read_stage) {
 
-    Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
-    Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
+    constexpr int P2_DIV_ = decltype(cute::size<2>(tCrB_load))::value
+                          / decltype(cute::size<2>(tCrB2_load))::value;
+    static_assert(P2_DIV_ >= 1, "plane 2 must not have MORE K steps than plane 1 (it is the denser plane)");
 
-    using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
-    convert_tensor(cvt_in, cvt_out, CPY_VEC{});
+    // ---- TWO-PLANE convert -------------------------------------------------------------------------------
+    // Plane 2 is DENSER (more elements per uint32), so its copy view has FEWER K steps: one plane-2 step serves
+    // P2_DIV plane-1 k_blocks. (int2 low / int1 high at the same Block_K: sB_s8 is [N][64] int8 while sB2_s8 is
+    // [N][32], hence P2_DIV == 2.) Within plane 2's step, plane-1 k_block kb uses the vreg pair starting at
+    // 2*(kb % P2_DIV) -- the tensor-level twin of the verified per-register rule (hi reg = lo reg v >> 1).
+    Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
+    Tensor cvt_hi  = recast<PlaneB2>(tCrB2_load(_, _, k_block / P2_DIV_));
+
+    // One call of the 2-plane converter consumes exactly 4 low vregs (64 low codes) + the matching 2 high vregs.
+    // Assert the fragment is exactly that, rather than silently converting only part of it.
+    static_assert(decltype(cute::size(cvt_in))::value == 64,
+      "2-plane convert currently expects a 64-code low fragment per k_block (Q3 config); generalize the loop below "
+      "before using a shape where CPY_VEC != 64");
+    uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(cvt_in.data());
+    uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(cvt_hi.data()) + 2 * (k_block % P2_DIV_);
+    uint32_t*       out_p = reinterpret_cast<uint32_t*>(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data());
+    MixGemm2Plane_uint2_uint1::convert(lo_p, hi_p, out_p);
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
     constexpr int KBM_    = MMA_KA_ / K_ATOM_PER_COPY;                  // K_BLOCK_MAX (copy steps)
