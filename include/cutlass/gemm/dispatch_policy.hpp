@@ -289,6 +289,57 @@ struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedIn
   using ClusterShape = Shape<_1,_1,_1>;
 };
 
+// ---- B BIT-PLANE CONCAT (Q3 = int2+int1, Q5 = int4+int1, Q6 = int4+int2) ------------------------------------
+// A DISTINCT mainloop policy, so the two-B-plane collective (ppu_mma_aiu_mixed_input_2plane.hpp) is its OWN
+// CollectiveMma specialization instead of competing with / being if-constexpr'd into the validated single-plane
+// one. Mirrors MainloopPPUAiuMixedInput exactly -- including every per-Schedule StaticGroupSize specialization --
+// because the 2-plane mainloop reuses the same scale/zero machinery (and the GGUF concats are gs=16, i.e. the
+// FINE per-mma-atom scale path).
+template<int Stages_, class kContinous_, typename Schedule_ = KernelAiuMultistageMixedInput>
+struct MainloopPPUAiuMixedInput2Plane {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 0;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputPerCol> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = -1;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs128> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 128;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs64> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 64;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+template<int Stages_, class kContinous_>
+struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs32> {
+  constexpr static int Stages = Stages_;
+  constexpr static int StaticGroupSize = 32;
+  using kContinous = kContinous_;
+  using Schedule = KernelAiuMultistageMixedInput;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
 
 struct KernelMultistageWithScale { };
 struct KernelAiuMultistageWithScale : public KernelAiuMultistage { };
