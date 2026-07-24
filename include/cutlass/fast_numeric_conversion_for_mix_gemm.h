@@ -399,23 +399,28 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
         // 8 halves for uint2 (int4 had 4). The WITHIN-b16 order of the 8 uint2 per b16 is left sequential in the
         // base-16 converter and is meant to be fixed by the OFFLINE pack; that fine ordering still needs a small
         // box probe (b16-internal 8-value order only). Verify the whole thing on ppu001.
+        // int2's 4 swzl vregs split by N-half: src0,src2 = low N-half (n%16<8), src1,src3 = high N-half
+        // (n%16>=8). The mma B-atom's 8 fp16 are frag[0..3]=low-N, frag[4..7]=high-N (verified via the atom's
+        // BLayout coord map: v0..3=(n0,k{0,1,8,9}), v4..7=(n8,k{0,1,8,9})). The OLD int4-mirrored reorder
+        // (result_ptr[0,2,1,3]) concatenated the two low vregs then the two high vregs, so each 8-fp16 atom
+        // got the NEXT atom's low-N in its high-N slots -> every high-N read the low half (sigma_n=n&~8).
+        // FIX: interleave low/high vregs at 4-fp16 (per-atom N-half) granularity. atoms 0-3 pair vregs (0,1);
+        // atoms 4-7 pair vregs (2,3). Each atom: frag[0..3] from the low vreg, frag[4..7] from the high vreg.
         MixGemmNumericArrayConverter<half_t, uint2b_t, 16> convert_vector_;
         result_type result;
-        using vec_result = Array<half_t, 16>;                 // one vreg = 16 halves
         using vec_source = Array<uint2b_t, 16>;
-        vec_result*       result_ptr = reinterpret_cast<vec_result*>(&result);
         vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
-        // VREG reorder (swap middle two vregs) — validated via the swzl word-map (width-independent).
-        result_ptr[0] = convert_vector_(source_ptr[0]);
-        result_ptr[2] = convert_vector_(source_ptr[1]);
-        result_ptr[1] = convert_vector_(source_ptr[2]);
-        result_ptr[3] = convert_vector_(source_ptr[3]);
-        // b16 swap [1<->2,5<->6] on 8-half chunks — mirrors int4b_t,32. (Removing it did NOT change sigma_n, so
-        // it only affects K-atom order, not the N-alias; kept for K correctness.)
-        using vec_b16 = Array<half_t, 8>;
-        vec_b16* b16 = reinterpret_cast<vec_b16*>(&result);
-        vec_b16 tmp_b16 = b16[1]; b16[1] = b16[2]; b16[2] = tmp_b16;
-        tmp_b16 = b16[5]; b16[5] = b16[6]; b16[6] = tmp_b16;
+        Array<half_t,16> vconv[4] = { convert_vector_(source_ptr[0]), convert_vector_(source_ptr[1]),
+                                      convert_vector_(source_ptr[2]), convert_vector_(source_ptr[3]) };
+        half_t* r = reinterpret_cast<half_t*>(&result);
+        CUTLASS_PRAGMA_UNROLL
+        for (int a = 0; a < 8; ++a) {
+          int g = a / 4, j = a % 4;                                     // g: which vreg-pair; j: atom within pair
+          const half_t* lo = reinterpret_cast<const half_t*>(&vconv[2*g + 0]);   // low-N  vreg
+          const half_t* hi = reinterpret_cast<const half_t*>(&vconv[2*g + 1]);   // high-N vreg
+          CUTLASS_PRAGMA_UNROLL
+          for (int p = 0; p < 4; ++p) { r[8*a + p] = lo[4*j + p]; r[8*a + 4 + p] = hi[4*j + p]; }
+        }
         return result;
     }
 
