@@ -412,12 +412,16 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
         vec_source const* source_ptr = reinterpret_cast<vec_source const*>(&source);
         Array<half_t,16> vconv[4] = { convert_vector_(source_ptr[0]), convert_vector_(source_ptr[1]),
                                       convert_vector_(source_ptr[2]), convert_vector_(source_ptr[3]) };
+        // MEASURED register layout (tCrB_load probe): the swzl delivers each mode0 block as [low-N 32 | high-N 32]
+        // CONTIGUOUS, i.e. src0,src1 = low-N (n%16<8), src2,src3 = high-N (n%16>=8) -- NOT the v-parity the sim
+        // suggested. So low-N vreg = vconv[g], high-N vreg = vconv[g+2] (g=0 -> atoms 0-3 use v0/v2; g=1 ->
+        // atoms 4-7 use v1/v3). Each atom: frag[0..3] <- low-N vreg's 4-slice, frag[4..7] <- high-N vreg's.
         half_t* r = reinterpret_cast<half_t*>(&result);
         CUTLASS_PRAGMA_UNROLL
         for (int a = 0; a < 8; ++a) {
-          int g = a / 4, j = a % 4;                                     // g: which vreg-pair; j: atom within pair
-          const half_t* lo = reinterpret_cast<const half_t*>(&vconv[2*g + 0]);   // low-N  vreg
-          const half_t* hi = reinterpret_cast<const half_t*>(&vconv[2*g + 1]);   // high-N vreg
+          int g = a / 4, j = a % 4;
+          const half_t* lo = reinterpret_cast<const half_t*>(&vconv[g]);       // low-N  vreg (src0/src1)
+          const half_t* hi = reinterpret_cast<const half_t*>(&vconv[g + 2]);   // high-N vreg (src2/src3)
           CUTLASS_PRAGMA_UNROLL
           for (int p = 0; p < 4; ++p) { r[8*a + p] = lo[4*j + p]; r[8*a + 4 + p] = hi[4*j + p]; }
         }
