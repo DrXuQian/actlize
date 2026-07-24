@@ -337,13 +337,15 @@ public:
     StrideA dA{};
     ElementB const* ptr_B = nullptr;
     StrideB dB{};
-    // 2nd plane: same logical [N][K] extent, so dB is reused (strides are in ELEMENTS); only bytes differ.
-    PlaneB2 const* ptr_B2 = nullptr;
     ElementScale const* ptr_S = nullptr;
     NonVoidStrideScale dS{};
     int group_size = 0;
     ElementZero const* ptr_Z = nullptr;
     int const* group_row_offsets = nullptr;   // ragged grouped: per-expert cumulative A row start; null=uniform
+    // 2nd bit plane. Deliberately LAST so callers' positional brace-init of the fields above is unchanged; set it
+    // separately (args.mainloop.ptr_B2 = ...). Same logical [N][K] extent, so dB is reused (strides are in
+    // ELEMENTS) -- only the byte footprint differs.
+    PlaneB2 const* ptr_B2 = nullptr;
   };
 
   // Device side kernel params

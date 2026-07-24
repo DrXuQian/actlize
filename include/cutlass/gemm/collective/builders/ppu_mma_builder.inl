@@ -577,7 +577,16 @@ public:
   using kContinousA = cute::conditional_t<cute::is_same_v<GmemLayoutA_, cutlass::layout::RowMajorInterleaved<256>>, Int<256>, Int<1>>;
   using kContinousB = cute::conditional_t<cute::is_same_v<GmemLayoutB_, cutlass::layout::ColumnMajorInterleaved<256>>, Int<256>, Int<1>>;
   using kContinous = cute::conditional_t<IsATransformed, kContinousA, kContinousB>;
-  using DispatchPolicy = MainloopPPUAiuMixedInput<PipelineStages, kContinous, KernelScheduleType>;
+  // ---- B BIT-PLANE CONCAT: a 4th member in the B element tuple (tuple<ElementB,Scale,Zero,PlaneB2>) routes to
+  // the dedicated TWO-plane mainloop. Absent => void => everything below degenerates to the single-plane build
+  // BIT-IDENTICALLY (same policy, same atoms, no BPlanes wrapper).
+  // NOTE PermutionK further down uses sizeof_bits<RealInternalElementB>, i.e. the LOW plane -- which is exactly
+  // right: the low plane drives the main swzl and tCrB_mma; the high plane only feeds extra bits to the converter.
+  using PlaneB2 = detail::deduce_mixed_width_dtype_t<3, ElementPairB>;
+  static constexpr bool HasPlane2 = !cute::is_void_v<PlaneB2>;
+  using DispatchPolicy = cute::conditional_t<HasPlane2,
+      MainloopPPUAiuMixedInput2Plane<PipelineStages, kContinous, KernelScheduleType>,
+      MainloopPPUAiuMixedInput<PipelineStages, kContinous, KernelScheduleType>>;
 
   using GmemLayoutA = cutlass::layout::RowMajor;
   using GmemLayoutB = cutlass::layout::ColumnMajor;
@@ -601,10 +610,27 @@ public:
   using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
   using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
 
-  // B
-  using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom; // N, K
-  using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
-  using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
+  // B plane 0 = the LOW plane
+  using SmemLayoutAtomB0 = typename DefaultOperandB::SmemLayoutAtom; // N, K
+  using SmemCopyAtomB0 = typename DefaultOperandB::SmemCopyAtom;
+  using GmemTiledCopyB0 = typename DefaultOperandB::GmemTiledCopy;
+
+  // B plane 1 = the HIGH plane. Both planes share ONE tile (so the tile is bounded below by the SPARSEST plane's
+  // AIU 32B minimum: int1 => Block_K>=256, int2 => >=128); only the element width differs, so plane 1's AIU/swzl
+  // config comes out with the matching 2x/4x-smaller byte extent automatically. The fallback element keeps this
+  // well-formed (and unused) in single-plane builds.
+  using DefaultOperandB2 = detail::MixGemm_AIU_Operand<
+      cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>, false, Int<blockN>, Int<blockK>, true>;
+
+  // Both planes' atoms ride the EXISTING single template params (CollectiveMma's parameter list is fixed by its
+  // primary template). collective::BPlanes is the marker -- NOT cute::is_tuple, since a cute Layout is itself
+  // tuple-like and would false-positive on SmemLayoutAtomB.
+  using SmemLayoutAtomB = cute::conditional_t<HasPlane2,
+      collective::BPlanes<SmemLayoutAtomB0, typename DefaultOperandB2::SmemLayoutAtom>, SmemLayoutAtomB0>;
+  using SmemCopyAtomB = cute::conditional_t<HasPlane2,
+      collective::BPlanes<SmemCopyAtomB0, typename DefaultOperandB2::SmemCopyAtom>, SmemCopyAtomB0>;
+  using GmemTiledCopyB = cute::conditional_t<HasPlane2,
+      collective::BPlanes<GmemTiledCopyB0, typename DefaultOperandB2::GmemTiledCopy>, GmemTiledCopyB0>;
 
   // Mainloop
   using CollectiveOp = collective::CollectiveMma<
