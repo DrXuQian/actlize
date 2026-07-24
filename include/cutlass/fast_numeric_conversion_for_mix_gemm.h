@@ -391,33 +391,36 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
     CUTLASS_DEVICE
     static result_type convert(source_type const& source)
     {
-        // STAGE-1 PERF (keeps the VALIDATED N-half order; offline pack still identity). The old body built a
-        // 64-half vconv[4] temp (4x base-16, each int->float->half) then did 64 scalar half copies to interleave
-        // the N-halves -> ~128 live halves = register SPILL at the 64x64 tile (int2 hit 2.3% MFU vs int4's 53.8%,
-        // and 64x64 was 7x SLOWER than 32x32 -- the tell-tale spill signature). This fused version writes result
-        // DIRECTLY (no vconv temp -> ~half the live registers) and extracts each crumb with the fp16 magic-OR
-        // (0x6400|crumb == fp16(1024+crumb)) instead of int->float->half, then ONE vectorized f16x2 subtract of
-        // 1024 over all 32 half2. Same crumb->slot map as the validated code, so correctness is unchanged:
-        //   src0,src1 = low-N (n%16<8), src2,src3 = high-N (n%16>=8)  [MEASURED via the tCrB_load probe];
-        //   atom a (g=a/4, j=a%4): frag[8a+0..3] <- crumbs 4j..4j+3 of vreg g    (low-N),
-        //                          frag[8a+4..7] <- crumbs 4j..4j+3 of vreg g+2  (high-N).
-        // (Full win = move the interleave OFFLINE like int4 so runtime is pure magic -- that's Stage 2.)
+        // STAGE-2 PERF: pure lop3 magic (like int4's base-8), zero scalar packing. DEPENDS on the OFFLINE register
+        // relayout in add_bias_and_interleave_int2s_inplace (mirror of int4's, split at 8 -> dest d gets src crumb
+        // d<8?2d:2(d-8)+1). After that relayout the lop3 h[t]=(crumb 2t, crumb 2t+1) i.e. exactly Stage-1's
+        // adjacent pairs, so the N-half placement below is Stage-1's VALIDATED interleave verbatim.
+        //   lop3 dst = (src & MASK) | 0x64006400  [immLut 0xEA = (a&b)|c]  -> fp16 1024 + K*crumb, K = mask position
+        //   weight, undone by fma(value, 1/K, -1024/K): 0x03->K=1, 0x0c->4, 0x30->16, 0xc0->64.
+        //   src0,src1 = low-N (n%16<8), src2,src3 = high-N (n%16>=8) [MEASURED]. For vreg v the 8 pairs (c0,c1)..
+        //   (c14,c15) land at h2[base + 4*(t/2) + (t%2)], base = 16*(v&1) + 2*(v>=2). 32 lop3 + 32 fma, no temp.
         result_type result;
         uint32_t const* s  = reinterpret_cast<uint32_t const*>(&source);   // 4 swzl vregs, 16 crumbs each
-        uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 32 half2 (uint32 view, consistent)
-        static constexpr uint32_t MAG = 0x64006400u;                       // half2{1024,1024}: magic base + subtrahend
+        uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 32 half2 (uint32 view)
+        #define _E(dst, src, MASK, MUL, ADD) do {                                                         \
+            uint32_t _x;                                                                                  \
+            asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x) : "r"(src), "n"(MASK), "n"(0x64006400u), "n"(0xEAu)); \
+            asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x) : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD))); \
+            (dst) = _x; } while (0)
         CUTLASS_PRAGMA_UNROLL
-        for (int a = 0; a < 8; ++a) {
-          int g = a / 4, sh = 8 * (a % 4);           // crumbs 4j..4j+3 of a vreg start at bit 8j
-          uint32_t lo = s[g] >> sh, hi = s[g + 2] >> sh;
-          h2[4*a + 0] = (0x6400u | ( lo       & 3u)) | ((0x6400u | ((lo >> 2) & 3u)) << 16); // frag[8a+0..1] low-N
-          h2[4*a + 1] = (0x6400u | ((lo >> 4) & 3u)) | ((0x6400u | ((lo >> 6) & 3u)) << 16); // frag[8a+2..3] low-N
-          h2[4*a + 2] = (0x6400u | ( hi       & 3u)) | ((0x6400u | ((hi >> 2) & 3u)) << 16); // frag[8a+4..5] high-N
-          h2[4*a + 3] = (0x6400u | ((hi >> 4) & 3u)) | ((0x6400u | ((hi >> 6) & 3u)) << 16); // frag[8a+6..7] high-N
+        for (int v = 0; v < 4; ++v) {
+          uint32_t reg = s[v], r8 = reg >> 8;
+          int base = 16 * (v & 1) + 2 * (v >= 2);
+          _E(h2[base + 0 ], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair0 (c0,c1)   K=1  : v-1024
+          _E(h2[base + 1 ], reg, 0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair1 (c2,c3)   K=4  : v/4-256
+          _E(h2[base + 4 ], reg, 0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair2 (c4,c5)   K=16 : v/16-64
+          _E(h2[base + 5 ], reg, 0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair3 (c6,c7)   K=64 : v/64-16
+          _E(h2[base + 8 ], r8,  0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair4 (c8,c9)
+          _E(h2[base + 9 ], r8,  0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair5 (c10,c11)
+          _E(h2[base + 12], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair6 (c12,c13)
+          _E(h2[base + 13], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair7 (c14,c15)
         }
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 32; ++i)                 // one vectorized subtract: (1024+crumb) - 1024 = crumb
-          asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h2[i]) : "r"(h2[i]), "r"(MAG));
+        #undef _E
         return result;
     }
 
