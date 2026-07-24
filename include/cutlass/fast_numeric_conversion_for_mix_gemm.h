@@ -444,22 +444,43 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
     CUTLASS_DEVICE
     static result_type convert(source_type const& source)
     {
+        // STAGE-2: pure lop3 magic (mirror of int2's, scaled to 1-bit / 32-bit-register). DEPENDS on the OFFLINE
+        // split-at-16 relayout in add_bias_and_interleave_int1s (unfused_weight_dequantize.hpp): after it, lop3
+        // h[t]=(bit 2t, bit 2t+1) = the validated (magic-OR) adjacent pairs. Per vreg: 8 masks (1<<b)|(1<<(16+b))
+        // b=0..7, x2 levels (reg / reg>>8); bit lands at fp16 mantissa bit b -> value=1024+2^b*bit, undone by
+        // fma(2^-b, -2^(10-b)). N-half placement = validated Stage-1: base = 32*(v&1) + 2*(v>=2); pair t -> h2[base
+        // + {0,1,4,5,8,9,12,13}[t%8] + 16*(t>=8)].
         result_type result;
         uint32_t const* s  = reinterpret_cast<uint32_t const*>(&source);   // 4 swzl vregs, 32 bits each
         uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 64 half2 (uint32 view)
+        #define _E(dst, src, MASK, MUL, ADD) do {                                                        \
+            uint32_t _x;                                                                                 \
+            asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x) : "r"(src), "n"(MASK), "n"(0x64006400u), "n"(0xEAu)); \
+            asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x) : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD))); \
+            (dst) = _x; } while (0)
         CUTLASS_PRAGMA_UNROLL
-        for (int a = 0; a < 16; ++a) {
-          int g = a / 8, sh = 4 * (a % 8);           // bits 4j..4j+3 of a vreg start at bit 4j
-          uint32_t lo = s[g] >> sh, hi = s[g + 2] >> sh;
-          h2[4*a + 0] = (0x6400u | ( lo       & 1u)) | ((0x6400u | ((lo >> 1) & 1u)) << 16); // frag[8a+0..1] low-N
-          h2[4*a + 1] = (0x6400u | ((lo >> 2) & 1u)) | ((0x6400u | ((lo >> 3) & 1u)) << 16); // frag[8a+2..3] low-N
-          h2[4*a + 2] = (0x6400u | ( hi       & 1u)) | ((0x6400u | ((hi >> 1) & 1u)) << 16); // frag[8a+4..5] high-N
-          h2[4*a + 3] = (0x6400u | ((hi >> 2) & 1u)) | ((0x6400u | ((hi >> 3) & 1u)) << 16); // frag[8a+6..7] high-N
+        for (int v = 0; v < 4; ++v) {
+          uint32_t reg = s[v], r8 = reg >> 8;
+          int base = 32 * (v & 1) + 2 * (v >= 2);
+          //         dst              src  MASK          MUL(2^-b)     ADD(-2^(10-b))   b : mantissa bit, K=2^b
+          _E(h2[base + 0 ], reg, 0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair0
+          _E(h2[base + 1 ], reg, 0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair1
+          _E(h2[base + 4 ], reg, 0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair2
+          _E(h2[base + 5 ], reg, 0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair3
+          _E(h2[base + 8 ], reg, 0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair4
+          _E(h2[base + 9 ], reg, 0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair5
+          _E(h2[base + 12], reg, 0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair6
+          _E(h2[base + 13], reg, 0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair7
+          _E(h2[base + 16], r8,  0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair8
+          _E(h2[base + 17], r8,  0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair9
+          _E(h2[base + 20], r8,  0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair10
+          _E(h2[base + 21], r8,  0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair11
+          _E(h2[base + 24], r8,  0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair12
+          _E(h2[base + 25], r8,  0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair13
+          _E(h2[base + 28], r8,  0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair14
+          _E(h2[base + 29], r8,  0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair15
         }
-        static constexpr uint32_t MAG = 0x64006400u;  // half2{1024,1024}
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 64; ++i)
-          asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h2[i]) : "r"(h2[i]), "r"(MAG));
+        #undef _E
         return result;
     }
 
