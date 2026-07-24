@@ -496,18 +496,30 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 // bl-bit spacing, so there is no bit gap to OR the high bit into (leaving one == padding, which is the route we
 // rejected because it costs 33% memory).
 //
-// Index relation is VERIFIED (scratchpad/xplane.py, bad=0/4096) end-to-end through subbyte_transpose +
-// interleave-256 + both existing relayouts:
-//     high-plane register  = low-plane register v >> 1        (int1 packs 2x the elements per uint32)
-//     high-plane pair index = low pair t + 8*(v & 1)
-// Both planes keep their ALREADY-VALIDATED offline relayouts -- no new bit derivation.
+// Both planes keep their ALREADY-VALIDATED offline relayouts -- no new bit derivation is needed. But BEWARE the
+// trap that cost a full debug cycle here: scratchpad/xplane.py verified (bad=0/4096) the relation
+//     high-plane MEMORY vector j1 == low-plane MEMORY vector j2 >> 1 ;  pair index += 8*(j2 & 1)
+// in MEMORY-VECTOR space. The converter's `v` is the SWZL-DELIVERED register index, and swzl permutes, so j2 != v.
+// Applying the memory-space relation to v is what produced the 50%-mis-sourced bug (rung8: 25% of recovered high
+// bits wrong under a random witness == 50% mis-sourced, flat across every n%16 and k%16, no k/n permutation fitting).
+//
+// The truth for DELIVERED indices comes from aligning the two VALIDATED single-plane converters, whose output h2
+// index is their ground truth:
+//     int2:  o2(v,t) = 16*(v&1) + 2*(v>=2) + off8[t]                    , o2 in [0,32)  = ONE k_block
+//     int1:  o1(v,t) = 32*(v&1) + 2*(v>=2) + off8[t%8] + 16*(t>=8)      , o1 in [0,64)  = TWO k_blocks
+// int1's 64 h2 span exactly twice int2's mma-fragment range, so int1's 32*(v&1) IS the k_block selector. Requiring
+// both planes to land on the same h2 index within a k_block gives, for low vreg v in low k_block kb:
+//     (v_hi & 1) = kb ,  (v_hi >= 2) = (v >= 2) ,  t_hi = t + 8*(v & 1)
+//   => v_hi = kb + 2*(v >> 1)            (NOT 2*kb + (v>>1), which is half wrong in BOTH k_blocks)
+// so the collective offsets the high pointer by kb (stride 1) and this converter indexes hi[2*(v>>1)] (stride 2).
 //
 // Placement trick that keeps ONE correction per half2: the low code sits at mantissa base b = 2*(t%4) (the four
 // int2 masks 0x03/0x0c/0x30/0xc0), so the high bit is placed at mantissa b+2, i.e. it contributes exactly
 // 4 * 2^b == 2^bl * 2^b. The single per-mask fma (2^-b, -2^(10-b)) then yields (low + 4*high) directly.
 struct MixGemm2Plane_uint2_uint1
 {
-    // lo: 4 swzl vregs (64 crumbs). hi: 2 vregs (the matching 64 bits; vreg v uses hi[v>>1], half v&1).
+    // lo: 4 swzl vregs (64 crumbs). hi: base already offset by the low k_block parity; this k_block's two vregs
+    // are STRIDE 2 apart, so low vreg v uses hi[2*(v>>1)], half selected by v&1 (see the derivation above).
     // out: 32 half2 (= 64 fp16), laid out exactly like the validated single-plane uint2 converter.
     CUTLASS_DEVICE
     static void convert(uint32_t const* lo, uint32_t const* hi, uint32_t* h2)
@@ -523,20 +535,12 @@ struct MixGemm2Plane_uint2_uint1
         CUTLASS_PRAGMA_UNROLL
         for (int v = 0; v < 4; ++v) {
           uint32_t reg = lo[v], r8 = reg >> 8;
-          // WHICH high vreg, and which half of it, serves low vreg v. Note (v>>1) and (v>=2) are the SAME 0/1
-          // quantity, so there are exactly TWO ways to assign the two roles (N-half selects the vreg, K-half selects
-          // the half) -- and getting them backwards misplaces exactly HALF the high bits, uniformly in k and n.
-          // That is precisely what rung8 measured: with a strong random witness, 25% of recovered high bits differ,
-          // and a wrong-source read coincides 50% of the time, so 25% observed == 50% actually mis-sourced, spread
-          // evenly across every n%16 and k%16 bucket (no candidate permutation fit, because a half/half role swap is
-          // not a permutation of k or n). HIMAP=0 is the original assignment, kept for A/B.
-#if defined(MIXGEMM_2PLANE_HIMAP) && (MIXGEMM_2PLANE_HIMAP == 0)
-          uint32_t hreg = hi[v >> 1];
+          // WHICH high vreg serves low vreg v -- DERIVED from the two validated single-plane converters (see the
+          // header block above), not guessed. hi points at the high fragment already offset by the low k_block
+          // parity, and the two vregs this k_block owns are STRIDE 2 apart, so hi[2*(v>>1)] == absolute vreg
+          // kb + 2*(v>=2).  hs is unchanged: pair index t + 8*(v&1) is what the alignment yields.
+          uint32_t hreg = hi[2 * (v >> 1)];
           int hs   = 8 * (v & 1);
-#else
-          uint32_t hreg = hi[v & 1];
-          int hs   = 8 * (v >> 1);
-#endif
           int base = 16 * (v & 1) + 2 * (v >= 2); // same N-half placement as the single-plane uint2 converter
           //   pair t : low mask (mantissa base b=2*(t%4)), level reg/r8 for t<4 / t>=4, high bit at b+2
           _E2(h2[base + 0 ], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u, hreg, hs + 0, 2);   // t=0 b=0
