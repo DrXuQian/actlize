@@ -428,6 +428,45 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
     result_type operator()(source_type const& s) { return convert(s); }
 };
 
+// ============================ W1A16 : uint1b_t -> fp16 ============================
+// Q1 base plane (high plane of Q3/Q5). bit in {0,1} UNSIGNED (affine 'zero' absorbs offset). CORRECTNESS-FIRST
+// magic-OR (0x6400|bit == fp16(1024+bit), one vectorized f16x2 sub of 1024) -- NO lop3 yet; optimize after the
+// N-half map is validated on ppu001. CPY_VEC = 4*32/1 = 128. N-half by ANALOGY to the (validated) uint2b_t wide
+// converter, scaled 2x (int1 packs 32 values/vreg vs int2's 16): src0,src1 = low-N, src2,src3 = high-N; 16 atoms,
+// atom a (g=a/8, j=a%8): frag[8a+0..3] <- bits 4j..4j+3 of vreg g (low-N), frag[8a+4..7] <- vreg g+2 (high-N).
+// MUST verify with test_w1a16_diag; if the permutation differs, re-derive with the controlled-input probe.
+template <>
+struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
+{
+    using result_type = Array<half_t, 128>;
+    using source_type = Array<uint1b_t, 128>;
+
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        result_type result;
+        uint32_t const* s  = reinterpret_cast<uint32_t const*>(&source);   // 4 swzl vregs, 32 bits each
+        uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 64 half2 (uint32 view)
+        CUTLASS_PRAGMA_UNROLL
+        for (int a = 0; a < 16; ++a) {
+          int g = a / 8, sh = 4 * (a % 8);           // bits 4j..4j+3 of a vreg start at bit 4j
+          uint32_t lo = s[g] >> sh, hi = s[g + 2] >> sh;
+          h2[4*a + 0] = (0x6400u | ( lo       & 1u)) | ((0x6400u | ((lo >> 1) & 1u)) << 16); // frag[8a+0..1] low-N
+          h2[4*a + 1] = (0x6400u | ((lo >> 2) & 1u)) | ((0x6400u | ((lo >> 3) & 1u)) << 16); // frag[8a+2..3] low-N
+          h2[4*a + 2] = (0x6400u | ( hi       & 1u)) | ((0x6400u | ((hi >> 1) & 1u)) << 16); // frag[8a+4..5] high-N
+          h2[4*a + 3] = (0x6400u | ((hi >> 2) & 1u)) | ((0x6400u | ((hi >> 3) & 1u)) << 16); // frag[8a+6..7] high-N
+        }
+        static constexpr uint32_t MAG = 0x64006400u;  // half2{1024,1024}
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 64; ++i)
+          asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h2[i]) : "r"(h2[i]), "r"(MAG));
+        return result;
+    }
+
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s) { return convert(s); }
+};
+
 } // namespace cutlass
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

@@ -160,6 +160,40 @@ template <
   using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
 };
 
+// W1A16 base plane: uint1b_t swzl operand. Mirrors uint2b_t; 8 int1/byte (int2 has 4/byte) -> the int8-typed
+// swzl element count is AiuContElemSize/8. Block_K*1/8 must be %32==0 -> Block_K % 256 == 0.
+template <
+  typename Block_MN,
+  typename Block_K,
+  bool Swap
+> struct MixGemm_AIU_Operand<
+  cutlass::uint1b_t,
+  false,
+  Block_MN,
+  Block_K,
+  Swap
+> {
+  static constexpr int BlockContSize = Block_K{} * sizeof_bits<cutlass::uint1b_t>::value / 8;   // Block_K/8 bytes
+  static_assert(BlockContSize % 32 == 0, "aiu w1: block_k*1/8 must be multiple of 32B (block_k % 256 == 0)");
+  static_assert(BlockContSize > 128 ? (BlockContSize % 128 == 0) : (BlockContSize % 32 == 0), "aiu w1: 128B or 32B");
+  static constexpr int AiuContByteSize = BlockContSize > 128 ? 128 : BlockContSize;
+  using AiuContElemSize = Int<AiuContByteSize / sizeof_bits<cutlass::uint1b_t>::value * 8>;      // AiuContByteSize*8
+  static constexpr int InstNum = Block_K{} / AiuContElemSize{};
+
+  static constexpr int bits_per_aiu = Block_MN{} * AiuContByteSize * 8;
+  using CopyInst = PPU0010_AIU_LOAD<cute::C<bits_per_aiu>, cutlass::uint1b_t, false>;            // load as i8
+
+  using GmemTiledCopy = decltype(
+    make_tiled_copy(Copy_Atom<CopyInst, cutlass::uint1b_t>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Block_MN, AiuContElemSize>>{}));
+
+  using SmemCopyOp = PPU0010_TSM_LD_SWZL<int8_t, Block_MN{}, AiuContElemSize{} / 8, Swap, false, InstNum>;  // 8 int1/byte
+  using SmemCopyAtom = Copy_Atom<SmemCopyOp, int8_t>;
+  using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
+};
+
 #endif
 
 template <typename Arch,
@@ -521,8 +555,8 @@ public:
 
   // currently only support a16w8 / a16w4 mix gemm
   // static_assert(IsATransformed, "currently only A is supported for quantization.");
-  static_assert(sizeof_bits<RealInternalElementA>::value == 16 && (sizeof_bits<RealInternalElementB>::value == 8 || sizeof_bits<RealInternalElementB>::value == 4 || sizeof_bits<RealInternalElementB>::value == 2),
-    "currently only support a16w8 / a16w4 / a16w2 mix gemm");
+  static_assert(sizeof_bits<RealInternalElementA>::value == 16 && (sizeof_bits<RealInternalElementB>::value == 8 || sizeof_bits<RealInternalElementB>::value == 4 || sizeof_bits<RealInternalElementB>::value == 2 || sizeof_bits<RealInternalElementB>::value == 1),
+    "currently only support a16w8 / a16w4 / a16w2 / a16w1 mix gemm");
   // For fp32 types, map to tf32 MMA value type
   // using MmaElementA = ElementA; //cute::conditional_t<cute::is_same_v<ElementA, float>, tfloat32_t, ElementA>;
   // using MmaElementB = ElementB; //cute::conditional_t<cute::is_same_v<ElementB, float>, tfloat32_t, ElementB>;
