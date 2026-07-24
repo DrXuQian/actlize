@@ -50,25 +50,6 @@
 namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// B BIT-PLANE CONCAT plumbing: a marker that lets the builder hand the mainloop TWO B-side atoms
-// (GmemTiledCopy / SmemCopyAtom / SmemLayoutAtom) through the EXISTING single template parameters, because this
-// mainloop is a partial specialization and cannot take extra defaulted parameters.
-//
-// A dedicated wrapper is required -- do NOT use cute::is_tuple to detect "two atoms": a cute Layout (which is what
-// SmemLayoutAtomB_ is) is itself tuple-like, so is_tuple would be a false positive. BPlanes is unambiguous.
-template <class T0, class T1>
-struct BPlanes {};
-
-namespace bplane_detail {
-  template <class T> struct first        { using type = T; };
-  template <class T0, class T1> struct first<BPlanes<T0, T1>> { using type = T0; };
-  template <class T> struct second       { using type = void; };
-  template <class T0, class T1> struct second<BPlanes<T0, T1>> { using type = T1; };
-}
-template <class T> using bplane_first_t  = typename bplane_detail::first<T>::type;
-template <class T> using bplane_second_t = typename bplane_detail::second<T>::type;
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
   typename Arch,
@@ -128,19 +109,6 @@ public:
       decltype(make_shape(shape<1>(TileShape{}), Int<1>{})), TileShape_Scale>;
   using ElementA = detail::deduce_mixed_width_dtype_t<0, ElementAOptionalTuple>;
   using ElementB = detail::deduce_mixed_width_dtype_t<0, ElementBOptionalTuple>;
-  // ---- B BIT-PLANE CONCAT (Q3 = int2+int1, Q5 = int4+int1, Q6 = int4+int2) --------------------------------
-  // A SECOND, denser-or-sparser B plane, passed as the 4th member of the B tuple:
-  //     cute::tuple<ElementB, ElementScale, ElementZero, PlaneB2>
-  // so no new template parameter is needed (this collective is a partial specialization and cannot take extra
-  // defaulted params). Absent 4th member => PlaneB2 = void => HasPlane2 = false => every plane-2 code path below
-  // is `if constexpr`-guarded off and the existing single-plane instantiations are bit-identical.
-  // The two planes' ALREADY-VALIDATED offline relayouts happen to align: int2's split-at-8 and int1's split-at-16
-  // both make "pair t" == element pair (2t, 2t+1) with the two elements 16 BITS apart in their own register
-  // (int2 at bit offsets 2t/2t+16, int1 at t/t+16) -- so the combine needs no new bit derivation, only different
-  // shift strides (2t vs t) plus reg pairing int2[v] <-> int1[v>>1] half (v&1) i.e. int1 pair t + 8*(v&1).
-  using PlaneB2 = detail::deduce_mixed_width_dtype_t<3, ElementBOptionalTuple>;
-  static constexpr bool HasPlane2 = !cute::is_void_v<PlaneB2>;
-  using NonVoidPlaneB2 = cute::conditional_t<HasPlane2, PlaneB2, ElementB>;   // keeps sizeof_bits<> well-formed
   static constexpr bool IsATransformed = cute::is_tuple<ElementAOptionalTuple>::value;
   using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
@@ -172,9 +140,7 @@ public:
   using ElementAccumulator = typename TiledMma::ValTypeC;
 
   using GmemTiledCopyA = GmemTiledCopyA_;
-  // B-side atoms may arrive as BPlanes<plane0, plane1> for the bit-plane concat; plain type => plane1 is void.
-  using GmemTiledCopyB  = bplane_first_t<GmemTiledCopyB_>;
-  using GmemTiledCopyB2 = bplane_second_t<GmemTiledCopyB_>;
+  using GmemTiledCopyB = GmemTiledCopyB_;
 
   constexpr static int Scale_TileN = shape<0>(ScaleTileShape{});
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
@@ -190,20 +156,10 @@ public:
                     Layout<Shape < _8,_1>>{}));
 
   using SmemLayoutAtomA = SmemLayoutAtomA_;
-  using SmemLayoutAtomB  = bplane_first_t<SmemLayoutAtomB_>;
-  using SmemLayoutAtomB2 = bplane_second_t<SmemLayoutAtomB_>;
+  using SmemLayoutAtomB = SmemLayoutAtomB_;
 
   using SmemCopyAtomA = SmemCopyAtomA_;
-  using SmemCopyAtomB  = bplane_first_t<SmemCopyAtomB_>;
-  using SmemCopyAtomB2 = bplane_second_t<SmemCopyAtomB_>;
-  // PlaneB2 (4th B-tuple member) and the BPlanes-wrapped B atoms must be supplied TOGETHER -- a half-configured
-  // concat would silently load one plane and combine garbage, so make it a compile error.
-  static_assert(HasPlane2 == !cute::is_void_v<GmemTiledCopyB2>,
-                "B bit-plane concat: supply PlaneB2 (4th B-tuple member) AND BPlanes<> for GmemTiledCopyB");
-  static_assert(HasPlane2 == !cute::is_void_v<SmemCopyAtomB2>,
-                "B bit-plane concat: SmemCopyAtomB must also be BPlanes<plane0,plane1>");
-  static_assert(HasPlane2 == !cute::is_void_v<SmemLayoutAtomB2>,
-                "B bit-plane concat: SmemLayoutAtomB must also be BPlanes<plane0,plane1>");
+  using SmemCopyAtomB = SmemCopyAtomB_;
   using SmemCopyAtomScale = Copy_Atom<cute::DefaultCopy, NonVoidElementScale>;
 
   // We must ensure the type to be scaled goes to RF
@@ -251,14 +207,6 @@ public:
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
-      make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
-
-  // Bit-plane concat: plane 2 covers the SAME logical (N,K,Stages) extent -- only its element width (and hence the
-  // byte footprint and its own atom) differ. HasPlane2 implies !SwapAB, so use the atom directly. When there is no
-  // plane 2 we still fall back to a well-formed atom so cosize_v<> below stays valid (the storage is then 0-sized).
-  using SmemLayoutAtomB2NonVoid = cute::conditional_t<HasPlane2, SmemLayoutAtomB2, InternalSmemLayoutAtomB>;
-  using SmemLayoutB2 = decltype(tile_to_shape(
-      SmemLayoutAtomB2NonVoid{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
@@ -322,10 +270,6 @@ public:
     static constexpr int zero_elements = elements_per_smem_zero();
     cute::ArrayEngine<RealInternalElementA, cute::cosize_v<SmemLayoutA>> smem_a;
     cute::ArrayEngine<RealInternalElementB, cute::cosize_v<SmemLayoutB>> smem_b;
-    // Bit-plane concat: 2nd plane. 0 elements when absent (same trick the scale/zero storage already uses), so
-    // single-plane SharedStorage keeps its exact size and the existing smem/occupancy math is untouched.
-    static constexpr int plane2_elements = HasPlane2 ? cute::cosize_v<SmemLayoutB2> : 0;
-    cute::ArrayEngine<NonVoidPlaneB2, plane2_elements> smem_b2;
     cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
     cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
   };
@@ -335,9 +279,6 @@ public:
     StrideA dA{};
     ElementB const* ptr_B = nullptr;
     StrideB dB{};
-    // Bit-plane concat: the 2nd (high) plane. Same logical [N][K] extent, so dB is reused (strides are in
-    // ELEMENTS); only the byte footprint differs. Ignored unless HasPlane2.
-    NonVoidPlaneB2 const* ptr_B2 = nullptr;
     ElementScale const* ptr_S = nullptr;
     NonVoidStrideScale dS{};
     int group_size = 0;
@@ -354,7 +295,6 @@ public:
     InternalStrideA dA{};
     RealInternalElementB const* ptr_B = nullptr;
     InternalStrideB dB{};
-    NonVoidPlaneB2 const* ptr_B2 = nullptr;   // bit-plane concat: 2nd plane (unused unless HasPlane2)
 
     NonVoidElementScale const* ptr_S = nullptr;
     NonVoidElementZero const* ptr_Z = nullptr;
@@ -367,9 +307,6 @@ public:
 
   GmemTiledCopyA gmem_tiled_copy_A;
   GmemTiledCopyB gmem_tiled_copy_B;
-  // Bit-plane concat: plane 2's own AIU tiled copy (carries its own desc_). GmemTiledCopyB2 is void when absent,
-  // and cute copy objects are empty types, so this costs nothing in the single-plane build.
-  cute::conditional_t<HasPlane2, GmemTiledCopyB2, cute::tuple<>> gmem_tiled_copy_B2;
   int64_t scale_residue_n = 0;
   int64_t scale_residue_k = 0;
   bool scale_valid = true;
@@ -393,11 +330,6 @@ public:
       p.ptr_B = reinterpret_cast<RealInternalElementB const*>(args.ptr_A);
       p.dA = args.dB;
       p.dB = args.dA;
-    }
-    if constexpr (HasPlane2) {
-      // Bit-plane concat only makes sense for the narrow-B (non-swapped) case; the 2nd plane rides the same dB.
-      static_assert(!SwapAB, "B bit-plane concat (PlaneB2) requires the narrow operand to be B (SwapAB=false)");
-      p.ptr_B2 = args.ptr_B2;
     }
     p.group_row_offsets = args.group_row_offsets;
 
@@ -447,11 +379,8 @@ public:
     auto mB_nk = load_init_B(mainloop_params, N, K, L, l_coord);                                                // (n,k)
     Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});                    // (BLK_N,BLK_K,k)
 
-    // Bit-plane concat: empty tuple unless HasPlane2, appended to every return below.
-    auto plane2 = load_init_plane2(mainloop_params, N, K, L, l_coord, blk_coord_mnkl);
-
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      return cute::tuple_cat(cute::make_tuple(gA, gB), plane2);
+      return cute::make_tuple(gA, gB);
     }
     else if constexpr (ModeHasScales) {
       auto scale_k = mainloop_params.scale_k;
@@ -463,13 +392,13 @@ public:
       scale_residue_n = N - size<0>(gB) * n_coord;
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::tuple_cat(cute::make_tuple(gA, gB, gS), plane2);
+        return cute::make_tuple(gA, gB, gS);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor mZ_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_Z), make_shape(N,scale_k,L));    // (n,scale_k,l)
         Tensor mZ_nk = mZ_nkl(_,_,l_coord);
         Tensor gZ = local_tile(mZ_nk, ScaleTileShape{}, make_coord(n_coord, _));
-        return cute::tuple_cat(cute::make_tuple(gA, gB, gS, gZ), plane2);
+        return cute::make_tuple(gA, gB, gS, gZ);
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
@@ -732,54 +661,6 @@ private:
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
             nullptr, N, K, mainloop_params.dB);
       return mB_nk;
-    }
-  }
-
-  // ---- bit-plane concat: plane 2's gmem tensor + AIU descriptor -------------------------------------------
-  // Exact mirror of load_init_B with ptr_B2 / PlaneB2 / gmem_tiled_copy_B2 (note the per-expert L-stride uses
-  // PlaneB2's OWN bit width, since that byte count is what the interleaved desc treats as the plane stride).
-  // Only instantiated under HasPlane2, so the void GmemTiledCopyB2 is never referenced in single-plane builds.
-  CUTLASS_DEVICE
-  auto load_init_B2(Params const& mainloop_params, int N, int K, int L, int l_coord) {
-    auto kCon = kContinous{};
-    using TilerB2 = typename GmemTiledCopyB2::Tiler_MN;
-    if constexpr (kCon != 1) {
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2),
-        make_shape(N, make_shape(kCon, K / kCon), L),
-        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N),
-                    int64_t(N) * int64_t(K) * sizeof_bits<NonVoidPlaneB2>::value / 8)
-      );
-      Tensor mB_nk = mB_nkl(_,_,l_coord);
-      auto layout_counting = make_layout(
-        mB_nk.shape(),
-        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N}))
-      );
-      Tensor mB_nk_counting = make_counting_tensor(layout_counting);
-      gmem_tiled_copy_B2.desc_.template init<NonVoidPlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
-            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N * K / kCon, kCon, mB_nk.stride());
-      return mB_nk_counting;
-    } else {
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2), make_shape(N,K,L), mainloop_params.dB);
-      Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
-      gmem_tiled_copy_B2.desc_.template init<NonVoidPlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
-            nullptr, N, K, mainloop_params.dB);
-      return mB_nk;
-    }
-  }
-
-  // A 1-tuple holding plane 2's gB2, or an EMPTY tuple when there is no plane 2, so load_init's returns can just
-  // tuple_cat it on. Appending is safe: both kernels only index get<0>/get<1> (A,B), static_assert size>=2, and
-  // forward the rest opaquely -- so the tuple's tail is free real estate.
-  template <class BlkCoord>
-  CUTLASS_DEVICE
-  auto load_init_plane2(Params const& mainloop_params, int N, int K, int L, int l_coord,
-                        BlkCoord const& blk_coord_mnkl) {
-    if constexpr (HasPlane2) {
-      auto mB2_nk = load_init_B2(mainloop_params, N, K, L, l_coord);
-      return cute::make_tuple(local_tile(mB2_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{}));
-    }
-    else {
-      return cute::make_tuple();
     }
   }
 
