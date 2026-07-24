@@ -436,13 +436,6 @@ public:
     int warp_idx = canonical_warp_idx_sync();
     int aiu_warp_group_thread_idx = warp_idx * 32;
 
-    // W2DBG ENTRY probe (unconditional): fires the moment ANY dtype enters THIS mixed-input collective. If int4
-    // never prints this, int4 W4A16 uses a DIFFERENT collective than int2 -- the divergence we're chasing.
-    if (cute::thread0()) {
-      printf("W2DBG-ENTRY mixed_input collective: elemB_bits=%d SwapAB=%d IsATransformed=%d\n",
-             int(cute::sizeof_bits<RealInternalElementB>::value), int(SwapAB), int(IsATransformed));
-    }
-
     Tensor gA = get<0>(load_inputs);
     Tensor gB = get<1>(load_inputs);
     auto k_iter_shape = cute::shape<2>(gB);
@@ -566,17 +559,6 @@ public:
       // Wait until our first prefetched tile is loaded in
       cp_async_wait<DispatchPolicy::Stages-2>();
       __syncthreads();
-      // W2A16 SMEM PROBE (uint2 only): after the AIU load fills sB, read N=0/8/16/24 rows directly (shared smem,
-      // not thread-limited). With q2=(n>>3)&1 -> sB(n,0)=(n>>3)&1 -> expect 0 1 0 1. If N8/N24 read 0 -> the AIU
-      // LOAD aliased N>=8 to N<8 (load bug); if 1 -> load OK, alias is in the swzl smem->reg read. Remove after.
-      if constexpr (cute::is_same_v<RealInternalElementB, cutlass::uint2b_t>) {
-        if (cute::thread0()) {
-          int rs = smem_pipe_read;
-          uint8_t const* sp = reinterpret_cast<uint8_t const*>(cute::raw_pointer_cast(sB.data()));
-          auto v = [&](int n){ int o = sB.layout()(n, 0, rs); return int((sp[o/4] >> ((o%4)*2)) & 0x3); };  // uint2 @ (n,0,rs)
-          printf("W2DBG smem sB(n,0): N0=%d N8=%d N16=%d N24=%d (expect 0 1 0 1)\n", v(0), v(8), v(16), v(24));
-        }
-      }
       // Prefetch the first rmem from the first k-tile
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
@@ -938,18 +920,6 @@ private:
 
     // LAYOUT PROBE for BOTH int4 (reference, works) and int2 (broken) -> compare fragment layouts to pin the
     // int2 N-half bug. Fires once (thread0, k_block==0). Tag = element type. Remove after diagnosis.
-    // UNCONDITIONAL probe (fires for every dtype) to settle why int4 didn't hit this transform: prints the
-    // element width the B side actually sees + SwapAB/IsATransformed. If int4 shows elemB_bits=16 (=half) it is
-    // SwapAB'd (narrow int4 on the A side, dequant via TransformA) -> a DIFFERENT path than int2's B-side one.
-    if (cute::thread0() && k_block == 0) {
-      printf("W2DBG elemB_bits=%d SwapAB=%d IsATransformed=%d K_ATOM_PER_COPY=%d\n",
-             int(cute::sizeof_bits<RealInternalElementB>::value), int(SwapAB), int(IsATransformed), int(K_ATOM_PER_COPY));
-      printf("W2DBG tCrB_load.layout= "); cute::print(tCrB_load.layout()); printf("\n");
-      printf("W2DBG cvt_in.layout   = "); cute::print(cvt_in.layout());    printf("\n");
-      printf("W2DBG tCrB_mma.layout = "); cute::print(tCrB_mma.layout());  printf("\n");
-      printf("W2DBG cvt_out.target  = "); cute::print(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).layout()); printf("\n");
-    }
-
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
     convert_tensor(cvt_in, cvt_out, CPY_VEC{});
 
