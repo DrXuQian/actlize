@@ -1047,21 +1047,25 @@ private:
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
     Tensor cvt_hi  = recast<PlaneB2>(tCrB2_load(_, _, k_block / P2_DIV_));
 
-    // One call of the 2-plane converter consumes 4 low vregs (64 low codes) + the matching 2 high vregs, so a
-    // k_block that holds more than 64 codes is walked in ITERS chunks (the single-plane path does the same thing
-    // inside convert_tensor's NumIterations loop).
-    constexpr int LOW_PER_KB  = decltype(cute::size(cvt_in))::value;      // low codes in one plane-1 k_block
-    constexpr int ITERS       = LOW_PER_KB / 64;
-    constexpr int HI_VREG_KB  = LOW_PER_KB / 32;                          // high vregs a k_block needs (32 bits each)
-    static_assert(LOW_PER_KB % 64 == 0, "low fragment per k_block must be a multiple of 64 codes");
-    // NOTE data() on a sub-byte tensor yields a cute::subbyte_iterator, not a pointer -> raw_pointer_cast first.
-    uint32_t const* lo_p  = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in.data()));
-    uint32_t const* hi_p  = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi.data()))
-                          + HI_VREG_KB * (k_block % P2_DIV_);             // which slice of plane 2's step
-    uint32_t*       out_p = reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data()));
+    // Write through the TENSOR, exactly like the single-plane convert_tensor does (`out(_, ii)`), NOT through a
+    // linear pointer: tCrB_mma's fragment layout is not contiguous with the stride a linear walk would assume, so
+    // a linear write scatters the fp16 into the wrong register slots (symptom: |D| 30-100x too large with random
+    // signs, which cannot come from wrong BITS since q = low + 4*high is bounded by 7).
+    // Mode-0 of cvt_in is one CPY_VEC chunk (64 low codes = 4 vregs); mode-1 is the chunk count.
+    Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
+    constexpr int NumIter = decltype(cute::size<1>(cvt_in))::value;
+    static_assert(decltype(cute::size<0>(cvt_in))::value == 64,
+      "2-plane convert expects a 64-code low chunk (CPY_VEC for uint2); generalize before changing that width");
+    static_assert(decltype(cute::size<0>(cvt_hi))::value == 128,
+      "expected plane 2's chunk to hold 128 codes (2x the low chunk) -- it is the denser plane");
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < ITERS; ++i) {
-      MixGemm2Plane_uint2_uint1::convert(lo_p + 4 * i, hi_p + 2 * i, out_p + 32 * i);
+    for (int ii = 0; ii < NumIter; ++ii) {
+      uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, ii).data()));
+      uint32_t*       o_p  = reinterpret_cast<uint32_t*>(raw_pointer_cast(cvt_out(_, ii).data()));
+      // same N-chunk of plane 2, offset to the half of its 128 codes that THIS k_block owns
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
+                           + 2 * (k_block % P2_DIV_);
+      MixGemm2Plane_uint2_uint1::convert(lo_p, hi_p, o_p);
     }
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
