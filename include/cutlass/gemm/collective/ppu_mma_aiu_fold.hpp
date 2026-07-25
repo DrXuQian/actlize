@@ -579,11 +579,11 @@ public:
         make_tensor(sB(_,_,0).data(), SmemLayoutB_MmaView{}));                 // (MMA,MMA_N,MMA_K) ordinary N x K
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
-    // N-FOLD (Plan A): B's fragment spans the FOLDED run, so its MMA_K is FoldF x A's and its MMA_N is 1/FoldF of the
-    // accumulator's -- the two unfolded equalities are replaced by the folded relations. The mainloop then gemms fold
-    // group f (B K-atoms f*A_MMA_K + k) into accum's N-atoms [f*B_MMA_N, (f+1)*B_MMA_N).
-    CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) * Int<FoldF>{} == size<2>(accum));  // MMA_N (folded)
-    CUTE_STATIC_ASSERT_V(size<2>(tCrA) * Int<FoldF>{} == size<2>(tCrB_mma));   // MMA_K (folded)
+    // N-FOLD: tCrB_mma now comes from the LOGICAL (N,K) view, so it has ORDINARY semantics (MMA_N=2, MMA_K=4 matching
+    // A) and the UNFOLDED equalities hold -- the fold is invisible past the ldmatrix, by design. (These two asserts
+    // were left over from the abandoned Plan A, where B's fragment was folded; that mismatch is what failed here.)
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) == size<2>(accum));                // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB_mma));                 // MMA_K
 
     //
     // Copy Atom retiling
