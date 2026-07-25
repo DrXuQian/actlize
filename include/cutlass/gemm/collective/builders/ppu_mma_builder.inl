@@ -621,6 +621,12 @@ public:
   // leaving Block_MN=blockN makes the swzl atom address a 2x-too-large tile per stage -> "TSM out of range" at
   // runtime (observed: tsm.ld.swzl stepping 0x800 through a 0x400-per-stage buffer).
   static constexpr int BFoldBlockN = blockN / (HasFold ? FoldF : 1);
+  // DIAGNOSTIC (define MOEG_FOLD_DEBUG to have the compiler print the resolved fold parameters):
+#if defined(MOEG_FOLD_DEBUG)
+  template <int...> struct fold_dbg;
+  static_assert(!HasFold || sizeof(fold_dbg<blockM, blockN, blockK, FoldF, BFoldBlockN, BFoldBlockK>) == 0,
+                "FOLD PARAMS: fold_dbg<blockM, blockN, blockK, FoldF, BFoldBlockN, BFoldBlockK>");
+#endif
   using DefaultOperandA = detail::MixGemm_AIU_Operand<RealInternalElementA, false, Int<blockM>, Int<blockK>, true>;
   using DefaultOperandB = detail::MixGemm_AIU_Operand<RealInternalElementB, false, Int<BFoldBlockN>, Int<BFoldBlockK>, true>;
 #elif 0 // async_cp not work now
