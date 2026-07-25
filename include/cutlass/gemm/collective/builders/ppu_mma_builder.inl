@@ -616,8 +616,13 @@ public:
   // FoldF*blockK (=> AiuContElemSize = FoldF*blockK, reusing a validated config, e.g. int2 blockK=64 FoldF=2 => 128
   // == int2@TK128). A stays blockK. The collective's fold-in-N SmemLayoutB then presents this as (FoldF*Ng, blockK).
   static constexpr int BFoldBlockK = (HasFold ? FoldF : 1) * blockK;
+  // ...and the PHYSICAL row count halves/quarters correspondingly: folding FoldF N-columns into one contiguous run
+  // means the B tile physically has blockN/FoldF rows of FoldF*blockK each (same total bytes). Folding only K while
+  // leaving Block_MN=blockN makes the swzl atom address a 2x-too-large tile per stage -> "TSM out of range" at
+  // runtime (observed: tsm.ld.swzl stepping 0x800 through a 0x400-per-stage buffer).
+  static constexpr int BFoldBlockN = blockN / (HasFold ? FoldF : 1);
   using DefaultOperandA = detail::MixGemm_AIU_Operand<RealInternalElementA, false, Int<blockM>, Int<blockK>, true>;
-  using DefaultOperandB = detail::MixGemm_AIU_Operand<RealInternalElementB, false, Int<blockN>, Int<BFoldBlockK>, true>;
+  using DefaultOperandB = detail::MixGemm_AIU_Operand<RealInternalElementB, false, Int<BFoldBlockN>, Int<BFoldBlockK>, true>;
 #elif 0 // async_cp not work now
   static_assert(false, "async_cp not work now");
   using DispatchPolicy = MainloopPPUAiuMixedInput<PipelineStages, kContinous, KernelScheduleType>;
@@ -643,7 +648,7 @@ public:
   // instantiated (it feeds the unused BPlanes fallback), so with a fold the plain blockK would give a sub-32B
   // contiguous run and trip MixGemm_AIU_Operand's `BlockContSize % 32 == 0` static_assert.
   using DefaultOperandB2 = detail::MixGemm_AIU_Operand<
-      cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>, false, Int<blockN>, Int<BFoldBlockK>, true>;
+      cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>, false, Int<BFoldBlockN>, Int<BFoldBlockK>, true>;
 
   // Both planes' atoms ride the EXISTING single template params (CollectiveMma's parameter list is fixed by its
   // primary template). collective::BPlanes is the marker -- NOT cute::is_tuple, since a cute Layout is itself
