@@ -66,6 +66,9 @@
 // TWO-B-PLANE variant (bit-plane concat: Q3=int2+int1, Q5=int4+int1, Q6=int4+int2). Separate collective selected
 // by MainloopPPUAiuMixedInput2Plane; also provides BPlanes<> which the builder uses to hand it both planes' atoms.
 #include "cutlass/gemm/collective/ppu_mma_aiu_mixed_input_2plane.hpp"
+// N-FOLD variant (frees TileShape.K from the AIU 32B-contiguous-K floor -> A-smem shrinks, occupancy -> int4's
+// level). Selected by MainloopPPUAiuFold via the KernelAiuFold<FoldF,Base> schedule; inert unless used.
+#include "cutlass/gemm/collective/ppu_mma_aiu_fold.hpp"
 #include "cutlass/gemm/collective/ppu_mma_aiu_multistage_batch_array.hpp"
 #include "cutlass/gemm/collective/ppu_mma_aiu_multistage_batch_array_overlap_prologue.hpp"
 #include "cutlass/gemm/collective/ppu_mma_cpasync_multistage.hpp"
