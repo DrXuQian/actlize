@@ -564,8 +564,11 @@ public:
     // mismatches both the accumulator's N and A's MMA_K (the two asserts below). The logical view re-labels the same
     // bytes: (n'=(f,g), k) -> phys (g, f*TKe + k)  [verified in scratchpad/cute_nfold3/5.cu, where partition_B on this
     // view puts the fold factor in MMA_N with MMA_K = TKe/16].
-    Tensor sB_logical = make_tensor(sB(_,_,0).data(), SmemLayoutB_Logical{});
-    Tensor tCrB_mma = thr_mma.partition_fragment_B(sB_logical);                // (MMA,MMA_N=TNe/atom,MMA_K=TKe/16)
+    // N-FOLD: partition B from the PHYSICAL sB. The fragment must span the FOLDED run (FoldF*TKe), which requires
+    // the B-side K-permutation to be FoldF*TKe -- see the builder's MmaPermK (kept at the UNFOLDED 32B-run value for
+    // exactly this reason). With PermutationK = TileShape.K the fragment only covered the run's first half, so the
+    // folded upper half never entered it (B.MMA_K measured 4 instead of 8) -- the real reason f looked unconsumed.
+    Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                 // (MMA,MMA_N,MMA_K=FoldF*TKe/16)
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) == size<2>(accum));                // MMA_N
