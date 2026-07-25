@@ -260,9 +260,17 @@ public:
   // AiuContElemSize=FoldF*TKe atom -> the collective fails to instantiate (surfacing as bogus StrideB / "no matching
   // make_cute_packed_stride" cascades at the launch site). Constructing all three modes explicitly keeps the
   // interleave: phys offset of (n'=(f,g), k, s) = s*TNe*TKe + g*FoldF*TKe + f*TKe + k  (mapping bad=0/12288 locally).
-  using SmemLayoutB = decltype(make_layout(
-      make_shape (make_shape(Int<FoldF>{}, Int<Ng>{}), Int<TKe>{}, Int<DispatchPolicy::Stages>{}),
-      make_stride(make_stride(Int<TKe>{}, Int<FoldF * TKe>{}), _1{}, Int<TNe * TKe>{})));
+  // PHYSICAL shape (Ng, FoldF*TKe, PIPE) -- this is what the AIU writes and the swzl atom reads, and it is what the
+  // gB/sB consistency asserts compare. The fold-in-N LOGICAL view (TNe output-N x TKe real-K) is recovered where the
+  // MMA consumes it (see the fold_logical_B() helper), NOT here: keeping smem physical avoids a mismatch between the
+  // gmem tiler, the AIU descriptor and the swzl read (that mismatch is what produced "TSM out of range").
+  using SmemLayoutB = decltype(tile_to_shape(
+      InternalSmemLayoutAtomB{},
+      make_shape(Int<Ng>{}, Int<FoldF * TKe>{}, Int<DispatchPolicy::Stages>{})));
+  // The fold-in-N logical view of one stage: (n'=(f,g), k) -> phys (g, f*TKe + k). Verified in cute_nfold5.cu.
+  using SmemLayoutB_Logical = decltype(make_layout(
+      make_shape (make_shape(Int<FoldF>{}, Int<Ng>{}), Int<TKe>{}),
+      make_stride(make_stride(Int<TKe>{}, Int<FoldF * TKe>{}), _1{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
   using SmemLayoutScale = decltype(tile_to_shape(
@@ -432,7 +440,12 @@ public:
 
     // B init (include init aiu desc)
     auto mB_nk = load_init_B(mainloop_params, N, K, L, l_coord);                                                // (n,k)
-    Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});                    // (BLK_N,BLK_K,k)
+    // N-FOLD: B's PHYSICAL tile is (TileN/FoldF) x (FoldF*TileK) -- the same bytes as TileShape's (TileN, TileK) but
+    // reshaped, because FoldF adjacent N-columns share one contiguous FoldF*TileK run. The gmem tile must be cut with
+    // that folded tiler, otherwise the AIU descriptor is built for (TileN, TileK) while the swzl atom reads
+    // (TileN/FoldF, FoldF*TileK) -> address stride mismatch -> "TSM out of range" at runtime.
+    using FoldTilerB = Shape<Int<size<0>(TileShape{})>, Int<TNe / FoldF>, Int<FoldF * TKe>>;   // (M unused, N_phys, K_phys)
+    Tensor gB = local_tile(mB_nk, FoldTilerB{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});                   // (BLK_N_phys,BLK_K_phys,k)
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple(gA, gB);
@@ -508,10 +521,9 @@ public:
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
     CUTE_STATIC_ASSERT_V(size<0>(gB) == size<0>(sB));                          // BLK_N
     CUTE_STATIC_ASSERT_V(size<1>(gB) == size<1>(sB));                          // BLK_K
-    // N-FOLD (fold-in-N): B's K-mode IS TK (same as A) -- the fold factor lives in B's N-mode, not K. So the
-    // ORIGINAL lockstep-K assert HOLDS unchanged (TK == TK). (The N-side, size<0>(sB) = FoldF*Ng = output N, and the
-    // gB/partition N-consistency, are the box items to finalize.)
-    CUTE_STATIC_ASSERT_V(size<1>(sA) == size<1>(sB));                          // BLK_K
+    // N-FOLD: sB is PHYSICAL (Ng, FoldF*TKe), so its K-extent is FoldF x A's TK, and its N-extent is TNe/FoldF.
+    // Both relations are checked here (gB is cut with the same folded tiler above, so gB/sB agree by construction).
+    CUTE_STATIC_ASSERT_V(size<1>(sA) * Int<FoldF>{} == size<1>(sB));           // BLK_K (folded, physical)
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));        // PIPE
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));        // PIPE
 
