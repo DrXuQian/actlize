@@ -708,13 +708,25 @@ public:
           for (int f = 0; f < FoldF; ++f) {
             auto b_atom = f * MMA_K_A + atom_idx;                                   // B atom in fold group f
             cute::transform(tCrB_mma(_,_,b_atom), TransformB{});
-            // accum's N-slice for fold group f (B_N_ATOM == 1, asserted below, so one N-atom per group)
-            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,b_atom), accum(_,_,f));
+            // accum's N-atoms for fold group f: [f*B_N_ATOM, (f+1)*B_N_ATOM). Loop so B_N_ATOM > 1 also works.
+            CUTLASS_PRAGMA_UNROLL
+            for (int bn = 0; bn < B_N_ATOM; ++bn) {
+              cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,bn,b_atom), accum(_,_,f * B_N_ATOM + bn));
+            }
           }
         }
-        static_assert(B_N_ATOM == 1,
-            "fold Plan A currently assumes one B N-atom per fold group (accum N-slice = a single coord); generalize the "
-            "accum slicing if TileShape.N/FoldF exceeds one MMA N-atom");
+        // Report the REAL fragment dims once (compile-time) instead of asserting a guessed shape: enable
+        // -DMOEG_FOLD_DIMS to get accum.MMA_N / A.MMA_K / B.MMA_N / B.MMA_K printed by the compiler.
+#if defined(MOEG_FOLD_DIMS)
+        { template <int...> struct fold_dims;   // never defined -> the error text carries the numbers
+          static_assert(sizeof(fold_dims<decltype(cute::size<2>(accum))::value, MMA_K_A, B_N_ATOM,
+                                        decltype(cute::size<2>(tCrB_mma))::value, FoldF>) == 0,
+                        "FOLD DIMS: fold_dims<accum_MMA_N, A_MMA_K, B_MMA_N, B_MMA_K, FoldF>"); }
+#endif
+        static_assert(decltype(cute::size<2>(accum))::value == FoldF * B_N_ATOM,
+            "fold Plan A: accumulator N-atoms must equal FoldF * B N-atoms (one fold group per accum N-slice group)");
+        static_assert(decltype(cute::size<2>(tCrB_mma))::value == FoldF * MMA_K_A,
+            "fold Plan A: B K-atoms must equal FoldF * A K-atoms (each fold group spans A's K range)");
       });
 
     }
