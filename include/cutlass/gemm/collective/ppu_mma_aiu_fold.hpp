@@ -571,8 +571,11 @@ public:
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                 // (MMA,MMA_N,MMA_K=FoldF*TKe/16)
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
-    CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) == size<2>(accum));                // MMA_N
-    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB_mma));                 // MMA_K
+    // N-FOLD (Plan A): B's fragment spans the FOLDED run, so its MMA_K is FoldF x A's and its MMA_N is 1/FoldF of the
+    // accumulator's -- the two unfolded equalities are replaced by the folded relations. The mainloop then gemms fold
+    // group f (B K-atoms f*A_MMA_K + k) into accum's N-atoms [f*B_MMA_N, (f+1)*B_MMA_N).
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) * Int<FoldF>{} == size<2>(accum));  // MMA_N (folded)
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) * Int<FoldF>{} == size<2>(tCrB_mma));   // MMA_K (folded)
 
     //
     // Copy Atom retiling
@@ -726,10 +729,7 @@ public:
                                         decltype(cute::size<2>(tCrB_mma))::value, FoldF>) == 0,
                         "FOLD DIMS: fold_dims<accum_MMA_N, A_MMA_K, B_MMA_N, B_MMA_K, FoldF>"); }
 #endif
-        static_assert(decltype(cute::size<2>(accum))::value == FoldF * B_N_ATOM,
-            "fold Plan A: accumulator N-atoms must equal FoldF * B N-atoms (one fold group per accum N-slice group)");
-        static_assert(decltype(cute::size<2>(tCrB_mma))::value == FoldF * MMA_K_A,
-            "fold Plan A: B K-atoms must equal FoldF * A K-atoms (each fold group spans A's K range)");
+        // (the folded MMA_N / MMA_K relations are asserted once above, right after the fragments are built)
       });
 
     }
