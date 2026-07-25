@@ -601,11 +601,23 @@ public:
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
 
     auto sB_s8 = recast<int8_t>(sB);
-    Tensor tCrB_load =thr_mma_s8.partition_fragment_B(sB_s8(_,_,0));
+    // N-FOLD: partition the LOAD fragment through the fold-in-N logical view too. Using the PHYSICAL sB_s8 here (N=Ng)
+    // while tCrB_mma comes from the logical view (N=FoldF*Ng) means the converter feeds Ng columns' worth of data into
+    // FoldF*Ng slots, so each folded pair ends up with the SAME source -- exactly what the labelled-input probe
+    // measured (odd n read the even-n value, i.e. n_used = n & ~1). Recast the logical view to int8 so both the swzl
+    // read and the mma fragment agree on N.
+    auto sB_logical_s8 = recast<int8_t>(make_tensor(sB(_,_,0).data(), SmemLayoutB_Logical{}));
+    Tensor tCrB_load = thr_mma_s8.partition_fragment_B(sB_logical_s8);
 
     auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma_s8);
     auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(aiu_warp_group_thread_idx);
-    Tensor tCsB            = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB_s8));             // (CPY,CPY_N,CPY_K,PIPE)
+    // N-FOLD: the swzl read source must be the SAME logical view as tCrB_load (see above), including the PIPE mode, so
+    // build the logical view over all stages: ((FoldF,Ng), TKe, PIPE) with the stage stride of the physical layout.
+    using SmemLayoutB_LogicalPipe = decltype(make_layout(
+        make_shape (make_shape(Int<FoldF>{}, Int<Ng>{}), Int<TKe>{}, Int<DispatchPolicy::Stages>{}),
+        make_stride(make_stride(Int<TKe>{}, Int<FoldF * TKe>{}), _1{}, Int<Ng * FoldF * TKe>{})));
+    auto sB_logical_pipe_s8 = recast<int8_t>(make_tensor(sB.data(), SmemLayoutB_LogicalPipe{}));
+    Tensor tCsB            = smem_thr_copy_B.partition_S(make_mix_tensor_like(sB_logical_pipe_s8)); // (CPY,CPY_N,CPY_K,PIPE)
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB_load);                                  // (CPY,CPY_N,CPY_K)
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // CPY_N
     CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(tCrB_copy_view));            // CPY_K
