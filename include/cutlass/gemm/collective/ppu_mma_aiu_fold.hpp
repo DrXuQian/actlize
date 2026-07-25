@@ -559,7 +559,13 @@ public:
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor tCrA     = thr_mma.partition_fragment_A(sA(_,_,0));                // (MMA,MMA_M,MMA_K)
-    Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
+    // N-FOLD: the MMA must see B through the fold-in-N LOGICAL view -- (TNe output-N, TKe real-K) -- not the physical
+    // (Ng, FoldF*TKe) smem shape. Partitioning the physical shape would give MMA_N=Ng and MMA_K=FoldF*TKe/16, which
+    // mismatches both the accumulator's N and A's MMA_K (the two asserts below). The logical view re-labels the same
+    // bytes: (n'=(f,g), k) -> phys (g, f*TKe + k)  [verified in scratchpad/cute_nfold3/5.cu, where partition_B on this
+    // view puts the fold factor in MMA_N with MMA_K = TKe/16].
+    Tensor sB_logical = make_tensor(sB(_,_,0).data(), SmemLayoutB_Logical{});
+    Tensor tCrB_mma = thr_mma.partition_fragment_B(sB_logical);                // (MMA,MMA_N=TNe/atom,MMA_K=TKe/16)
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) == size<2>(accum));                // MMA_N
