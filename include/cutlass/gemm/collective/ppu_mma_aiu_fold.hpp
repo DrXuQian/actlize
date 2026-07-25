@@ -223,7 +223,13 @@ public:
 
   static_assert(rank(InternalSmemLayoutAtomB{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
   static_assert((size<1>(TileShape{}) % size<0>(InternalSmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
-  static_assert((size<2>(TileShape{}) % size<1>(InternalSmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+  // N-FOLD: B's atom K is the FOLDED run (FoldF * TileShape.K), so the original
+  //   size<2>(TileShape) % size<1>(atomB) == 0  (i.e. 64 % 128) no longer holds by construction.
+  // The folded relation is what must divide: atom K == FoldF * TileShape.K.
+  static_assert((size<1>(InternalSmemLayoutAtomB{}) % size<2>(TileShape{})) == 0,
+                "fold: B atom K must be a multiple of TileShape.K");
+  static_assert(size<1>(InternalSmemLayoutAtomB{}) == FoldF * size<2>(TileShape{}),
+                "fold: B atom K must equal FoldF * TileShape.K (operand Block_K must be the folded one)");
 
   static_assert(rank(SmemLayoutAtomScale{}) == 2, "SmemLayoutAtomScale must be rank 2");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must equal the tile shape.");
