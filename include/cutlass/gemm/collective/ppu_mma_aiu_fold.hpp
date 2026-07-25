@@ -564,11 +564,19 @@ public:
     // mismatches both the accumulator's N and A's MMA_K (the two asserts below). The logical view re-labels the same
     // bytes: (n'=(f,g), k) -> phys (g, f*TKe + k)  [verified in scratchpad/cute_nfold3/5.cu, where partition_B on this
     // view puts the fold factor in MMA_N with MMA_K = TKe/16].
-    // N-FOLD: partition B from the PHYSICAL sB. The fragment must span the FOLDED run (FoldF*TKe), which requires
-    // the B-side K-permutation to be FoldF*TKe -- see the builder's MmaPermK (kept at the UNFOLDED 32B-run value for
-    // exactly this reason). With PermutationK = TileShape.K the fragment only covered the run's first half, so the
-    // folded upper half never entered it (B.MMA_K measured 4 instead of 8) -- the real reason f looked unconsumed.
-    Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                 // (MMA,MMA_N,MMA_K=FoldF*TKe/16)
+    // N-FOLD, division of views (this is the crux):
+    //   * the swzl READ (tCrB_load / tCsB below) uses the PHYSICAL (Ng, FoldF*TKe) shape -- its atom IS physical, and
+    //     handing it a logical view re-triggers "TSM out of range" (tried, reverted);
+    //   * the MMA fragment uses a LOGICAL (TileShape.N, TileShape.K) VIEW of the same bytes, which is the only shape
+    //     that yields ordinary N x K semantics (verified: partition on logical gives MMA_N=2/MMA_K=4 matching A, while
+    //     the physical shape gives MMA_N=1/MMA_K=8 = still-folded semantics).
+    // tCrB_mma is only a register destination (the converter writes into it), so using a logical view here does NOT
+    // touch smem addressing and cannot overflow the TSM window.
+    using SmemLayoutB_MmaView = decltype(make_layout(
+        make_shape (Int<TNe>{}, Int<TKe>{}),
+        make_stride(Int<TKe>{}, _1{})));       // logical (N,K) over the folded bytes; P must match L (see notes)
+    Tensor tCrB_mma = thr_mma.partition_fragment_B(
+        make_tensor(sB(_,_,0).data(), SmemLayoutB_MmaView{}));                 // (MMA,MMA_N,MMA_K) ordinary N x K
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
     // N-FOLD (Plan A): B's fragment spans the FOLDED run, so its MMA_K is FoldF x A's and its MMA_N is 1/FoldF of the
