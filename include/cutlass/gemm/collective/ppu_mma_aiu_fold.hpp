@@ -244,11 +244,17 @@ public:
   // form (and its compatibility with the operand's swzl SmemCopyAtom, whose AiuContElemSize=FoldF*TK is reused from
   // the validated int2@TK128 / int1@TK256 config) on the box.
   static constexpr int TKe = shape<2>(TileShape{});          // real TK (A / MMA K-depth)
-  static constexpr int Ng  = shape<1>(TileShape{}) / FoldF;  // physical N-groups
-  using SmemLayoutB = decltype(tile_to_shape(
-      make_layout(make_shape(make_shape(Int<FoldF>{}, Int<Ng>{}), Int<TKe>{}),
-                  make_stride(make_stride(Int<TKe>{}, Int<FoldF * TKe>{}), _1{})),
-      make_shape(shape<1>(TileShape{}), Int<TKe>{}, Int<DispatchPolicy::Stages>{})));
+  static constexpr int TNe = shape<1>(TileShape{});          // output N per tile
+  static constexpr int Ng  = TNe / FoldF;                    // physical N-groups
+  // BUILD IT DIRECTLY -- do NOT use tile_to_shape here. Verified locally (scratchpad/cute_nfold4/5.cu):
+  // tile_to_shape COALESCES the fold interleave away (atom size == tile size, so ((2,32),64):((64,128),1) collapses
+  // to (64,64):(64,1) = plain row-major), which silently destroys the fold and then mismatches the operand's
+  // AiuContElemSize=FoldF*TKe atom -> the collective fails to instantiate (surfacing as bogus StrideB / "no matching
+  // make_cute_packed_stride" cascades at the launch site). Constructing all three modes explicitly keeps the
+  // interleave: phys offset of (n'=(f,g), k, s) = s*TNe*TKe + g*FoldF*TKe + f*TKe + k  (mapping bad=0/12288 locally).
+  using SmemLayoutB = decltype(make_layout(
+      make_shape (make_shape(Int<FoldF>{}, Int<Ng>{}), Int<TKe>{}, Int<DispatchPolicy::Stages>{}),
+      make_stride(make_stride(Int<TKe>{}, Int<FoldF * TKe>{}), _1{}, Int<TNe * TKe>{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
   using SmemLayoutScale = decltype(tile_to_shape(
