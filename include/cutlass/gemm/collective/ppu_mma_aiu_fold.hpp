@@ -696,40 +696,16 @@ public:
           smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
         }
 
-        CUTLASS_PRAGMA_UNROLL
-        // N-FOLD (PLAN A): B's fragment holds FoldF x A's K-atoms (measured: MMA_K_B = 8 = 2 * MMA_K_A = 2*4), because
-        // each folded 32B run carries FoldF N-columns of TKe each. The MMA will NOT pick the upper atoms up as a
-        // second N by itself (probe-verified: any offline placement alone yields n_used = n&~1 or n//2, i.e. f never
-        // consumed), so consume them EXPLICITLY: atom group f (B atoms f*MMA_K_A + k) is gemm'd against the SAME A
-        // atoms k, into the f-th N-slice of the accumulator. Shapes check out exactly (cute_planA.cu):
-        //   accum.MMA_N == FoldF * B.MMA_N,  B.MMA_K == FoldF * A.MMA_K
-        // No extra A traffic (A is read once, reused FoldF times) and the same total mma count as unfolded.
-        constexpr int MMA_K_A  = decltype(cute::size<2>(tCrA))::value;              // A's K-atoms per tile
-        constexpr int B_N_ATOM = decltype(cute::size<1>(tCrB_mma))::value;          // B's N-atoms (physical, = Ng/16)
+        // N-FOLD: IDENTICAL to the unfolded mainloop. The fold lives only in the load layer -- gmem/smem are
+        // (N/FoldF) x (FoldF*K) to satisfy the AIU 32B contiguous minimum, and the swzl ldmatrix already delivers the
+        // fragment with ordinary N x K register semantics (same as int4). So no fold-specific compute code at all.
         CUTLASS_PRAGMA_UNROLL
         for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;                       // A-side atom index
+          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
           cute::transform(tCrA(_,_,atom_idx), TransformA{});
-          CUTLASS_PRAGMA_UNROLL
-          for (int f = 0; f < FoldF; ++f) {
-            auto b_atom = f * MMA_K_A + atom_idx;                                   // B atom in fold group f
-            cute::transform(tCrB_mma(_,_,b_atom), TransformB{});
-            // accum's N-atoms for fold group f: [f*B_N_ATOM, (f+1)*B_N_ATOM). Loop so B_N_ATOM > 1 also works.
-            CUTLASS_PRAGMA_UNROLL
-            for (int bn = 0; bn < B_N_ATOM; ++bn) {
-              cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,bn,b_atom), accum(_,_,f * B_N_ATOM + bn));
-            }
-          }
+          cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
+          cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
         }
-        // Report the REAL fragment dims once (compile-time) instead of asserting a guessed shape: enable
-        // -DMOEG_FOLD_DIMS to get accum.MMA_N / A.MMA_K / B.MMA_N / B.MMA_K printed by the compiler.
-#if defined(MOEG_FOLD_DIMS)
-        { template <int...> struct fold_dims;   // never defined -> the error text carries the numbers
-          static_assert(sizeof(fold_dims<decltype(cute::size<2>(accum))::value, MMA_K_A, B_N_ATOM,
-                                        decltype(cute::size<2>(tCrB_mma))::value, FoldF>) == 0,
-                        "FOLD DIMS: fold_dims<accum_MMA_N, A_MMA_K, B_MMA_N, B_MMA_K, FoldF>"); }
-#endif
-        // (the folded MMA_N / MMA_K relations are asserted once above, right after the fragments are built)
       });
 
     }
