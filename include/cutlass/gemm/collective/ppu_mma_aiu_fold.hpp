@@ -691,14 +691,30 @@ public:
         }
 
         CUTLASS_PRAGMA_UNROLL
+        // N-FOLD (PLAN A): B's fragment holds FoldF x A's K-atoms (measured: MMA_K_B = 8 = 2 * MMA_K_A = 2*4), because
+        // each folded 32B run carries FoldF N-columns of TKe each. The MMA will NOT pick the upper atoms up as a
+        // second N by itself (probe-verified: any offline placement alone yields n_used = n&~1 or n//2, i.e. f never
+        // consumed), so consume them EXPLICITLY: atom group f (B atoms f*MMA_K_A + k) is gemm'd against the SAME A
+        // atoms k, into the f-th N-slice of the accumulator. Shapes check out exactly (cute_planA.cu):
+        //   accum.MMA_N == FoldF * B.MMA_N,  B.MMA_K == FoldF * A.MMA_K
+        // No extra A traffic (A is read once, reused FoldF times) and the same total mma count as unfolded.
+        constexpr int MMA_K_A  = decltype(cute::size<2>(tCrA))::value;              // A's K-atoms per tile
+        constexpr int B_N_ATOM = decltype(cute::size<1>(tCrB_mma))::value;          // B's N-atoms (physical, = Ng/16)
+        CUTLASS_PRAGMA_UNROLL
         for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-          // Transform before compute
+          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;                       // A-side atom index
           cute::transform(tCrA(_,_,atom_idx), TransformA{});
-          cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
-          // gemm for one tiled_mma atom on K
-          cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
+          CUTLASS_PRAGMA_UNROLL
+          for (int f = 0; f < FoldF; ++f) {
+            auto b_atom = f * MMA_K_A + atom_idx;                                   // B atom in fold group f
+            cute::transform(tCrB_mma(_,_,b_atom), TransformB{});
+            // accum's N-slice for fold group f (B_N_ATOM == 1, asserted below, so one N-atom per group)
+            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,b_atom), accum(_,_,f));
+          }
         }
+        static_assert(B_N_ATOM == 1,
+            "fold Plan A currently assumes one B N-atom per fold group (accum N-slice = a single coord); generalize the "
+            "accum slicing if TileShape.N/FoldF exceeds one MMA N-atom");
       });
 
     }
