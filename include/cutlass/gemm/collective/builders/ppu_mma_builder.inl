@@ -562,9 +562,15 @@ public:
   // using MmaElementA = ElementA; //cute::conditional_t<cute::is_same_v<ElementA, float>, tfloat32_t, ElementA>;
   // using MmaElementB = ElementB; //cute::conditional_t<cute::is_same_v<ElementB, float>, tfloat32_t, ElementB>;
 
+  // PermutionK = the K span one B swzl copy step delivers = 32B worth of the packed element (int4 64 / int2 128 /
+  // int1 256). Under an N-FOLD that 32B run is FoldF N-cols x blockK each, so the K span the MMA sees is only
+  // blockK -- using the unfolded value would exceed TileShape.K and index past the tile.
+  static constexpr int MmaPermK = (fold_schedule_traits<KernelScheduleType>::FoldF > 0)
+      ? cute::get<2>(TileShape_MNK{})
+      : (32 * 8 / sizeof_bits<RealInternalElementB>::value);
   using TiledMma = typename detail::get_tiled_mma<
         Arch, ElementMma, ElementMma, ElementAccumulator, TileShape_MNK, ClusterShape_MNK,
-        Int<32 * 8 / sizeof_bits<RealInternalElementB>::value>>::TiledMma;
+        Int<MmaPermK>>::TiledMma;
 
   static constexpr int PipelineStages = ppu_detail::compute_stage_count_or_override<ppu_detail::ppu10000_smem_capacity_bytes,
       ElementMma, ElementMma, TileShape_MNK>(StageCountType{});
@@ -633,8 +639,11 @@ public:
   // AIU 32B minimum: int1 => Block_K>=256, int2 => >=128); only the element width differs, so plane 1's AIU/swzl
   // config comes out with the matching 2x/4x-smaller byte extent automatically. The fallback element keeps this
   // well-formed (and unused) in single-plane builds.
+  // NOTE Block_K here must ALSO be the folded one (BFoldBlockK): even in single-plane builds this type gets
+  // instantiated (it feeds the unused BPlanes fallback), so with a fold the plain blockK would give a sub-32B
+  // contiguous run and trip MixGemm_AIU_Operand's `BlockContSize % 32 == 0` static_assert.
   using DefaultOperandB2 = detail::MixGemm_AIU_Operand<
-      cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>, false, Int<blockN>, Int<blockK>, true>;
+      cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>, false, Int<blockN>, Int<BFoldBlockK>, true>;
 
   // Both planes' atoms ride the EXISTING single template params (CollectiveMma's parameter list is fixed by its
   // primary template). collective::BPlanes is the marker -- NOT cute::is_tuple, since a cute Layout is itself
