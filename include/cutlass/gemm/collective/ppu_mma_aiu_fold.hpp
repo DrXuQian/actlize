@@ -3,20 +3,22 @@
 // PURPOSE: free a sparse B plane's TileShape.K from the AIU 32B-contiguous-K floor, so A-smem (=TileM*TK*2) shrinks
 // and occupancy rises to int4's level (int1: 12%->~50%). The offline data is folded by nfold_column_pairs_ppu (P1.1);
 // this collective consumes it.
-// DONE (structural, correct-by-inspection, isolated -- zero regression to the validated single-plane collective):
+// KEY REALIZATION (scratchpad/cute_nfold3.cu, verified): the fold is a FOLD-IN-N smem layout, NOT fold-in-K. Present
+// the physical folded run (FoldF cols x TK each) as a LOGICAL (FoldF*Ng output-N, TK) tile via strides -> partition_B
+// puts the FoldF factor in MMA_N and MMA_K = TK/16. So the MMA accumulates over the REAL TK and emits FoldF*Ng output
+// columns NATURALLY. This DISSOLVES the 2-pass mainloop and the interleaved epilogue I first thought were needed --
+// mainloop, C accumulator, and epilogue are all STANDARD.
+// DONE (structural, isolated -- zero regression; fold header not #included anywhere yet):
 //   * matches MainloopPPUAiuFold<Stages,kContinous,FoldF,Schedule>;
-//   * SmemLayoutB K-extent = FoldF * TileShape.K (A stays TileShape.K)  <-- the defining change;
-//   * relaxed the lockstep-K assert to size<1>(sA)*FoldF == size<1>(sB).
-// TODO (box-iterated; cannot compile/test locally -- PPU device asm):
-//   * MAINLOOP: B fragment now has FoldF x A's K-atoms. Per cute_nfold2.cu the atoms split cleanly into FoldF blocks
-//     (lower atoms = N-col 2g, upper = 2g+1, ...). Run FoldF gemm passes reusing ONE A (atoms 0..A_K-1):
-//       for f in [0,FoldF): gemm(A(_,_,k), B(_,_, f*A_K + k)) for k -> accum[f]   // FoldF separate C accumulators
-//   * EPILOGUE: FoldF accumulators -> FoldF*N output columns (interleaved n_out = FoldF*g + f). The one genuinely
-//     open design point (spans kernel+epilogue); options: strided ptr-array write per accumulator, or a folded
-//     output layout un-permuted by the consumer.
-//   * BUILDER: a fold path selecting MainloopPPUAiuFold + B operand with Block_K = FoldF*blockK.
-// GATE: not gated on the int4-ceiling measurement -- int2/int1-fold reaching int4's geometry is guaranteed (same
-// A-smem, less B pressure); the ceiling only sizes the win. Biggest beneficiary is int1 (4x occupancy).
+//   * SmemLayoutB = FOLD-IN-N layout ((FoldF,Ng),TK):((TK,FoldF*TK),1)  <-- the defining change;
+//   * lockstep-K assert UNCHANGED (fold-in-N keeps B's K-mode == TK == A's).
+// TODO (box-iterated; PPU device asm, cannot compile locally):
+//   * finalize the general FoldF/Ng SmemLayoutB form + verify the operand's swzl SmemCopyAtom (AiuContElemSize =
+//     FoldF*TK, REUSED from validated int2@TK128/int1@TK256) delivers into this fold-in-N layout;
+//   * gB / gmem-partition N-consistency (size<0>(gB)==size<0>(sB)=FoldF*Ng);
+//   * BUILDER: fold path selecting MainloopPPUAiuFold + B operand Block_K = FoldF*blockK.
+//   (mainloop + epilogue need NO fold-specific change -- standard, thanks to fold-in-N.)
+// NOT gated on int4 ceiling -- int2/int1-fold reaching int4 geometry is guaranteed; biggest win is int1 (4x occ).
 // =============================================================================================================
 /***************************************************************************************************
  * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved.
@@ -230,13 +232,23 @@ public:
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
-  // N-FOLD defining change: B's smem K-extent = FoldF * TileShape.K (the physical folded run = FoldF N-cols x
-  // TileShape.K each), while A above uses TileShape.K unchanged. This is what keeps A-smem small (TK) while the AIU
-  // still reads a legal 32B run. The B operand atom (InternalSmemLayoutAtomB) is instantiated by the builder with
-  // Block_K = FoldF*TileShape.K, so its AiuContElemSize already matches this K -> tile_to_shape divides cleanly.
+  // N-FOLD defining change = a FOLD-IN-N smem layout (verified in scratchpad/cute_nfold3.cu). The physical folded
+  // run is [n_a's TK][n_b's TK]...(FoldF cols) = FoldF*TK contiguous. Instead of presenting this as (N, FoldF*TK)
+  // [which would put the fold in MMA_K -> need a 2-pass mainloop + a 2xN interleaved epilogue], present it as a
+  // LOGICAL (FoldF*Ng output-N, TK) tile via strides: logical n' = (f in [0,FoldF), g in [0,Ng)), phys offset =
+  // f*TK + g*(FoldF*TK) + k. cute_nfold3 confirmed partition_B then puts the FoldF factor in MMA_N and MMA_K = TK/16
+  // -> the MMA accumulates over the REAL TK and emits FoldF*Ng output columns NATURALLY. => STANDARD C accumulator +
+  // STANDARD mainloop + STANDARD epilogue. No 2-pass, no dual accumulator, no interleaved epilogue.
+  //   Ng = shape<1>(TileShape)/FoldF (physical N-groups); output N = shape<1>(TileShape).
+  // NOTE: the exact generalized layout below is the FoldF=2-verified shape; finalize/verify the FoldF/Ng general
+  // form (and its compatibility with the operand's swzl SmemCopyAtom, whose AiuContElemSize=FoldF*TK is reused from
+  // the validated int2@TK128 / int1@TK256 config) on the box.
+  static constexpr int TKe = shape<2>(TileShape{});          // real TK (A / MMA K-depth)
+  static constexpr int Ng  = shape<1>(TileShape{}) / FoldF;  // physical N-groups
   using SmemLayoutB = decltype(tile_to_shape(
-      InternalSmemLayoutAtomB{},
-      make_shape(shape<1>(TileShape{}), Int<FoldF * shape<2>(TileShape{})>{}, Int<DispatchPolicy::Stages>{})));
+      make_layout(make_shape(make_shape(Int<FoldF>{}, Int<Ng>{}), Int<TKe>{}),
+                  make_stride(make_stride(Int<TKe>{}, Int<FoldF * TKe>{}), _1{})),
+      make_shape(shape<1>(TileShape{}), Int<TKe>{}, Int<DispatchPolicy::Stages>{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
   using SmemLayoutScale = decltype(tile_to_shape(
@@ -482,9 +494,10 @@ public:
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
     CUTE_STATIC_ASSERT_V(size<0>(gB) == size<0>(sB));                          // BLK_N
     CUTE_STATIC_ASSERT_V(size<1>(gB) == size<1>(sB));                          // BLK_K
-    // N-FOLD: B's K-extent is FoldF x A's (B folds FoldF N-cols into its K-contiguous run). The original
-    // lockstep-K assert (size<1>(sA)==size<1>(sB)) is intentionally relaxed to the folded relation.
-    CUTE_STATIC_ASSERT_V(size<1>(sA) * Int<FoldF>{} == size<1>(sB));           // BLK_K (folded)
+    // N-FOLD (fold-in-N): B's K-mode IS TK (same as A) -- the fold factor lives in B's N-mode, not K. So the
+    // ORIGINAL lockstep-K assert HOLDS unchanged (TK == TK). (The N-side, size<0>(sB) = FoldF*Ng = output N, and the
+    // gB/partition N-consistency, are the box items to finalize.)
+    CUTE_STATIC_ASSERT_V(size<1>(sA) == size<1>(sB));                          // BLK_K
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));        // PIPE
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));        // PIPE
 
