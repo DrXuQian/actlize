@@ -565,11 +565,12 @@ public:
   // PermutionK = the K span one B swzl copy step delivers = 32B worth of the packed element (int4 64 / int2 128 /
   // int1 256). Under an N-FOLD that 32B run is FoldF N-cols x blockK each, so the K span the MMA sees is only
   // blockK -- using the unfolded value would exceed TileShape.K and index past the tile.
-  // NOTE for the FOLD: keep the UNFOLDED value (32B-run K span). Under a fold that equals FoldF * TileShape.K, which
-  // is exactly what the B fragment must span so partition_fragment_B picks up BOTH halves of the folded run. Setting
-  // it to TileShape.K (an earlier attempt) made the fragment cover only the first half -> B.MMA_K=4 instead of 8, and
-  // the folded upper half never entered the fragment at all.
-  static constexpr int MmaPermK = 32 * 8 / sizeof_bits<RealInternalElementB>::value;
+  // FOLD: the fragment must have ORDINARY N x K register semantics (the fold lives only in the load layer), so the
+  // K-permutation is TileShape.K when folding -- NOT the 32B-run span, which would keep the fragment in the folded
+  // (N/FoldF) x (FoldF*K) form and force a 2-pass mainloop.
+  static constexpr int MmaPermK = (fold_schedule_traits<KernelScheduleType>::FoldF > 0)
+      ? cute::get<2>(TileShape_MNK{})
+      : (32 * 8 / sizeof_bits<RealInternalElementB>::value);
   using TiledMma = typename detail::get_tiled_mma<
         Arch, ElementMma, ElementMma, ElementAccumulator, TileShape_MNK, ClusterShape_MNK,
         Int<MmaPermK>>::TiledMma;
