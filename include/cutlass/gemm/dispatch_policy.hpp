@@ -144,6 +144,14 @@ struct KernelAiuMultistageMixedInputPerCol { };
 struct KernelAiuMultistageMixedInputFinegrainedGs128 { };
 struct KernelAiuMultistageMixedInputFinegrainedGs64 { };
 struct KernelAiuMultistageMixedInputFinegrainedGs32 { };  // gs=32 (Q4_0/Q4_1/Q4_K-as-AWQ)
+
+// N-FOLD schedule wrapper: signals the builder to route to MainloopPPUAiuFold (B operand Block_K = FoldF*blockK,
+// fold-in-N SmemLayoutB), carrying both the fold factor and the base group-size schedule (for StaticGroupSize).
+template<int FoldF_, class BaseSchedule_ = KernelAiuMultistageMixedInputFinegrainedGs32>
+struct KernelAiuFold { static constexpr int FoldF = FoldF_; using BaseSchedule = BaseSchedule_; };
+// detection trait (FoldF=0 / Base=self when not a fold schedule)
+template<class T> struct fold_schedule_traits { static constexpr int FoldF = 0; using Base = T; };
+template<int F, class B> struct fold_schedule_traits<KernelAiuFold<F,B>> { static constexpr int FoldF = F; using Base = B; };
 struct KernelAiuMultistageBatchArray { };
 struct KernelAiuMultistageBatchArrayOverlapPrologue { };
 struct KernelAiuMultistageStreamK { };

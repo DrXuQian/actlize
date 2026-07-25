@@ -523,7 +523,8 @@ struct CollectiveBuilder<
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputPerCol> ||
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs128> ||
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs64> ||
-       cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs32>)>
+       cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs32> ||
+       (fold_schedule_traits<KernelScheduleType>::FoldF > 0))>   // N-FOLD: KernelAiuFold<FoldF, Base>
 > {
 private:
   using ScaleA = detail::deduce_mixed_width_dtype_t<1, ElementPairA_>;
@@ -584,9 +585,18 @@ public:
   // right: the low plane drives the main swzl and tCrB_mma; the high plane only feeds extra bits to the converter.
   using PlaneB2 = detail::deduce_mixed_width_dtype_t<3, ElementPairB>;
   static constexpr bool HasPlane2 = !cute::is_void_v<PlaneB2>;
-  using DispatchPolicy = cute::conditional_t<HasPlane2,
-      MainloopPPUAiuMixedInput2Plane<PipelineStages, kContinous, KernelScheduleType>,
-      MainloopPPUAiuMixedInput<PipelineStages, kContinous, KernelScheduleType>>;
+
+  // N-FOLD: KernelScheduleType may be KernelAiuFold<FoldF, Base>. Extract FoldF + the underlying (group-size) base
+  // schedule; when folding, route to MainloopPPUAiuFold and give the B operand a folded Block_K (below).
+  static constexpr int FoldF = fold_schedule_traits<KernelScheduleType>::FoldF;
+  static constexpr bool HasFold = FoldF > 0;
+  using BaseSchedule = typename fold_schedule_traits<KernelScheduleType>::Base;   // == KernelScheduleType if no fold
+
+  using DispatchPolicy = cute::conditional_t<HasFold,
+      MainloopPPUAiuFold<PipelineStages, kContinous, (HasFold ? FoldF : 2), BaseSchedule>,
+      cute::conditional_t<HasPlane2,
+          MainloopPPUAiuMixedInput2Plane<PipelineStages, kContinous, BaseSchedule>,
+          MainloopPPUAiuMixedInput<PipelineStages, kContinous, BaseSchedule>>>;
 
   using GmemLayoutA = cutlass::layout::RowMajor;
   using GmemLayoutB = cutlass::layout::ColumnMajor;
@@ -596,8 +606,12 @@ public:
   static constexpr int blockN = cute::get<1>(TileShape_MNK{});
   static constexpr int blockK = cute::get<2>(TileShape_MNK{});
 
+  // N-FOLD: the B plane's AIU contiguous run folds FoldF adjacent N-cols x blockK each, so its operand Block_K =
+  // FoldF*blockK (=> AiuContElemSize = FoldF*blockK, reusing a validated config, e.g. int2 blockK=64 FoldF=2 => 128
+  // == int2@TK128). A stays blockK. The collective's fold-in-N SmemLayoutB then presents this as (FoldF*Ng, blockK).
+  static constexpr int BFoldBlockK = (HasFold ? FoldF : 1) * blockK;
   using DefaultOperandA = detail::MixGemm_AIU_Operand<RealInternalElementA, false, Int<blockM>, Int<blockK>, true>;
-  using DefaultOperandB = detail::MixGemm_AIU_Operand<RealInternalElementB, false, Int<blockN>, Int<blockK>, true>;
+  using DefaultOperandB = detail::MixGemm_AIU_Operand<RealInternalElementB, false, Int<blockN>, Int<BFoldBlockK>, true>;
 #elif 0 // async_cp not work now
   static_assert(false, "async_cp not work now");
   using DispatchPolicy = MainloopPPUAiuMixedInput<PipelineStages, kContinous, KernelScheduleType>;
