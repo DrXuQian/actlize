@@ -461,7 +461,16 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
         CUTLASS_PRAGMA_UNROLL
         for (int v = 0; v < 4; ++v) {
           uint32_t reg = s[v], r8 = reg >> 8;
-          int base = 32 * (v & 1) + 2 * (v >= 2);
+          // N-GROUP ROUTING. The validated 2-way form is base = 32*(v&1) + 2*(v>=2) -> bases {0,32,2,34}: the 64
+          // h2 outputs are split in HALVES, i.e. exactly two N-groups, which is why a fold with F=2 works and F=4
+          // silently collapses (decoded on box as n_used = n % Ng -- groups 2,3 land on group 0).
+          // MIXGEMM_INT1_NWAY4 selects the natural 4-way generalisation: quarter the output, one N-group per vreg.
+          // Guarded by a flag so the validated F<=2 path is bit-identical when it is off.
+#if defined(MIXGEMM_INT1_NWAY4)
+          int base = 16 * v;                       // bases {0,16,32,48} -- four N-groups
+#else
+          int base = 32 * (v & 1) + 2 * (v >= 2);  // bases {0,32,2,34} -- two N-groups (validated)
+#endif
           //         dst              src  MASK          MUL(2^-b)     ADD(-2^(10-b))   b : mantissa bit, K=2^b
           _E(h2[base + 0 ], reg, 0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair0
           _E(h2[base + 1 ], reg, 0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair1
