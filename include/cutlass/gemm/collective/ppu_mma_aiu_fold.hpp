@@ -728,18 +728,23 @@ private:
     auto kCon = kContinous{};
     using TilerB = typename GmemTiledCopyB::Tiler_MN;
     if constexpr (kCon != 1) {
+      // N-FOLD (interleaved-256 path -- THIS is the branch a %256-aligned shape takes, and it builds its own
+      // shape/stride from N,K,kCon WITHOUT consulting mainloop_params.dB. A folded buffer is (N/FoldF) physical rows
+      // of (FoldF*K) codes, so both must be folded here; patching only the non-interleaved branch (or only launch's
+      // stride) is dead code for this path -- which is why four different offline placements all measured the same
+      // ~72% random result: the gmem walk was wrong independently of the placement.
       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B),
-        make_shape(N, make_shape(kCon, K / kCon), L),
+        make_shape(N / FoldF, make_shape(kCon, (K * FoldF) / kCon), L),
         // GROUPED FIX: interleaved desc base = (uint8_t*)raw_pointer_cast(mB_nk.data()) treats the packed
         // ELEMENT L-stride as a BYTE count, so the stride must be in bytes: one expert weight is
         // N*K * sizeof_bits<B>/8 bytes (int4 -> N*K/2, int2 -> N*K/4, int8 -> N*K). (Was Int<0> -> every expert
         // read plane 0; wrong scale -> e>=2 read OOB garbage. This lands each expert exactly. No effect on L=1.)
-        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N), int64_t(N) * int64_t(K) * sizeof_bits<RealInternalElementB>::value / 8)
+        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * (N / FoldF)), int64_t(N) * int64_t(K) * sizeof_bits<RealInternalElementB>::value / 8)
       );
       Tensor mB_nk = mB_nkl(_,_,l_coord);
       auto layout_counting = make_layout(
         mB_nk.shape(),
-        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N}))
+        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N / FoldF}))
       );
       Tensor mB_nk_counting = make_counting_tensor(layout_counting);
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
