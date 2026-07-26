@@ -1079,21 +1079,10 @@ private:
             copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
             copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
           }
-          // FUSED affine: one FMA pass instead of multiplies-then-plus (two full sweeps over the fragment).
-          // The 2x2 measurement showed the ZERO path is what costs at small gs -- with ScaleOnly both int2-fold and
-          // int4 sit at 53.1% and are gs-INSENSITIVE, while ScaleZero drops them to 42.1% / 38.9% at gs=16 (-11.0 /
-          // -14.2 points) and only -0.8 / -5.3 at gs=32. Halving the fragment sweeps is the cheapest attack on it.
-          // (Same trick already recorded for the GGUF marlin path: hmul2 -> hfma2 makes the affine min free.)
-          {
-            auto sfrag = cute::get<1>(partitioned_extra_info)(_, _, 0);
-            auto zfrag = cute::get<3>(partitioned_extra_info)(_, _, 0);
-            auto bfrag = tCrB_mma(_, _, atom_idx);
-            CUTLASS_PRAGMA_UNROLL
-            for (int e = 0; e < cute::size(bfrag); ++e) {
-              bfrag(e) = static_cast<typename decltype(bfrag)::value_type>(
-                  static_cast<float>(bfrag(e)) * static_cast<float>(sfrag(e)) + static_cast<float>(zfrag(e)));
-            }
-          }
+          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
+          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<3>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, atom_idx), cute::plus{});
         }
       }
     }
