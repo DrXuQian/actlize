@@ -51,13 +51,29 @@ namespace detail {
 
 ///////////////////////////////////////////////////////////////////////////////
 #if ENABLE_AIU
+// ContigShape_: describes WHAT MAKES UP the AIU's 32-byte contiguous run. void (default) = the run is pure K, i.e.
+// Shape<Block_K> -- byte-identical to the original derivation for every existing config (proved for int4 TK64/TK128,
+// int2 TK128/TK256, int1 TK256 x MN64/MN128). An N-FOLD instead passes Shape<Int<FoldF>, Int<TK>>, so the 32B rule is
+// satisfied by (FoldF N-columns x TK) and every derived quantity (AiuContElemSize, InstNum, bits_per_aiu, swzl CUBE_W)
+// follows automatically -- no manual Block_K/Block_MN doubling to keep in sync across four places.
 template <
   typename Element,
   bool Trans,
   typename Block_MN,
   typename Block_K,
-  bool Swap
+  bool Swap,
+  typename ContigShape_ = void
 > struct MixGemm_AIU_Operand;
+
+namespace aiu_detail {
+// contiguous element count of the run: size(ContigShape) when given, else Block_K
+template <class Block_K, class ContigShape_> struct contig_elems {
+  static constexpr int value = cute::size(ContigShape_{});
+};
+template <class Block_K> struct contig_elems<Block_K, void> {
+  static constexpr int value = Block_K{};
+};
+} // namespace aiu_detail
 
 template <
   typename Element,

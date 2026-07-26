@@ -746,7 +746,10 @@ private:
             (uint8_t*)(raw_pointer_cast(mB_nk.data())), N * K / kCon, kCon, mB_nk.stride());
       return mB_nk_counting;
     } else {
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B), make_shape(N,K,L), mainloop_params.dB);
+      // N-FOLD: the folded buffer is (N/FoldF) physical rows x (FoldF*K) codes; describing it as (N,K) would walk it
+      // with the unfolded row pitch. dB already carries the folded pitch (set in launch), so the SHAPE must match it.
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B),
+                                  make_shape(N / FoldF, K * FoldF, L), mainloop_params.dB);
       Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
 
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
