@@ -105,6 +105,32 @@ struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, Ins
   // Reference map from (thr,val) to bit
   using RefLayout = DstLayout;
 
+  // ---------------------------------------------------------------------------------------------------------
+  // LogicalTV -- (thread, vreg) -> the LOGICAL 32-bit word of the cube that vreg reads.
+  //
+  // DESCRIPTIVE ONLY. It is deliberately NOT SrcLayout/DstLayout: those feed partition_S/retile_D, whose result
+  // becomes the coord_ handed to the asm, so changing them changes runtime addressing on every path (fp16, dense,
+  // MoE, every quant format). This member exists so that offline placement generators and static checks have ONE
+  // source of truth instead of each re-deriving the delivery pattern. Wiring cute up to compute the addresses is a
+  // separate, behaviour-changing step that needs a box regression.
+  //
+  // Derived from ppu_tsm_ld_swzl_sim's SWAP=true branch with the two swizzle terms stripped -- they cancel against
+  // the AIU write's matching .swzl, so what is left is the gmem-relative word:
+  //     row = (v/2)*8 + lane/4 ,  word-in-row = (v%2)*4 + lane%4 ,  index = row*WordsPerRow + word
+  // Validated in Kernels/general/w4a16_gemm/cutlass_w4a16/fold_derivation/:
+  //   l2l3_layouts.cu  0 mismatch over all 128 (lane,vreg), bijective, against the sim's own arithmetic
+  //   l17_fp16_identity.cu  the fp16 chain composes to the IDENTITY -- no converter and no offline exist there to
+  //                         hide a compensating error, so this is the strongest available check
+  //   l7/l10/l12/l13/l16    0 mismatch against the real offline for int1/int2/int4, fold and unfolded, whole buffer
+  //
+  // LIMIT: one 32B slice. A cube wider than 32B adds the cross-slice term (vec + slice_start_vec) % 8, which is an
+  // XOR for slices 0 and 1 but CARRIES for 2 and 3, so it is not a plain stride. Guarded below.
+  static constexpr int LogicalWordsPerRow = CUBE_W * sizeof_bits<Element>::value / 32;
+  static constexpr bool LogicalTVValid    = (LogicalWordsPerRow == 8);
+  using LogicalTV = Layout<Shape <Shape<_4, Int<8>>,               Shape<_2, _2>>,
+                           Stride<Stride<_1, Int<LogicalWordsPerRow>>,
+                                  Stride<_4, Int<8 * LogicalWordsPerRow>>>>;   // ((lane%4,lane/4),(v%2,v/2))
+
   void *smem_base_;
 
   template <class Coord, int... Is>

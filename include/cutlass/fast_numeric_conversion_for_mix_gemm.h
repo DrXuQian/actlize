@@ -428,6 +428,63 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
     result_type operator()(source_type const& s) { return convert(s); }
 };
 
+// ================= EMISSION LAYOUT of the mixed-input converters, unified across widths =================
+//
+// Every converter below is 1:1 in element COUNT -- N sub-byte codes in, N fp16 out -- and only the value width
+// changes. But the position map is NOT the identity: each writes its results to h2[base + off] with a hand-chosen
+// base and offset table, and that permutation is exactly what the offline weight relayout has to compensate. This
+// struct is that permutation, and it turns out to be ONE map for all three widths, parameterised only by how many
+// codes fit in a vreg:
+//
+//     e(code, vreg) = half + 2*c0 + sum_{i>=1} 4*2^i * ci + (2*CodesPerVreg)*(vreg%2) + 4*(vreg/2)
+//
+// where the code index's TOP bit is `half` (which fp16 of the half2) and c0..c_{nb-2} are the rest. Read off:
+//     int1  CodesPerVreg=32  code bits -> 2, 8, 16, 32, 1     vreg -> 64, 4
+//     int2  CodesPerVreg=16  code bits -> 2, 8, 16, 1          vreg -> 32, 4
+//     int4  CodesPerVreg= 8  code bits -> 2, 8, 1              vreg -> 16, 4
+// int4 looks structurally different in the source -- four base-8 calls, result_ptr[0,2,1,3], a 4-element block swap
+// -- only because it folds the vreg into a GLOBAL code index. Split it back out (vreg = c/8, code = c%8) and it is
+// the same map.
+//
+// DESCRIPTIVE. The converters still hardcode their h2[] offsets; nothing here changes generated code. The point is
+// a single source of truth for offline placement generators, which previously each re-derived this by hand.
+// Validated 0 mismatch against all three converters' own mask constants and sub-vector permutations in
+// Kernels/general/w4a16_gemm/cutlass_w4a16/fold_derivation/ (l2l3_layouts.cu, l12_widths.cu), and end to end
+// against the real offline for fold and unfolded paths, whole buffer (l13, l16).
+//
+// NOTE the +8 that add_bias_and_interleave_int4s applies is a VALUE transform, not a position one, so it is
+// deliberately absent here -- a layout describes where a code goes, not what it becomes.
+template <int Bits>
+struct MixGemmEmit {
+  static constexpr int kCodesPerVreg = 32 / Bits;
+  static constexpr int kNumCodeBits  = (Bits == 1) ? 5 : (Bits == 2) ? 4 : (Bits == 4) ? 3 : 0;
+  static_assert(kNumCodeBits != 0, "MixGemmEmit: only 1/2/4-bit codes");
+
+  // (code within a vreg, vreg) -> fp16 element index within the converter's 4*kCodesPerVreg outputs
+  static constexpr int index(int code, int vreg) {
+    int e = ((code >> (kNumCodeBits - 1)) & 1)                  // the half2 lo/hi bit -> weight 1
+          + (2 * kCodesPerVreg) * (vreg & 1)                    // vreg low  bit -> top weight
+          + 4 * (vreg >> 1);                                    // vreg high bit -> weight 4
+    for (int i = 0; i < kNumCodeBits - 1; ++i)
+      e += ((code >> i) & 1) * (i == 0 ? 2 : (4 << i));         // 2, 8, 16, 32, ...
+    return e;
+  }
+  static constexpr int kNumOutputs = 4 * kCodesPerVreg;
+
+  // a permutation or the model is wrong; checked at compile time so it cannot rot
+  static constexpr bool bijective() {
+    bool seen[4 * 32] = {};
+    for (int v = 0; v < 4; ++v)
+      for (int c = 0; c < kCodesPerVreg; ++c) {
+        const int e = index(c, v);
+        if (e < 0 || e >= kNumOutputs || seen[e]) return false;
+        seen[e] = true;
+      }
+    return true;
+  }
+  static_assert(bijective(), "MixGemmEmit: emission map is not a permutation");
+};
+
 // ============================ W1A16 : uint1b_t -> fp16 ============================
 // Q1 base plane (high plane of Q3/Q5). bit in {0,1} UNSIGNED (affine 'zero' absorbs offset). CORRECTNESS-FIRST
 // magic-OR (0x6400|bit == fp16(1024+bit), one vectorized f16x2 sub of 1024) -- NO lop3 yet; optimize after the
