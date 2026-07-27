@@ -50,6 +50,93 @@ namespace cutlass
 // signed and had a bias of 2**(b-1) added (where b is the number of bits in the type) to make all numbers unsigned.
 // This converter will uninterleave the data and subtract the bias while converting to the result type.
 
+// ===================== THE EMISSION MAP, hoisted above the converters that now USE it =====================
+// ================= EMISSION LAYOUT of the mixed-input converters, unified across widths =================
+//
+// Every converter below is 1:1 in element COUNT -- N sub-byte codes in, N fp16 out -- and only the value width
+// changes. But the position map is NOT the identity: each writes its results to h2[base + off] with a hand-chosen
+// base and offset table, and that permutation is exactly what the offline weight relayout has to compensate. This
+// struct is that permutation, and it turns out to be ONE map for all three widths, parameterised only by how many
+// codes fit in a vreg:
+//
+//     e(code, vreg) = half + 2*c0 + sum_{i>=1} 4*2^i * ci + (2*CodesPerVreg)*(vreg%2) + 4*(vreg/2)
+//
+// where the code index's TOP bit is `half` (which fp16 of the half2) and c0..c_{nb-2} are the rest. Read off:
+//     int1  CodesPerVreg=32  code bits -> 2, 8, 16, 32, 1     vreg -> 64, 4
+//     int2  CodesPerVreg=16  code bits -> 2, 8, 16, 1          vreg -> 32, 4
+//     int4  CodesPerVreg= 8  code bits -> 2, 8, 1              vreg -> 16, 4
+// int4 looks structurally different in the source -- four base-8 calls, result_ptr[0,2,1,3], a 4-element block swap
+// -- only because it folds the vreg into a GLOBAL code index. Split it back out (vreg = c/8, code = c%8) and it is
+// the same map.
+//
+// NO LONGER DESCRIPTIVE. int2 and int1 now index h2[] THROUGH MixGemmEmit<Bits>::index(t, v)/2, and int4 -- whose
+// composed base8-o-permutation-o-block-swap form is all risk to rewrite on the 55.9% production path -- is PINNED to
+// it by a static_assert instead. So a new bit width inherits a map that is bijective by construction and agrees with
+// three existing converters, rather than being hand-derived again. That hand-derivation is where the int2
+// sigma_n = n & ~8 bug came from. The point was
+// a single source of truth for offline placement generators, which previously each re-derived this by hand.
+// Validated 0 mismatch against all three converters' own mask constants and sub-vector permutations in
+// Kernels/general/w4a16_gemm/cutlass_w4a16/fold_derivation/ (l2l3_layouts.cu, l12_widths.cu), and end to end
+// against the real offline for fold and unfolded paths, whole buffer (l13, l16).
+//
+// NOTE the +8 that add_bias_and_interleave_int4s applies is a VALUE transform, not a position one, so it is
+// deliberately absent here -- a layout describes where a code goes, not what it becomes.
+template <int Bits>
+struct MixGemmEmit {
+  static constexpr int kCodesPerVreg = 32 / Bits;
+  static constexpr int kNumCodeBits  = (Bits == 1) ? 5 : (Bits == 2) ? 4 : (Bits == 4) ? 3 : 0;
+  static_assert(kNumCodeBits != 0, "MixGemmEmit: only 1/2/4-bit codes");
+
+  // (code within a vreg, vreg) -> fp16 element index within the converter's 4*kCodesPerVreg outputs
+  static constexpr int index(int code, int vreg) {
+    int e = ((code >> (kNumCodeBits - 1)) & 1)                  // the half2 lo/hi bit -> weight 1
+          + (2 * kCodesPerVreg) * (vreg & 1)                    // vreg low  bit -> top weight
+          + 4 * (vreg >> 1);                                    // vreg high bit -> weight 4
+    for (int i = 0; i < kNumCodeBits - 1; ++i)
+      e += ((code >> i) & 1) * (i == 0 ? 2 : (4 << i));         // 2, 8, 16, 32, ...
+    return e;
+  }
+  static constexpr int kNumOutputs = 4 * kCodesPerVreg;
+
+  // a permutation or the model is wrong; checked at compile time so it cannot rot
+  static constexpr bool bijective() {
+    bool seen[4 * 32] = {};
+    for (int v = 0; v < 4; ++v)
+      for (int c = 0; c < kCodesPerVreg; ++c) {
+        const int e = index(c, v);
+        if (e < 0 || e >= kNumOutputs || seen[e]) return false;
+        seen[e] = true;
+      }
+    return true;
+  }
+  static_assert(bijective(), "MixGemmEmit: emission map is not a permutation");
+};
+
+// int4's wide converter does NOT use a flat table: it composes the base-8 converter's internal order, a vreg
+// permutation (result_ptr[0]=s0,[2]=s1,[1]=s2,[3]=s3) and a 4-element block swap (elt_b16 1<->2, 5<->6). Rewriting
+// that to be MixGemmEmit-driven is pure risk on the 55.9% production path, so it is PINNED instead: if anyone
+// changes either the composition or MixGemmEmit, this fails at compile time. Verified independently in
+// fold_derivation/l29_emit_is_converter.cu, where the same three permutations compose onto the closed form with 0
+// mismatch -- which is much stronger evidence for the model than a flat table agreeing.
+namespace detail {
+constexpr int mixgemm_int4_composed(int c, int v) {
+  const int l = 2 * (c & 3) + (c >= 4 ? 1 : 0);        // base-8: h[c&3], low lane c<4, high lane c>=4
+  const int p[4] = {0, 2, 1, 3};
+  const int g0 = 8 * p[v] + l;
+  int b = g0 / 4;
+  b = (b == 1) ? 2 : (b == 2) ? 1 : (b == 5) ? 6 : (b == 6) ? 5 : b;
+  return 4 * b + (g0 % 4);
+}
+constexpr bool mixgemm_int4_agrees() {
+  for (int v = 0; v < 4; ++v)
+    for (int c = 0; c < 8; ++c)
+      if (mixgemm_int4_composed(c, v) != MixGemmEmit<4>::index(c, v)) return false;
+  return true;
+}
+static_assert(mixgemm_int4_agrees(),
+              "int4's composed emission (base8 o vreg-perm o block-swap) no longer matches MixGemmEmit<4>");
+}  // namespace detail
+
 template <typename T, typename S, int N>
 struct MixGemmNumericArrayConverter
 {
@@ -410,15 +497,18 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
         CUTLASS_PRAGMA_UNROLL
         for (int v = 0; v < 4; ++v) {
           uint32_t reg = s[v], r8 = reg >> 8;
-          int base = 16 * (v & 1) + 2 * (v >= 2);
-          _E(h2[base + 0 ], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair0 (c0,c1)   K=1  : v-1024
-          _E(h2[base + 1 ], reg, 0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair1 (c2,c3)   K=4  : v/4-256
-          _E(h2[base + 4 ], reg, 0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair2 (c4,c5)   K=16 : v/16-64
-          _E(h2[base + 5 ], reg, 0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair3 (c6,c7)   K=64 : v/64-16
-          _E(h2[base + 8 ], r8,  0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair4 (c8,c9)
-          _E(h2[base + 9 ], r8,  0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair5 (c10,c11)
-          _E(h2[base + 12], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair6 (c12,c13)
-          _E(h2[base + 13], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair7 (c14,c15)
+          // The h2 index is DERIVED now: MixGemmEmit<2>::index(t, v)/2 equals the hardcoded
+          // base + {0,1,4,5,8,9,12,13}[t] it replaces, 0 mismatch over all (t, v) -- see
+          // fold_derivation/l29_emit_is_converter.cu. The MASKS stay literal on purpose: they encode a code's BIT
+          // POSITION, which is a value transform, and a layout describes where a code goes, not what it becomes.
+          _E(h2[MixGemmEmit<2>::index(0, v) / 2], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair0 (c0,c1)   K=1  : v-1024
+          _E(h2[MixGemmEmit<2>::index(1, v) / 2], reg, 0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair1 (c2,c3)   K=4  : v/4-256
+          _E(h2[MixGemmEmit<2>::index(2, v) / 2], reg, 0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair2 (c4,c5)   K=16 : v/16-64
+          _E(h2[MixGemmEmit<2>::index(3, v) / 2], reg, 0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair3 (c6,c7)   K=64 : v/64-16
+          _E(h2[MixGemmEmit<2>::index(4, v) / 2], r8,  0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair4 (c8,c9)
+          _E(h2[MixGemmEmit<2>::index(5, v) / 2], r8,  0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair5 (c10,c11)
+          _E(h2[MixGemmEmit<2>::index(6, v) / 2], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair6 (c12,c13)
+          _E(h2[MixGemmEmit<2>::index(7, v) / 2], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair7 (c14,c15)
         }
         #undef _E
         return result;
@@ -428,62 +518,7 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
     result_type operator()(source_type const& s) { return convert(s); }
 };
 
-// ================= EMISSION LAYOUT of the mixed-input converters, unified across widths =================
-//
-// Every converter below is 1:1 in element COUNT -- N sub-byte codes in, N fp16 out -- and only the value width
-// changes. But the position map is NOT the identity: each writes its results to h2[base + off] with a hand-chosen
-// base and offset table, and that permutation is exactly what the offline weight relayout has to compensate. This
-// struct is that permutation, and it turns out to be ONE map for all three widths, parameterised only by how many
-// codes fit in a vreg:
-//
-//     e(code, vreg) = half + 2*c0 + sum_{i>=1} 4*2^i * ci + (2*CodesPerVreg)*(vreg%2) + 4*(vreg/2)
-//
-// where the code index's TOP bit is `half` (which fp16 of the half2) and c0..c_{nb-2} are the rest. Read off:
-//     int1  CodesPerVreg=32  code bits -> 2, 8, 16, 32, 1     vreg -> 64, 4
-//     int2  CodesPerVreg=16  code bits -> 2, 8, 16, 1          vreg -> 32, 4
-//     int4  CodesPerVreg= 8  code bits -> 2, 8, 1              vreg -> 16, 4
-// int4 looks structurally different in the source -- four base-8 calls, result_ptr[0,2,1,3], a 4-element block swap
-// -- only because it folds the vreg into a GLOBAL code index. Split it back out (vreg = c/8, code = c%8) and it is
-// the same map.
-//
-// DESCRIPTIVE. The converters still hardcode their h2[] offsets; nothing here changes generated code. The point is
-// a single source of truth for offline placement generators, which previously each re-derived this by hand.
-// Validated 0 mismatch against all three converters' own mask constants and sub-vector permutations in
-// Kernels/general/w4a16_gemm/cutlass_w4a16/fold_derivation/ (l2l3_layouts.cu, l12_widths.cu), and end to end
-// against the real offline for fold and unfolded paths, whole buffer (l13, l16).
-//
-// NOTE the +8 that add_bias_and_interleave_int4s applies is a VALUE transform, not a position one, so it is
-// deliberately absent here -- a layout describes where a code goes, not what it becomes.
-template <int Bits>
-struct MixGemmEmit {
-  static constexpr int kCodesPerVreg = 32 / Bits;
-  static constexpr int kNumCodeBits  = (Bits == 1) ? 5 : (Bits == 2) ? 4 : (Bits == 4) ? 3 : 0;
-  static_assert(kNumCodeBits != 0, "MixGemmEmit: only 1/2/4-bit codes");
 
-  // (code within a vreg, vreg) -> fp16 element index within the converter's 4*kCodesPerVreg outputs
-  static constexpr int index(int code, int vreg) {
-    int e = ((code >> (kNumCodeBits - 1)) & 1)                  // the half2 lo/hi bit -> weight 1
-          + (2 * kCodesPerVreg) * (vreg & 1)                    // vreg low  bit -> top weight
-          + 4 * (vreg >> 1);                                    // vreg high bit -> weight 4
-    for (int i = 0; i < kNumCodeBits - 1; ++i)
-      e += ((code >> i) & 1) * (i == 0 ? 2 : (4 << i));         // 2, 8, 16, 32, ...
-    return e;
-  }
-  static constexpr int kNumOutputs = 4 * kCodesPerVreg;
-
-  // a permutation or the model is wrong; checked at compile time so it cannot rot
-  static constexpr bool bijective() {
-    bool seen[4 * 32] = {};
-    for (int v = 0; v < 4; ++v)
-      for (int c = 0; c < kCodesPerVreg; ++c) {
-        const int e = index(c, v);
-        if (e < 0 || e >= kNumOutputs || seen[e]) return false;
-        seen[e] = true;
-      }
-    return true;
-  }
-  static_assert(bijective(), "MixGemmEmit: emission map is not a permutation");
-};
 
 // ============================ W1A16 : uint1b_t -> fp16 ============================
 // Q1 base plane (high plane of Q3/Q5). bit in {0,1} UNSIGNED (affine 'zero' absorbs offset). CORRECTNESS-FIRST
@@ -523,24 +558,26 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
           // capped at 2 by the swzl delivery grid, not by anything here; see fold_traits.hpp for the derivation
           // (scratchpad/leg1_runword.cpp + leg2_frag.cu). The short version: the two extra columns of an F=4 run
           // are delivered to DIFFERENT LANES, and a converter only relabels registers inside one thread.
-          int base = 32 * (v & 1) + 2 * (v >= 2);
+          // Derived: MixGemmEmit<1>::index(t, v)/2 equals base + {0,1,4,5,8,9,12,13}[t%8] + 16*(t>=8).
+          // NOTE the comment ABOVE this struct describes the STAGE-1 magic-OR implementation, not this one --
+          // encoding it instead of this code cost 120/128 mismatches on l29's first run.
           //         dst              src  MASK          MUL(2^-b)     ADD(-2^(10-b))   b : mantissa bit, K=2^b
-          _E(h2[base + 0 ], reg, 0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair0
-          _E(h2[base + 1 ], reg, 0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair1
-          _E(h2[base + 4 ], reg, 0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair2
-          _E(h2[base + 5 ], reg, 0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair3
-          _E(h2[base + 8 ], reg, 0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair4
-          _E(h2[base + 9 ], reg, 0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair5
-          _E(h2[base + 12], reg, 0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair6
-          _E(h2[base + 13], reg, 0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair7
-          _E(h2[base + 16], r8,  0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair8
-          _E(h2[base + 17], r8,  0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair9
-          _E(h2[base + 20], r8,  0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair10
-          _E(h2[base + 21], r8,  0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair11
-          _E(h2[base + 24], r8,  0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair12
-          _E(h2[base + 25], r8,  0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair13
-          _E(h2[base + 28], r8,  0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair14
-          _E(h2[base + 29], r8,  0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair15
+          _E(h2[MixGemmEmit<1>::index(0, v) / 2], reg, 0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair0
+          _E(h2[MixGemmEmit<1>::index(1, v) / 2], reg, 0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair1
+          _E(h2[MixGemmEmit<1>::index(2, v) / 2], reg, 0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair2
+          _E(h2[MixGemmEmit<1>::index(3, v) / 2], reg, 0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair3
+          _E(h2[MixGemmEmit<1>::index(4, v) / 2], reg, 0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair4
+          _E(h2[MixGemmEmit<1>::index(5, v) / 2], reg, 0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair5
+          _E(h2[MixGemmEmit<1>::index(6, v) / 2], reg, 0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair6
+          _E(h2[MixGemmEmit<1>::index(7, v) / 2], reg, 0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair7
+          _E(h2[MixGemmEmit<1>::index(8, v) / 2], r8,  0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair8
+          _E(h2[MixGemmEmit<1>::index(9, v) / 2], r8,  0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair9
+          _E(h2[MixGemmEmit<1>::index(10, v) / 2], r8,  0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair10
+          _E(h2[MixGemmEmit<1>::index(11, v) / 2], r8,  0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair11
+          _E(h2[MixGemmEmit<1>::index(12, v) / 2], r8,  0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair12
+          _E(h2[MixGemmEmit<1>::index(13, v) / 2], r8,  0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair13
+          _E(h2[MixGemmEmit<1>::index(14, v) / 2], r8,  0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair14
+          _E(h2[MixGemmEmit<1>::index(15, v) / 2], r8,  0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair15
         }
         #undef _E
         return result;
