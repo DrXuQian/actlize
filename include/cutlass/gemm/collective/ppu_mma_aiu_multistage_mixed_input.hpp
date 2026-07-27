@@ -759,6 +759,68 @@ private:
     }
   }
 
+  template <class TiledMma, class STensor>
+  CUTLASS_DEVICE
+  static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS) {
+    return make_tensor<ElementScale>(scale_fragment_layout(thr_mma, sS));
+  }
+
+  // The layout, split out of make_scale_fragment so it is HOST-callable and can be witnessed at compile time (see
+  // kScaleFragCosize below). make_scale_fragment is CUTLASS_DEVICE, so it cannot appear even in an unevaluated
+  // context from host code.
+  template <class TiledMma, class STensor>
+  CUTE_HOST_DEVICE static constexpr auto scale_fragment_layout(TiledMma const& thr_mma, STensor const& sS) {
+#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
+    return make_layout_like(thr_mma.partition_B(sS(_,_,Int<0>{})).layout());   // the MATERIALISED fragment
+#else
+    auto pB0 = thr_mma.partition_B(sS(_,_,Int<0>{}));
+    auto fz  = make_fragment_like(filter_zeros(pB0.layout()));
+    auto bc  = make_layout(pB0.shape(), make_stride(stride<0>(fz), stride<1>(fz), _0{}));
+    // MMA_K must be the mode the scale is invariant along, and mode 0 must have kept its zeros, or the layout above
+    // is not the broadcast it claims to be. Both are checkable right here: cosize is 2*MMA_N exactly when the two k
+    // val-bits are stride 0 and MMA_K is stride 0, and it is what l28 compares against the copy's distinct count.
+    static_assert(cute::is_static<decltype(bc)>::value, "scale broadcast layout must be static");
+    CUTE_STATIC_ASSERT_V(cosize(bc) < size(bc), "scale broadcast: nothing was shared, so no mode was zeroed");
+    return bc;
+#endif
+  }
+
+  // A COMPILE-TIME WITNESS that THIS collective is what got compiled, and which path it took.
+  //
+  // WHY IT EXISTS. "Every acu counter is identical" in an A/B is ambiguous three ways: the change is inert, or the
+  // box never rebuilt (stale actlize submodule), or the define never reached the device compile. The first two are
+  // invisible in any runtime log, and the second is the likeliest -- the submodule gitlink moves with Kernels but
+  // `git submodule update` is a separate step. If the submodule is stale these members DO NOT EXIST and the harness
+  // FAILS TO COMPILE, which is the one signal that cannot be missed or misread.
+  //
+  // kScaleFragCosize is the number that actually matters: 8 (or 4) for the broadcast against 32 (or 16) for the
+  // materialised fragment, at the shapes in the tree. If an A/B prints the same cosize twice, the two builds really
+  // are the same build.
+  static constexpr bool kScaleBroadcast =
+#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
+      false;
+#else
+      true;
+#endif
+  static constexpr int scale_frag_cosize() {
+    if constexpr (ModeHasScales) {
+      return cute::cosize_v<decltype(scale_fragment_layout(
+          TiledMma{}.get_thread_slice(0),
+          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})))>;
+    } else {
+      return 0;
+    }
+  }
+  static constexpr int scale_frag_size() {
+    if constexpr (ModeHasScales) {
+      return cute::size_v<decltype(scale_fragment_layout(
+          TiledMma{}.get_thread_slice(0),
+          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})))>;
+    } else {
+      return 0;
+    }
+  }
+
   /// Utilities for partitioning extra inputs for loading from smem in the mainloop.
   template <class TiledMma>
   CUTLASS_DEVICE
@@ -781,7 +843,7 @@ private:
           make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<smem_scale_k>{})));
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemCopyLayoutScale{});
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
-      Tensor tCrS = make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
+      Tensor tCrS = make_scale_fragment(thr_mma, sS);
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         return cute::make_tuple(tCsS, tCrS);
@@ -789,7 +851,7 @@ private:
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemCopyLayoutScale{});
         Tensor tCsZ = smem_thr_copy_S.partition_S(sZ);
-        Tensor tCrZ = make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sZ(_,_,Int<0>{})));
+        Tensor tCrZ = make_scale_fragment(thr_mma, sZ);
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
       }
       else {
