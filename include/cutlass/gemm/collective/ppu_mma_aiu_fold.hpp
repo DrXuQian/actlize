@@ -653,6 +653,29 @@ public:
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrB_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrB_mma) / size<2>(tCrB_copy_view);
+    // PPU_MMA_PROBE=1: print the two numbers any per-atom / chunked B scheme depends on, from the DEFAULT build.
+    // Added because writing them as static_asserts and then building the dependent code on top is backwards -- the
+    // assert makes a wrong assumption loud but not cheap, and it would only fire after the whole chunked path had
+    // been written. One printf on the default path settles it first, for free.
+#if defined(PPU_MMA_PROBE) && (PPU_MMA_PROBE != 0)
+    if (thread0()) {
+      cute::print("[mma probe] K_BLOCK_MAX(CPY_K)="); cute::print(K_BLOCK_MAX);
+      cute::print("  K_ATOM_PER_COPY="); cute::print(K_ATOM_PER_COPY);
+      cute::print("  MMA_K(tCrB_mma)="); cute::print(size<2>(tCrB_mma));
+      cute::print("  MMA_N="); cute::print(size<1>(tCrB_mma));
+      cute::print("  Scale_TileK="); cute::print(int(Scale_TileK));
+      cute::print("\n");
+    }
+#endif
+#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
+    // One k-atom of converted B, reused across atoms, instead of tCrB_mma's MMA_K atoms held simultaneously.
+    // 4*MMA_N*MMA_K registers -> 4*MMA_N. Assumptions asserted rather than assumed:
+    static_assert(decltype(K_ATOM_PER_COPY)::value == 4,
+        "PPU_B_CHUNK is derived for 4 mma-K atoms per delivery (the int1 TK=64 WN=64 target)");
+    CUTE_STATIC_ASSERT_V(K_BLOCK_MAX == Int<1>{},
+        "PPU_B_CHUNK assumes one copy step per k-tile, so copy->convert->mma all sit in one k_block");
+    Tensor tCrB_one = make_fragment_like(tCrB_mma(_,_,Int<0>{}));
+#endif
 
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
@@ -663,8 +686,10 @@ public:
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
+#if !defined(PPU_B_CHUNK) || (PPU_B_CHUNK == 0)
       transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
+#endif
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -691,8 +716,10 @@ public:
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+#if !defined(PPU_B_CHUNK) || (PPU_B_CHUNK == 0)
         transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
+#endif
 
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
@@ -717,6 +744,18 @@ public:
         // N-FOLD: IDENTICAL to the unfolded mainloop. The fold lives only in the load layer -- gmem/smem are
         // (N/FoldF) x (FoldF*K) to satisfy the AIU 32B contiguous minimum, and the swzl ldmatrix already delivers the
         // fragment with ordinary N x K register semantics (same as int4). So no fold-specific compute code at all.
+#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
+        // for_each, not a for loop: the chunk must be a TEMPLATE argument so the emission gate stays compile-time.
+        for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
+          constexpr int kChunk = decltype(k_loop)::value;
+          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+          transform_B_atom<RealInternalElementB, kChunk>(tCrB_copy_view, tCrB_one, partitioned_extra_info,
+              atom_idx, int(K_ATOM_PER_COPY), copy_partitions_extra_info, smem_pipe_read);
+          cute::transform(tCrA(_,_,atom_idx), TransformA{});
+          cute::transform(tCrB_one, TransformB{});
+          cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_one, accum);
+        });
+#else
         CUTLASS_PRAGMA_UNROLL
         for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
           auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
@@ -724,6 +763,7 @@ public:
           cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
           cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
         }
+#endif
       });
 
     }
@@ -1162,6 +1202,66 @@ private:
       assert(false);
     //   static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
     }
+  }
+
+  // PPU_B_CHUNK: convert and scale ONE k-atom into a one-atom fragment, instead of converting a whole delivery into
+  // a fragment that holds all MMA_K atoms. See fold_derivation/HANDOFF_TASK9.md for the why; the short version is that
+  // a 16 B delivery carries 16/Bits mma atom-slots, so the fp16 fragment is FORCED to >= 4*16/Bits = 64 registers for
+  // int1, and those 64 push the best config past the power-of-two register billing boundary, halving warps/CU from 32
+  // to 16. Converting one atom at a time drops B to 64/MMA_K with every delivered code still converted and used --
+  // only the emission order changes, not the mma count or the total converter work.
+  //
+  // Chunk must be a TEMPLATE parameter: the emission gate is `if constexpr (MixGemmEmit index / kPer == Chunk)`, a
+  // compile-time predicate (verified static for all widths in l32_chunk_predicate.cu), and a runtime `if` would make
+  // the register saving depend on the compiler folding branches -- the assumption the scale-broadcast episode
+  // punished.
+  template <class RealB, int Chunk, class TCrB_load, class TCrB_one, class... Ts, class CopyViews>
+  CUTLASS_DEVICE
+  void transform_B_atom(
+    TCrB_load const& tCrB_load,
+    TCrB_one& tCrB_one,
+    cute::tuple<Ts...> const& partitioned_extra_info,
+    int const atom_idx,
+    int const mma_k_atoms,
+    CopyViews const& tiled_copy_and_views,
+    int const read_stage) {
+
+    // The whole delivery arrives in ONE copy step, so there is no cross-iteration hazard between the copy and a
+    // deferred conversion, and no B prefetch overlap to lose. If a future atom/tile makes CPY_K > 1 this assert fires
+    // rather than silently converting the wrong step's codes.
+    CUTE_STATIC_ASSERT_V(cute::size<2>(tCrB_load) == cute::Int<1>{},
+        "PPU_B_CHUNK assumes one copy step per k-tile (CPY_K == 1); with more, tCrB_load must be double-buffered");
+
+    Tensor cvt_in = recast<RealB>(tCrB_load(_, _, Int<0>{}));
+    Tensor cvt_out = make_tensor(tCrB_one.data(), make_layout(make_shape(Int<MixGemmInt1Emit<Chunk, 4>::kHalf2 * 2>{})));
+    cutlass::MixGemmInt1Emit<Chunk, 4>::emit(reinterpret_cast<uint32_t const*>(cvt_in.data()),
+                                             reinterpret_cast<uint32_t*>(tCrB_one.data()));
+
+    // Scale/zero, same rule as transform_B_kblock's FINE branch but for this one atom. APG_ = mma atoms per scale
+    // group; reload at a group's first atom.
+    if constexpr (ModeHasScales) {
+      constexpr int MMA_KA_ = 4;                                        // atoms per delivery at the target shape
+      constexpr bool FINE   = (int(Scale_TileK) > 1);
+      constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;
+      auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+      auto tCsS              = cute::get<0>(partitioned_extra_info);
+      auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
+      if constexpr (FINE) {
+        if (atom_idx % APG_ == 0)
+          copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + atom_idx / APG_), tCrS_copy_view(_,_,0));
+      }
+      cute::transform(tCrB_one, cute::get<1>(partitioned_extra_info)(_,_,0), tCrB_one, cute::multiplies{});
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        auto tCsZ           = cute::get<2>(partitioned_extra_info);
+        auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
+        if constexpr (FINE) {
+          if (atom_idx % APG_ == 0)
+            copy(smem_tiled_copy_S, tCsZ(_,_,0, read_stage * int(Scale_TileK) + atom_idx / APG_), tCrZ_copy_view(_,_,0));
+        }
+        cute::transform(tCrB_one, cute::get<3>(partitioned_extra_info)(_,_,0), tCrB_one, cute::plus{});
+      }
+    }
+    (void)mma_k_atoms;
   }
 
   /// Utilities for transforming the A operand prior to issuing tensor cell math.
