@@ -123,13 +123,22 @@ struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, Ins
   //                         hide a compensating error, so this is the strongest available check
   //   l7/l10/l12/l13/l16    0 mismatch against the real offline for int1/int2/int4, fold and unfolded, whole buffer
   //
-  // LIMIT: one 32B slice. A cube wider than 32B adds the cross-slice term (vec + slice_start_vec) % 8, which is an
-  // XOR for slices 0 and 1 but CARRIES for 2 and 3, so it is not a plain stride. Guarded below.
+  // MULTI-SLICE. A cube wider than 32B is read as several 32B slices, and the sim carries a cross-slice term
+  // (vec + slice_start_vec) % 8 with ssv in {0,4,2,6} -- a rotate that carries for slices 2 and 3, so NOT a plain
+  // stride. It looked like that would force a custom swizzle functor. It does not: the rotate belongs to the
+  // SWIZZLE, and the AIU write applies the matching one, so it cancels and the LOGICAL map has no rotate at all.
+  // Measured, not assumed -- fold_derivation/l19_multislice.cu tries {strip, keep} x {slice-major, rowblock-major}
+  // and only "strip + slice-major" yields the fp16 identity, at 2 slices (0/2048) and 4 slices (0/4096), with a
+  // 1-slice control that all four pass because ssv is 0 there.
+  //
+  // So the slice is just one more mode with stride 8 words, and stock cute covers ANY cube width. The copy
+  // instances walk slice-major: all slices of a row-block before the next row-block.
   static constexpr int LogicalWordsPerRow = CUBE_W * sizeof_bits<Element>::value / 32;
-  static constexpr bool LogicalTVValid    = (LogicalWordsPerRow == 8);
-  using LogicalTV = Layout<Shape <Shape<_4, Int<8>>,               Shape<_2, _2>>,
-                           Stride<Stride<_1, Int<LogicalWordsPerRow>>,
-                                  Stride<_4, Int<8 * LogicalWordsPerRow>>>>;   // ((lane%4,lane/4),(v%2,v/2))
+  static constexpr int LogicalSlices      = LogicalWordsPerRow / 8;
+  static constexpr bool LogicalTVValid    = (LogicalWordsPerRow % 8 == 0);
+  // ((lane%4, lane/4), (v%2, v/2), slice) -> logical 32-bit word index within the cube
+  using LogicalTV = Layout<Shape <Shape<_4, Int<8>>,                    Shape<_2, _2>,                     Int<LogicalSlices>>,
+                           Stride<Stride<_1, Int<LogicalWordsPerRow>>,  Stride<_4, Int<8 * LogicalWordsPerRow>>, _8>>;
 
   void *smem_base_;
 
