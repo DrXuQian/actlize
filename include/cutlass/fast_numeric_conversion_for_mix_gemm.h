@@ -160,6 +160,104 @@ static_assert(mixgemm_int4_agrees(),
               "int4's composed emission (base8 o vreg-perm o block-swap) no longer matches MixGemmEmit<4>");
 }  // namespace detail
 
+// ================== CHUNK-AWARE EMISSION, one implementation for int1 AND int2 ==================
+//
+// The constants are DERIVED from Bits, not tabulated. int1 had 16 hardcoded (mask, mul, add) triples and int2 another
+// 8 -- two tables encoding one rule, which also meant chunking int2 would mean copying the whole emitter. Verified
+// against both widths' actual constants (24 rows, 0 differ) in fold_derivation/l36_emit_constants.cu:
+//
+//     pairs per vreg = 16/Bits          per level = 8/Bits    (level 1 reads reg>>8)
+//     b              = (t % (8/Bits)) * Bits
+//     mask           = m | (m<<16),  m = ((1<<Bits)-1) << b
+//     mul            = fp16(2^-b)       = (15 - b) << 10, duplicated
+//     add            = fp16(-2^(10-b))  = 0x8000 | ((25 - b) << 10), duplicated
+//
+// int4 is deliberately NOT covered: it uses the +8 bias with the 1032/72 magic on nibbles, a different scheme -- and
+// it needs no chunking, since slots/delivery = 4 leaves it one k-atom per copy step, i.e. NChunk = 1.
+//
+// WHY CHUNKING EXISTS. One 16 B swzl delivery carries 16/Bits mma atom-slots of B, which is simultaneously int1's
+// advantage (one read feeds 4x the mma of int4) and its handicap: the fp16 fragment must hold a whole delivery, so
+// B_regs = 4*MMA_N*MMA_K >= 64 for int1, and those 64 push the best config past the power-of-two register billing
+// boundary, halving warps/CU from 32 to 16. Chunking decouples how many atom-slots the delivery COVERS from how many
+// are fp16 AT ONCE: all of them still convert and get used, in NChunk batches. Measured 186 -> 142 registers.
+//
+// at() AND keep() ARE LAYOUT COMPOSITIONS over FragLayout, which is tCrB_mma's OWN layout passed in by the caller --
+// not restated. Restating it by hand (assuming a compact (8,32) where the fragment is ((1,2,4),32,8)) is what produced
+// "MMA_N atom 0 right, atoms 1-3 wrong" on the box.
+//     L_dst = shape(L) : (val strides, size(val), 0)   compact in n, stride-0 in k = ONE k-atom
+//     L_k   = shape(L) : (zeros,       0,        1)    which k-atom an element belongs to
+// composed with right_inverse(L); cute simplifies both symbolically. l35 checks them against the arithmetic they
+// replace on all 256 (chunk, t, v) combinations.
+//
+// V AND T ARE TEMPLATE PARAMETERS, not loop variables: the gate is `if constexpr (keep(T, V))`, and a plain `if`
+// relying on unrolling plus dead-code elimination would make the register saving depend on the compiler folding
+// branches -- the assumption the scale-broadcast episode punished.
+template <int Bits, int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
+                                          cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>>
+struct MixGemmChunkEmit {
+  static constexpr int kCodesPerVreg = 32 / Bits;
+  static constexpr int kOut          = 4 * kCodesPerVreg;      // 128 for int1, 64 for int2
+  static constexpr int kPairsPerVreg = kCodesPerVreg / 2;
+  static constexpr int kPerLevel     = 8 / Bits;
+  static constexpr int kPer          = kOut / NChunk;
+  static_assert(Bits == 1 || Bits == 2, "MixGemmChunkEmit covers int1 and int2; int4 uses the bias/1032 scheme");
+  static_assert(NChunk >= 1 && kOut % NChunk == 0, "MixGemmChunkEmit: NChunk must divide the output count");
+  static_assert(Chunk < NChunk, "MixGemmChunkEmit: Chunk out of range");
+  static_assert(Chunk < 0 || cute::size(FragLayout{}) == kOut,
+                "MixGemmChunkEmit: FragLayout must cover all outputs when chunking");
+
+  using AtL = decltype(cute::composition(
+      cute::make_layout(cute::shape(FragLayout{}),
+                        cute::make_stride(cute::stride<0>(FragLayout{}),
+                                          cute::Int<cute::size<0>(FragLayout{})>{}, cute::_0{})),
+      cute::right_inverse(FragLayout{})));
+  using KaL = decltype(cute::composition(
+      cute::make_layout(cute::shape(FragLayout{}),
+                        cute::make_stride(cute::repeat_like(cute::stride<0>(FragLayout{}), cute::_0{}),
+                                          cute::_0{}, cute::_1{})),
+      cute::right_inverse(FragLayout{})));
+
+  static constexpr bool keep(int t, int v) {
+    return Chunk < 0 || int(KaL{}(MixGemmEmit<Bits>::index(t, v))) == Chunk;
+  }
+  static constexpr int at(int t, int v) {
+    const int e = MixGemmEmit<Bits>::index(t, v);
+    return (Chunk < 0 || !Rebase) ? e / 2 : int(AtL{}(e)) / 2;
+  }
+  static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
+
+  static constexpr uint32_t dup(uint32_t h) { return h | (h << 16); }
+  template <int T> static constexpr int      bpos() { return (T % kPerLevel) * Bits; }
+  template <int T> static constexpr uint32_t mask() { return dup(uint32_t(((1u << Bits) - 1u) << bpos<T>())); }
+  template <int T> static constexpr uint32_t mul()  { return dup(uint32_t((15 - bpos<T>()) << 10)); }
+  template <int T> static constexpr uint32_t add()  { return dup(uint32_t(0x8000u | ((25 - bpos<T>()) << 10))); }
+
+  template <int T, int V>
+  CUTLASS_DEVICE static void emit_one(uint32_t reg, uint32_t* h2) {
+    const uint32_t src = (T / kPerLevel) ? (reg >> 8) : reg;
+    uint32_t x;
+    asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n"
+                 : "=r"(x) : "r"(src), "n"(mask<T>()), "n"(0x64006400u), "n"(0xEAu));
+    asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n"
+                 : "=r"(x) : "r"(x), "r"(mul<T>()), "r"(add<T>()));
+    h2[at(T, V)] = x;
+  }
+
+  template <int V>
+  CUTLASS_DEVICE static void emit_v(uint32_t reg, uint32_t* h2) {
+    cute::for_each(cute::make_int_sequence<kPairsPerVreg>{}, [&] (auto t) {
+      constexpr int T = decltype(t)::value;
+      if constexpr (keep(T, V)) emit_one<T, V>(reg, h2);
+    });
+  }
+
+  CUTLASS_DEVICE static void emit(uint32_t const* s, uint32_t* h2) {
+    emit_v<0>(s[0], h2); emit_v<1>(s[1], h2); emit_v<2>(s[2], h2); emit_v<3>(s[3], h2);
+  }
+};
+
+
 template <typename T, typename S, int N>
 struct MixGemmNumericArrayConverter
 {
@@ -509,32 +607,12 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
         //   weight, undone by fma(value, 1/K, -1024/K): 0x03->K=1, 0x0c->4, 0x30->16, 0xc0->64.
         //   src0,src1 = low-N (n%16<8), src2,src3 = high-N (n%16>=8) [MEASURED]. For vreg v the 8 pairs (c0,c1)..
         //   (c14,c15) land at h2[base + 4*(t/2) + (t%2)], base = 16*(v&1) + 2*(v>=2). 32 lop3 + 32 fma, no temp.
+        // Delegates to MixGemmChunkEmit<2>, whose (mask, mul, add) are DERIVED from Bits. The eight triples that
+        // used to live here were the same rule as int1's sixteen at a different stride -- verified identical, 24 rows,
+        // 0 differ, in fold_derivation/l36_emit_constants.cu. One rule, one implementation.
         result_type result;
-        uint32_t const* s  = reinterpret_cast<uint32_t const*>(&source);   // 4 swzl vregs, 16 crumbs each
-        uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 32 half2 (uint32 view)
-        #define _E(dst, src, MASK, MUL, ADD) do {                                                         \
-            uint32_t _x;                                                                                  \
-            asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x) : "r"(src), "n"(MASK), "n"(0x64006400u), "n"(0xEAu)); \
-            asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x) : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD))); \
-            (dst) = _x; } while (0)
-        CUTLASS_PRAGMA_UNROLL
-        for (int v = 0; v < 4; ++v) {
-          uint32_t reg = s[v], r8 = reg >> 8;
-          // The h2 index is DERIVED now: MixGemmEmit<2>::index(t, v)/2 equals the hardcoded
-          // base + {0,1,4,5,8,9,12,13}[t] it replaces, 0 mismatch over all (t, v) -- see
-          // fold_derivation/l29_emit_is_converter.cu. The MASKS stay literal on purpose: they encode a code's BIT
-          // POSITION, which is a value transform, and a layout describes where a code goes, not what it becomes.
-          _E(h2[MixGemmEmit<2>::index(0, v) / 2], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair0 (c0,c1)   K=1  : v-1024
-          _E(h2[MixGemmEmit<2>::index(1, v) / 2], reg, 0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair1 (c2,c3)   K=4  : v/4-256
-          _E(h2[MixGemmEmit<2>::index(2, v) / 2], reg, 0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair2 (c4,c5)   K=16 : v/16-64
-          _E(h2[MixGemmEmit<2>::index(3, v) / 2], reg, 0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair3 (c6,c7)   K=64 : v/64-16
-          _E(h2[MixGemmEmit<2>::index(4, v) / 2], r8,  0x00030003u, 0x3c003c00u, 0xe400e400u);  // pair4 (c8,c9)
-          _E(h2[MixGemmEmit<2>::index(5, v) / 2], r8,  0x000c000cu, 0x34003400u, 0xdc00dc00u);  // pair5 (c10,c11)
-          _E(h2[MixGemmEmit<2>::index(6, v) / 2], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair6 (c12,c13)
-          _E(h2[MixGemmEmit<2>::index(7, v) / 2], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair7 (c14,c15)
-        }
-        #undef _E   // restored: an edit to the int1 converter below had removed THIS one by mistake, leaking the
-                    // macro across two converters. It still compiled, which is why only a define/undef audit caught it.
+        MixGemmChunkEmit<2, -1, 1>::emit(reinterpret_cast<uint32_t const*>(&source),
+                                         reinterpret_cast<uint32_t*>(&result));
         return result;
     }
 
@@ -577,92 +655,6 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
 // the assumption the scale-broadcast episode punished. So the per-vreg emission is templated instead.
 // Rebase=false writes at the FULL output index instead of the chunk-local one. That is the bisection mode: chunked
 // EMISSION into the whole fragment, so a mismatch localises to the gating rather than to the small buffer.
-template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
-                                          cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>>
-struct MixGemmInt1Emit {
-  static constexpr int kOut = 128;
-  static constexpr int kPer = kOut / NChunk;
-  static_assert(NChunk >= 1 && kOut % NChunk == 0, "MixGemmInt1Emit: NChunk must divide 128");
-  static_assert(Chunk < NChunk, "MixGemmInt1Emit: Chunk out of range");
-
-  // AGAINST THE MEASURED FRAGMENT LAYOUT, not an assumed compact one. tCrB_mma is
-  //     ((2,2,2), MMA_N, MMA_K) : ((1,2,4), 32, 8)
-  // i.e. MMA_N stride 32 and MMA_K stride 8, so the element index is
-  //     e = val + 32*n_atom + 8*k_atom      hence  e/32 == n_atom, NOT k_atom
-  // An earlier version of this file used e/kPer as the chunk and called it a k-atom. It is an N-atom. The box found
-  // out: MMA_N atom 0 came out correct and atoms 1..3 wrong, because chunk 0 held n_atom 0's (val x k) data while
-  // cute::gemm read the buffer as (val, MMA_N). l32 had "verified" the split -- correctly, but of the wrong model.
-  //
-  // cute::gemm wants B as (val, MMA_N) at a fixed k, so the chunk must be a K-ATOM:
-  //     keep : ((e/8) % NChunk) == Chunk     because e/8 == MMA_K*n_atom + k_atom
-  //     at   : ((e%8) + 8*(e/(8*NChunk))) / 2   == (val + 8*n_atom)/2, the offset in a (val, MMA_N) fragment
-  // Both halves of a pair stay in one chunk: e is even and e+1 only flips val's low bit, so e/8 is unchanged.
-  // at() AND keep() ARE LAYOUT COMPOSITIONS, not hand arithmetic. The previous version wrote
-  //     keep = ((e/8) % kMmaK) == Chunk        at = ((e%8) + 8*(e/(8*kMmaK))) / 2
-  // where /8, %8 and 8*kMmaK were the MEASURED fragment strides typed out by hand -- and getting those strides wrong
-  // (I assumed a compact (8,32) where the fragment is (32,8)) is what produced 'MMA_N atom 0 right, atoms 1-3 wrong'
-  // on the box. As layouts the same maps are, with L_src taken FROM tCrB_mma rather than restated:
-  //     L_src = ((2,2,2), MMA_N, MMA_K) : ((1,2,4), 32, 8)      the fragment's own layout
-  //     L_dst = same shape              : ((1,2,4),  8, 0)      compact in n, stride-0 in k = ONE k-atom
-  //     L_k   = same shape              : ((0,0,0),  0, 1)      which k-atom an element belongs to
-  //     At = composition(L_dst, right_inverse(L_src))   Ka = composition(L_k, right_inverse(L_src))
-  // cute simplifies both symbolically to (8,MMA_N,MMA_K):(1,8,0) and (8,MMA_N,MMA_K):(0,0,1). Verified identical to
-  // the hand arithmetic on all 64 emission lines, and it now FOLLOWS the fragment layout instead of restating it.
-  using AtL = decltype(cute::composition(
-      cute::make_layout(cute::shape(FragLayout{}),
-                        cute::make_stride(cute::stride<0>(FragLayout{}),
-                                          cute::Int<cute::size<0>(FragLayout{})>{}, cute::_0{})),
-      cute::right_inverse(FragLayout{})));
-  using KaL = decltype(cute::composition(
-      cute::make_layout(cute::shape(FragLayout{}),
-                        cute::make_stride(cute::repeat_like(cute::stride<0>(FragLayout{}), cute::_0{}),
-                                          cute::_0{}, cute::_1{})),
-      cute::right_inverse(FragLayout{})));
-
-  static constexpr bool keep(int t, int v) {
-    return Chunk < 0 || int(KaL{}(MixGemmEmit<1>::index(t, v))) == Chunk;
-  }
-  static constexpr int at(int t, int v) {
-    const int e = MixGemmEmit<1>::index(t, v);
-    return (Chunk < 0 || !Rebase) ? e / 2 : int(AtL{}(e)) / 2;
-  }
-  // how many half2 this chunk writes -- the caller's buffer size
-  static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
-  static_assert(cute::size(FragLayout{}) == kOut, "MixGemmInt1Emit: FragLayout must cover all 128 outputs");
-
-  template <int V>
-  CUTLASS_DEVICE static void emit_v(uint32_t reg, uint32_t* h2) {
-    uint32_t r8 = reg >> 8; (void)r8;
-#define _EC(T, SRC, MASK, MUL, ADD)                                                                          \
-    if constexpr (keep(T, V)) { uint32_t _x;                                                                 \
-      asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x) : "r"(SRC), "n"(MASK), "n"(0x64006400u), "n"(0xEAu)); \
-      asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x) : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD))); \
-      h2[at(T, V)] = _x; }
-    _EC( 0, reg, 0x00010001u, 0x3c003c00u, 0xe400e400u)   // b0 pair0
-    _EC( 1, reg, 0x00020002u, 0x38003800u, 0xe000e000u)   // b1 pair1
-    _EC( 2, reg, 0x00040004u, 0x34003400u, 0xdc00dc00u)   // b2 pair2
-    _EC( 3, reg, 0x00080008u, 0x30003000u, 0xd800d800u)   // b3 pair3
-    _EC( 4, reg, 0x00100010u, 0x2c002c00u, 0xd400d400u)   // b4 pair4
-    _EC( 5, reg, 0x00200020u, 0x28002800u, 0xd000d000u)   // b5 pair5
-    _EC( 6, reg, 0x00400040u, 0x24002400u, 0xcc00cc00u)   // b6 pair6
-    _EC( 7, reg, 0x00800080u, 0x20002000u, 0xc800c800u)   // b7 pair7
-    _EC( 8, r8 , 0x00010001u, 0x3c003c00u, 0xe400e400u)   // b0 pair8
-    _EC( 9, r8 , 0x00020002u, 0x38003800u, 0xe000e000u)   // b1 pair9
-    _EC(10, r8 , 0x00040004u, 0x34003400u, 0xdc00dc00u)   // b2 pair10
-    _EC(11, r8 , 0x00080008u, 0x30003000u, 0xd800d800u)   // b3 pair11
-    _EC(12, r8 , 0x00100010u, 0x2c002c00u, 0xd400d400u)   // b4 pair12
-    _EC(13, r8 , 0x00200020u, 0x28002800u, 0xd000d000u)   // b5 pair13
-    _EC(14, r8 , 0x00400040u, 0x24002400u, 0xcc00cc00u)   // b6 pair14
-    _EC(15, r8 , 0x00800080u, 0x20002000u, 0xc800c800u)   // b7 pair15
-#undef _EC
-  }
-
-  CUTLASS_DEVICE static void emit(uint32_t const* s, uint32_t* h2) {
-    emit_v<0>(s[0], h2); emit_v<1>(s[1], h2); emit_v<2>(s[2], h2); emit_v<3>(s[3], h2);
-  }
-};
-
 template <>
 struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 {
@@ -681,8 +673,8 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
         // Delegates to MixGemmInt1Emit<-1,1> so the chunked and unchunked paths cannot drift apart. The
         // emission comment lives on that struct.
         result_type result;
-        MixGemmInt1Emit<-1, 1>::emit(reinterpret_cast<uint32_t const*>(&source),
-                                     reinterpret_cast<uint32_t*>(&result));
+        MixGemmChunkEmit<1, -1, 1>::emit(reinterpret_cast<uint32_t const*>(&source),
+                                         reinterpret_cast<uint32_t*>(&result));
         return result;
     }
 

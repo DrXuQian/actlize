@@ -1276,7 +1276,7 @@ private:
     Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
     // FragL is tCrB_mma's OWN layout, passed in rather than restated: at()/keep() are compositions over it, so a
     // change to the mma atom or the warp tile propagates instead of silently invalidating hand-typed strides.
-    cutlass::MixGemmInt1Emit<Chunk, NChunk, Rebase, FragL>::emit(
+    cutlass::MixGemmChunkEmit<cutlass::sizeof_bits<RealB>::value, Chunk, NChunk, Rebase, FragL>::emit(
         reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in.data())),
         reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data())));
 
