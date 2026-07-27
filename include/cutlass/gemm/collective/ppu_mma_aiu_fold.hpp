@@ -858,6 +858,45 @@ private:
     }
   }
 
+  // The scale/zero register fragment. The scale is k-INVARIANT, so every mma slot that differs only in k wants the
+  // same value -- but the default construction materialises that replication in registers anyway:
+  //
+  //     partition_B(sS(_,_,0))                    ((2,2,2), MMA_N, MMA_K) : ((0,0,8), 32, 0)
+  //     make_fragment_like of it (i.e. today)     ((2,2,2), MMA_N, MMA_K) : ((0,0,1),  8, 2)   <- MMA_K materialised
+  //     this function                             ((2,2,2), MMA_N, MMA_K) : ((0,0,1),  2, 0)
+  //
+  // cute's make_fragment_like preserves stride-0s in MODE 0 ONLY (its own comment says so), which is why the two k
+  // val-bits keep their zeros and MMA_K does not. That one materialised mode is a 4x in scale registers, and it also
+  // enlarges what the copy has to issue: copy(Copy_Atom<...>) auto-filters on nullspace(layout<1>(dst_v)), so a
+  // destination that distinguishes fewer registers is a destination the copy visits fewer times. Nothing else has to
+  // change -- retile_D, the copy call and the elementwise transform are all untouched.
+  //
+  // The naive patch (zero MMA_K in make_fragment_like's output) does NOT work: compact_order follows the REFERENCE
+  // strides and MMA_K's reference stride is 0, so it sorts MMA_K ahead of MMA_N and leaves MMA_N a non-compact 8
+  // (cosize 26 instead of 8). filter_zeros first, so MMA_K is extent 1 during compaction, THEN restore its zero.
+  //
+  // Derived and verified in fold_derivation/l28_scale_bcast.cu: cosize equals the copy's distinct-element count on
+  // every config in the tree, and -- the check that matters -- the equivalence classes this layout induces on mma
+  // slots coincide EXACTLY with the classes induced by n, so no slot can receive another n's scale. Stated as classes
+  // rather than as an index formula on purpose: two earlier attempts failed by guessing filter_zeros' ordering.
+  template <class TiledMma, class STensor>
+  CUTLASS_DEVICE
+  static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS) {
+#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
+    return make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
+#else
+    auto pB0 = thr_mma.partition_B(sS(_,_,Int<0>{}));
+    auto fz  = make_fragment_like(filter_zeros(pB0.layout()));
+    auto bc  = make_layout(pB0.shape(), make_stride(stride<0>(fz), stride<1>(fz), _0{}));
+    // MMA_K must be the mode the scale is invariant along, and mode 0 must have kept its zeros, or the layout above
+    // is not the broadcast it claims to be. Both are checkable right here: cosize is 2*MMA_N exactly when the two k
+    // val-bits are stride 0 and MMA_K is stride 0, and it is what l28 compares against the copy's distinct count.
+    static_assert(cute::is_static<decltype(bc)>::value, "scale broadcast layout must be static");
+    CUTE_STATIC_ASSERT_V(cosize(bc) < size(bc), "scale broadcast: nothing was shared, so no mode was zeroed");
+    return make_tensor<ElementScale>(bc);
+#endif
+  }
+
   /// Utilities for partitioning extra inputs for loading from smem in the mainloop.
   template <class TiledMma>
   CUTLASS_DEVICE
@@ -880,7 +919,7 @@ private:
           make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<smem_scale_k>{})));
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemCopyLayoutScale{});
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
-      Tensor tCrS = make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
+      Tensor tCrS = make_scale_fragment(thr_mma, sS);
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         return cute::make_tuple(tCsS, tCrS);
@@ -888,7 +927,7 @@ private:
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemCopyLayoutScale{});
         Tensor tCsZ = smem_thr_copy_S.partition_S(sZ);
-        Tensor tCrZ = make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sZ(_,_,Int<0>{})));
+        Tensor tCrZ = make_scale_fragment(thr_mma, sZ);
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
       }
       else {
