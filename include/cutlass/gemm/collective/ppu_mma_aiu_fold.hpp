@@ -216,6 +216,19 @@ public:
 
   using RealInternalElementA = cute::conditional_t<!SwapAB, ElementA, ElementB>;
   using RealInternalElementB = cute::conditional_t<!SwapAB, ElementB, ElementA>;
+
+  // PPU_B_CHUNK is int1-ONLY, and the box found out the hard way: transform_B_atom calls MixGemmInt1Emit
+  // unconditionally, so with the flag on it was instantiated for uint2b_t too and 576 errors followed. The gate is a
+  // constexpr bool rather than #if so BOTH branches type-check for every width and only one is instantiated.
+  //
+  // int1 is also the only width that needs it: chunks = k-atoms per copy step = slots/delivery, which is 4 for int1,
+  // 2 for int2 and 1 for int4 -- int4 has nothing to chunk, and its B fragment is already only 16 registers.
+  static constexpr bool kBChunk =
+#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
+      (cutlass::sizeof_bits<RealInternalElementB>::value == 1);
+#else
+      false;
+#endif
   using InternalStrideA  = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using InternalStrideB  = cute::conditional_t<!SwapAB, StrideB, StrideA>;
 
@@ -667,15 +680,12 @@ public:
       cute::print("\n");
     }
 #endif
-#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
-    // One k-atom of converted B, reused across atoms, instead of tCrB_mma's MMA_K atoms held simultaneously.
-    // 4*MMA_N*MMA_K registers -> 4*MMA_N. Assumptions asserted rather than assumed:
-    // Only the emitter's own constraint remains: the 128 outputs must split evenly into NChunk chunks. CPY_K is not
-    // constrained -- tCrB_load has a slot per copy step, so a deferred conversion reads its own step.
-    static_assert(128 % decltype(K_ATOM_PER_COPY)::value == 0,
+    // One k-atom of converted B, reused across atoms, instead of tCrB_mma's MMA_K atoms held simultaneously:
+    // 4*MMA_N*MMA_K registers -> 4*MMA_N. Declared unconditionally and dead-code-eliminated when kBChunk is false,
+    // because the for_each lambda below captures it by reference.
+    static_assert(!kBChunk || (128 % decltype(K_ATOM_PER_COPY)::value == 0),
         "PPU_B_CHUNK: the delivery's 128 outputs must split evenly into K_ATOM_PER_COPY chunks");
     Tensor tCrB_one = make_fragment_like(tCrB_mma(_,_,Int<0>{}));
-#endif
 
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
@@ -686,10 +696,10 @@ public:
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
-#if !defined(PPU_B_CHUNK) || (PPU_B_CHUNK == 0)
+if constexpr (!kBChunk) {
       transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
-#endif
+      }
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -716,10 +726,10 @@ public:
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-#if !defined(PPU_B_CHUNK) || (PPU_B_CHUNK == 0)
+if constexpr (!kBChunk) {
         transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
-#endif
+      }
 
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
@@ -744,27 +754,27 @@ public:
         // N-FOLD: IDENTICAL to the unfolded mainloop. The fold lives only in the load layer -- gmem/smem are
         // (N/FoldF) x (FoldF*K) to satisfy the AIU 32B contiguous minimum, and the swzl ldmatrix already delivers the
         // fragment with ordinary N x K register semantics (same as int4). So no fold-specific compute code at all.
-#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
-        // for_each, not a for loop: the chunk must be a TEMPLATE argument so the emission gate stays compile-time.
-        for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
-          constexpr int kChunk = decltype(k_loop)::value;
-          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-          transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value>(
-              tCrB_copy_view, tCrB_one, partitioned_extra_info, k_block, atom_idx,
-              copy_partitions_extra_info, smem_pipe_read);
-          cute::transform(tCrA(_,_,atom_idx), TransformA{});
-          cute::transform(tCrB_one, TransformB{});
-          cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_one, accum);
-        });
-#else
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-          cute::transform(tCrA(_,_,atom_idx), TransformA{});
-          cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
-          cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
+        if constexpr (kBChunk) {
+          // for_each, not a for loop: the chunk must be a TEMPLATE argument so the emission gate stays compile-time.
+          for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
+            constexpr int kChunk = decltype(k_loop)::value;
+            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+            transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value>(
+                tCrB_copy_view, tCrB_one, partitioned_extra_info, k_block, atom_idx,
+                copy_partitions_extra_info, smem_pipe_read);
+            cute::transform(tCrA(_,_,atom_idx), TransformA{});
+            cute::transform(tCrB_one, TransformB{});
+            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_one, accum);
+          });
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
+            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+            cute::transform(tCrA(_,_,atom_idx), TransformA{});
+            cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
+            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
+          }
         }
-#endif
       });
 
     }
@@ -1236,15 +1246,23 @@ private:
     // For the record, CPY_K is DERIVABLE rather than assumption: it is slots/delivery in fp16 units, so at
     // WN=64/TK=64 it is 1 for int1 (delivery 128 == slots 128), 2 for int2 and 4 for int4. NChunk is therefore the
     // atoms per copy step, passed in rather than hardcoded.
+    // raw_pointer_cast FIRST. tCrB_load is a SUBBYTE tensor, so .data() is a cute::subbyte_iterator and
+    // reinterpret_cast from that class type to uint32_t const* is ill-formed -- which is exactly how the box build
+    // failed. convert_tensor already had the right idiom a few lines below: raw_pointer_cast(t.data()) then cast.
     Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
-    cutlass::MixGemmInt1Emit<Chunk, NChunk>::emit(reinterpret_cast<uint32_t const*>(cvt_in.data()),
-                                                 reinterpret_cast<uint32_t*>(tCrB_one.data()));
+    cutlass::MixGemmInt1Emit<Chunk, NChunk>::emit(
+        reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in.data())),
+        reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data())));
 
     // Scale/zero, same rule as transform_B_kblock's FINE branch but for this one atom. APG_ = mma atoms per scale
     // group; reload at a group's first atom.
     if constexpr (ModeHasScales) {
-      constexpr int MMA_KA_ = NChunk;                                   // atoms per copy step
-      constexpr bool FINE   = (int(Scale_TileK) > 1);
+      // Same formula as transform_B_kblock, not a simplification of it. FINE there is Scale_TileK > K_BLOCK_MAX, and
+      // K_BLOCK_MAX == size<2>(tCrB_load) -- writing "> 1" would only be accidentally right because chunking is
+      // int1-only and int1's K_BLOCK_MAX happens to be 1.
+      constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;  // copy steps per k-tile
+      constexpr int MMA_KA_ = NChunk * KBM_;                              // total mma-K atoms in the tile
+      constexpr bool FINE   = (int(Scale_TileK) > KBM_);
       constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;
       auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
       auto tCsS              = cute::get<0>(partitioned_extra_info);
