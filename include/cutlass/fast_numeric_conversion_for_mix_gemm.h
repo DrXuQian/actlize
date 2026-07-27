@@ -41,6 +41,9 @@
 #include "cutlass/array.h"
 #include "cutlass/half.h"
 #include "cutlass/numeric_types.h"
+// MixGemmEmit is a cute Layout now (it was a closed-form loop), so the algebra has to be available here.
+#include "cute/layout.hpp"
+#include <utility>
 
 namespace cutlass
 {
@@ -87,14 +90,34 @@ struct MixGemmEmit {
   static constexpr int kNumCodeBits  = (Bits == 1) ? 5 : (Bits == 2) ? 4 : (Bits == 4) ? 3 : 0;
   static_assert(kNumCodeBits != 0, "MixGemmEmit: only 1/2/4-bit codes");
 
+  // THIS IS A cute LAYOUT, not a closed-form loop. It used to be the loop; the formula is a sum of per-bit weights,
+  // which is precisely what a Layout is, and expressing it as one lets it COMPOSE with the other layouts in the
+  // chain (pi = right_inverse(frag.layout()), LogicalTV, partition_B) instead of being a function every consumer has
+  // to call specially. Verified equal to the loop for all three widths in
+  // fold_derivation/l30_should_have_been_cute.cu.
+  //
+  //   shape  ((2, ..., 2), (2, 2))          nb code bits, then the 2 vreg bits
+  //   stride ((2, 8, 16, ..., 1), (2*CPW, 4))
+  //          code bit 0 -> 2 ; bit i in [1, nb-2] -> 4<<i ; bit nb-1 -> 1 (the half2 lo/hi selector)
+  //
+  // The 1-D DOMAIN IS `code + kCodesPerVreg * vreg` on purpose: cute decomposes an integer coordinate
+  // colexicographically through the nested shape, and our modes are exactly code's bits low-to-high followed by
+  // vreg's, so a flat index needs no manual splitting and index()'s signature is unchanged.
+  template <int I>
+  using CodeStride = cute::Int<(I == kNumCodeBits - 1) ? 1 : (I == 0 ? 2 : (4 << I))>;
+
+  template <std::size_t... I>
+  static constexpr auto make_emit_layout(std::index_sequence<I...>) {
+    return cute::make_layout(
+        cute::make_shape (cute::make_shape((void(I), cute::_2{})...), cute::make_shape(cute::_2{}, cute::_2{})),
+        cute::make_stride(cute::make_stride(CodeStride<int(I)>{}...),
+                          cute::make_stride(cute::Int<2 * kCodesPerVreg>{}, cute::_4{})));
+  }
+  using EmitLayout = decltype(make_emit_layout(std::make_index_sequence<kNumCodeBits>{}));
+
   // (code within a vreg, vreg) -> fp16 element index within the converter's 4*kCodesPerVreg outputs
   static constexpr int index(int code, int vreg) {
-    int e = ((code >> (kNumCodeBits - 1)) & 1)                  // the half2 lo/hi bit -> weight 1
-          + (2 * kCodesPerVreg) * (vreg & 1)                    // vreg low  bit -> top weight
-          + 4 * (vreg >> 1);                                    // vreg high bit -> weight 4
-    for (int i = 0; i < kNumCodeBits - 1; ++i)
-      e += ((code >> i) & 1) * (i == 0 ? 2 : (4 << i));         // 2, 8, 16, 32, ...
-    return e;
+    return int(EmitLayout{}(code + kCodesPerVreg * vreg));
   }
   static constexpr int kNumOutputs = 4 * kCodesPerVreg;
 
