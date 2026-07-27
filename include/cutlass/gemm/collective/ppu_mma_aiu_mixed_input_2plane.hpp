@@ -647,6 +647,35 @@ public:
                          / decltype(cute::size<2>(tCrB2_copy_view))::value;
     static_assert(P2_DIV >= 1, "plane 2's CPY_K must not exceed plane 1's");
 
+    // PPU_MMA_PROBE=1: the same "let the kernel report its own indices" probe the fold collective has, plus the two
+    // LAYOUTS -- because chunking B here needs to know what the emission's index space actually is, and a local cute
+    // stub cannot answer it. This collective's tiled_mma carries PermutationM/N from the builder and its B fragment is
+    // loaded through an int8 m16n16k32 atom (NOT the fp16 k16 one), so neither the fragment's mode order nor CPY_K can
+    // be reproduced offline. What a stub CAN establish, and did (fold_derivation/l39_2plane_frag.cu): every fold-path
+    // config has MMA_N == MMA_K == 4, so 8*MMA_K and 8*MMA_N coincide there and no fold measurement distinguishes
+    // k-inner from k-outer. At TK=256, MMA_N=2 and MMA_K=16 -- they differ by 8x. Print it instead of assuming it.
+#if defined(PPU_MMA_PROBE) && (PPU_MMA_PROBE != 0)
+    if (thread0()) {
+      cute::print("[2plane probe] K_BLOCK_MAX(CPY_K)="); cute::print(K_BLOCK_MAX);
+      cute::print("  K_ATOM_PER_COPY="); cute::print(K_ATOM_PER_COPY);
+      cute::print("  P2_DIV="); cute::print(P2_DIV);
+      cute::print("  Scale_TileK="); cute::print(int(Scale_TileK));
+      cute::print("\n  tCrB_mma      : "); cute::print(tCrB_mma.layout());
+      cute::print("\n  tCrB_load     : "); cute::print(tCrB_load.layout());
+      cute::print("\n  tCrB_copy_view: "); cute::print(tCrB_copy_view.layout());
+      cute::print("\n  tCrB2_load    : "); cute::print(tCrB2_load.layout());
+      // The emission index space: cvt_in's layout is what the converter's flat output pointer walks, and cvt_out
+      // aliases tCrB_mma's registers THROUGH it. If cvt_in's mode-1 stride != tCrB_mma's MMA_N stride, a chunk gate
+      // built on tCrB_mma's layout is built on the wrong space.
+      cute::print("\n  cvt_in(=recast<B>(tCrB_load(_,_,0))): ");
+      cute::print(recast<RealInternalElementB>(tCrB_load(_, _, 0)).layout());
+      cute::print("\n  MMA_N stride of tCrB_mma="); cute::print(stride<1>(tCrB_mma.layout()));
+      cute::print("  8*MMA_K="); cute::print(8 * int(size<2>(tCrB_mma)));
+      cute::print("  8*MMA_N="); cute::print(8 * int(size<1>(tCrB_mma)));
+      cute::print("\n");
+    }
+#endif
+
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
