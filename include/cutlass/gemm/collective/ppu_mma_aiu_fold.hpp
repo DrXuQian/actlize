@@ -670,10 +670,10 @@ public:
 #if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
     // One k-atom of converted B, reused across atoms, instead of tCrB_mma's MMA_K atoms held simultaneously.
     // 4*MMA_N*MMA_K registers -> 4*MMA_N. Assumptions asserted rather than assumed:
-    static_assert(decltype(K_ATOM_PER_COPY)::value == 4,
-        "PPU_B_CHUNK is derived for 4 mma-K atoms per delivery (the int1 TK=64 WN=64 target)");
-    CUTE_STATIC_ASSERT_V(K_BLOCK_MAX == Int<1>{},
-        "PPU_B_CHUNK assumes one copy step per k-tile, so copy->convert->mma all sit in one k_block");
+    // Only the emitter's own constraint remains: the 128 outputs must split evenly into NChunk chunks. CPY_K is not
+    // constrained -- tCrB_load has a slot per copy step, so a deferred conversion reads its own step.
+    static_assert(128 % decltype(K_ATOM_PER_COPY)::value == 0,
+        "PPU_B_CHUNK: the delivery's 128 outputs must split evenly into K_ATOM_PER_COPY chunks");
     Tensor tCrB_one = make_fragment_like(tCrB_mma(_,_,Int<0>{}));
 #endif
 
@@ -749,8 +749,9 @@ public:
         for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
           constexpr int kChunk = decltype(k_loop)::value;
           auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-          transform_B_atom<RealInternalElementB, kChunk>(tCrB_copy_view, tCrB_one, partitioned_extra_info,
-              atom_idx, int(K_ATOM_PER_COPY), copy_partitions_extra_info, smem_pipe_read);
+          transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value>(
+              tCrB_copy_view, tCrB_one, partitioned_extra_info, k_block, atom_idx,
+              copy_partitions_extra_info, smem_pipe_read);
           cute::transform(tCrA(_,_,atom_idx), TransformA{});
           cute::transform(tCrB_one, TransformB{});
           cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_one, accum);
@@ -1215,32 +1216,34 @@ private:
   // compile-time predicate (verified static for all widths in l32_chunk_predicate.cu), and a runtime `if` would make
   // the register saving depend on the compiler folding branches -- the assumption the scale-broadcast episode
   // punished.
-  template <class RealB, int Chunk, class TCrB_load, class TCrB_one, class... Ts, class CopyViews>
+  template <class RealB, int Chunk, int NChunk, class TCrB_load, class TCrB_one, class... Ts, class CopyViews>
   CUTLASS_DEVICE
   void transform_B_atom(
     TCrB_load const& tCrB_load,
     TCrB_one& tCrB_one,
     cute::tuple<Ts...> const& partitioned_extra_info,
+    int const k_block,
     int const atom_idx,
-    int const mma_k_atoms,
     CopyViews const& tiled_copy_and_views,
     int const read_stage) {
 
-    // The whole delivery arrives in ONE copy step, so there is no cross-iteration hazard between the copy and a
-    // deferred conversion, and no B prefetch overlap to lose. If a future atom/tile makes CPY_K > 1 this assert fires
-    // rather than silently converting the wrong step's codes.
-    CUTE_STATIC_ASSERT_V(cute::size<2>(tCrB_load) == cute::Int<1>{},
-        "PPU_B_CHUNK assumes one copy step per k-tile (CPY_K == 1); with more, tCrB_load must be double-buffered");
-
-    Tensor cvt_in = recast<RealB>(tCrB_load(_, _, Int<0>{}));
-    Tensor cvt_out = make_tensor(tCrB_one.data(), make_layout(make_shape(Int<MixGemmInt1Emit<Chunk, 4>::kHalf2 * 2>{})));
-    cutlass::MixGemmInt1Emit<Chunk, 4>::emit(reinterpret_cast<uint32_t const*>(cvt_in.data()),
-                                             reinterpret_cast<uint32_t*>(tCrB_one.data()));
+    // NO CROSS-ITERATION HAZARD, and no dependence on CPY_K. tCrB_load has ONE SLOT PER COPY STEP -- the copy writes
+    // tCrB_copy_view(_,_,k_block_next) while this reads (_,_,k_block) -- so deferring the conversion into the mma loop
+    // cannot see overwritten codes. An earlier version hardcoded Int<0> here and then asserted CPY_K == 1 to protect
+    // its own shortcut, which made a limitation of the implementation look like a property of the design. It is not:
+    // "convert inside the loop instead of all at once" works for any K_BLOCK_MAX.
+    //
+    // For the record, CPY_K is DERIVABLE rather than assumption: it is slots/delivery in fp16 units, so at
+    // WN=64/TK=64 it is 1 for int1 (delivery 128 == slots 128), 2 for int2 and 4 for int4. NChunk is therefore the
+    // atoms per copy step, passed in rather than hardcoded.
+    Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
+    cutlass::MixGemmInt1Emit<Chunk, NChunk>::emit(reinterpret_cast<uint32_t const*>(cvt_in.data()),
+                                                 reinterpret_cast<uint32_t*>(tCrB_one.data()));
 
     // Scale/zero, same rule as transform_B_kblock's FINE branch but for this one atom. APG_ = mma atoms per scale
     // group; reload at a group's first atom.
     if constexpr (ModeHasScales) {
-      constexpr int MMA_KA_ = 4;                                        // atoms per delivery at the target shape
+      constexpr int MMA_KA_ = NChunk;                                   // atoms per copy step
       constexpr bool FINE   = (int(Scale_TileK) > 1);
       constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;
       auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
@@ -1261,7 +1264,6 @@ private:
         cute::transform(tCrB_one, cute::get<3>(partitioned_extra_info)(_,_,0), tCrB_one, cute::plus{});
       }
     }
-    (void)mma_k_atoms;
   }
 
   /// Utilities for transforming the A operand prior to issuing tensor cell math.
