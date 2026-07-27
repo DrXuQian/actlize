@@ -533,7 +533,8 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
           _E(h2[MixGemmEmit<2>::index(6, v) / 2], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u);  // pair6 (c12,c13)
           _E(h2[MixGemmEmit<2>::index(7, v) / 2], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u);  // pair7 (c14,c15)
         }
-        #undef _E
+        #undef _E   // restored: an edit to the int1 converter below had removed THIS one by mistake, leaking the
+                    // macro across two converters. It still compiled, which is why only a define/undef audit caught it.
         return result;
     }
 
@@ -550,6 +551,80 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
 // converter, scaled 2x (int1 packs 32 values/vreg vs int2's 16): src0,src1 = low-N, src2,src3 = high-N; 16 atoms,
 // atom a (g=a/8, j=a%8): frag[8a+0..3] <- bits 4j..4j+3 of vreg g (low-N), frag[8a+4..7] <- vreg g+2 (high-N).
 // MUST verify with test_w1a16_diag; if the permutation differs, re-derive with the controlled-input probe.
+// ================== W1A16 emission, CHUNK-AWARE. One source of truth for chunked and unchunked. ==================
+//
+// WHY. One swzl delivery is a fixed 16 B, so it carries 16/Bits mma atom-slots of B -- 16 for int1 against int4's 4.
+// That is simultaneously int1's advantage (one read feeds 4x the mma; the width-isolation run measured 49.9 / 48.1 /
+// 45.9 for int1 / int2 / int4 at one shared config, monotone in bits) and its handicap: the fp16 fragment must hold a
+// whole delivery, so MMA_N*MMA_K >= 16/Bits and B_regs = 4*MMA_N*MMA_K >= 64 for int1. Those 64 registers are what
+// push the best int1 config from 164 to over the power-of-two billing boundary, costing half the occupancy
+// (warps/CU 32 -> 16). Chunking DECOUPLES "how many atom-slots the delivery covers" from "how many are fp16 at
+// once": all 16 are still converted and used, in NChunk batches, so B drops to 64/NChunk with no wasted delivery and
+// no change to the mma count or total converter work. Only the emission ORDER changes.
+//
+// THE GATE IS COMPILE-TIME, which is the whole reason MixGemmEmit had to become the emission source first (l29):
+// against the old hand-written offset table there would be nothing to gate on. tCrB_mma is compact
+// (8, MMA_N, MMA_K), so k-atom a owns the contiguous range [kPer*a, kPer*(a+1)), and from MixGemmEmit<1>
+//     e = bit4 + 2*b0 + 8*b1 + 16*b2 + 32*bit3 + 64*(v&1) + 4*(v>>1)
+// every term except 32*bit3 and 64*(v&1) is below 32, so at kPer=32 the chunk is exactly
+//     e / 32 == bit3(code) + 2*(vreg & 1)
+// a STATIC function of (code, vreg). Verified for all three widths and MMA_N in 4/2, with the pairs splitting exactly
+// evenly, in fold_derivation/l32_chunk_predicate.cu.
+//
+// V IS A TEMPLATE PARAMETER, not a loop variable. The first attempt at this kept `for (int v = 0; v < 4; ++v)` and
+// gated with `if constexpr`, which cannot depend on a runtime variable. Relying on a plain `if` plus unrolling and
+// dead-code elimination would have made the register saving depend on the compiler folding the branches -- exactly
+// the assumption the scale-broadcast episode punished. So the per-vreg emission is templated instead.
+template <int Chunk = -1, int NChunk = 1>
+struct MixGemmInt1Emit {
+  static constexpr int kOut = 128;
+  static constexpr int kPer = kOut / NChunk;
+  static_assert(NChunk >= 1 && kOut % NChunk == 0, "MixGemmInt1Emit: NChunk must divide 128");
+  static_assert(Chunk < NChunk, "MixGemmInt1Emit: Chunk out of range");
+
+  static constexpr bool keep(int t, int v) {
+    return Chunk < 0 || (MixGemmEmit<1>::index(t, v) / kPer) == Chunk;
+  }
+  // h2 index, rebased into this chunk's own buffer when chunking
+  static constexpr int at(int t, int v) {
+    const int e = MixGemmEmit<1>::index(t, v);
+    return (Chunk < 0 ? e : (e % kPer)) / 2;
+  }
+  // how many half2 this chunk writes -- the caller's buffer size
+  static constexpr int kHalf2 = (Chunk < 0 ? kOut : kPer) / 2;
+
+  template <int V>
+  CUTLASS_DEVICE static void emit_v(uint32_t reg, uint32_t* h2) {
+    uint32_t r8 = reg >> 8; (void)r8;
+#define _EC(T, SRC, MASK, MUL, ADD)                                                                          \
+    if constexpr (keep(T, V)) { uint32_t _x;                                                                 \
+      asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x) : "r"(SRC), "n"(MASK), "n"(0x64006400u), "n"(0xEAu)); \
+      asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x) : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD))); \
+      h2[at(T, V)] = _x; }
+    _EC( 0, reg, 0x00010001u, 0x3c003c00u, 0xe400e400u)   // b0 pair0
+    _EC( 1, reg, 0x00020002u, 0x38003800u, 0xe000e000u)   // b1 pair1
+    _EC( 2, reg, 0x00040004u, 0x34003400u, 0xdc00dc00u)   // b2 pair2
+    _EC( 3, reg, 0x00080008u, 0x30003000u, 0xd800d800u)   // b3 pair3
+    _EC( 4, reg, 0x00100010u, 0x2c002c00u, 0xd400d400u)   // b4 pair4
+    _EC( 5, reg, 0x00200020u, 0x28002800u, 0xd000d000u)   // b5 pair5
+    _EC( 6, reg, 0x00400040u, 0x24002400u, 0xcc00cc00u)   // b6 pair6
+    _EC( 7, reg, 0x00800080u, 0x20002000u, 0xc800c800u)   // b7 pair7
+    _EC( 8, r8 , 0x00010001u, 0x3c003c00u, 0xe400e400u)   // b0 pair8
+    _EC( 9, r8 , 0x00020002u, 0x38003800u, 0xe000e000u)   // b1 pair9
+    _EC(10, r8 , 0x00040004u, 0x34003400u, 0xdc00dc00u)   // b2 pair10
+    _EC(11, r8 , 0x00080008u, 0x30003000u, 0xd800d800u)   // b3 pair11
+    _EC(12, r8 , 0x00100010u, 0x2c002c00u, 0xd400d400u)   // b4 pair12
+    _EC(13, r8 , 0x00200020u, 0x28002800u, 0xd000d000u)   // b5 pair13
+    _EC(14, r8 , 0x00400040u, 0x24002400u, 0xcc00cc00u)   // b6 pair14
+    _EC(15, r8 , 0x00800080u, 0x20002000u, 0xc800c800u)   // b7 pair15
+#undef _EC
+  }
+
+  CUTLASS_DEVICE static void emit(uint32_t const* s, uint32_t* h2) {
+    emit_v<0>(s[0], h2); emit_v<1>(s[1], h2); emit_v<2>(s[2], h2); emit_v<3>(s[3], h2);
+  }
+};
+
 template <>
 struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 {
@@ -565,44 +640,11 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
         // b=0..7, x2 levels (reg / reg>>8); bit lands at fp16 mantissa bit b -> value=1024+2^b*bit, undone by
         // fma(2^-b, -2^(10-b)). N-half placement = validated Stage-1: base = 32*(v&1) + 2*(v>=2); pair t -> h2[base
         // + {0,1,4,5,8,9,12,13}[t%8] + 16*(t>=8)].
+        // Delegates to MixGemmInt1Emit<-1,1> so the chunked and unchunked paths cannot drift apart. The
+        // emission comment lives on that struct.
         result_type result;
-        uint32_t const* s  = reinterpret_cast<uint32_t const*>(&source);   // 4 swzl vregs, 32 bits each
-        uint32_t*       h2 = reinterpret_cast<uint32_t*>(&result);         // 64 half2 (uint32 view)
-        #define _E(dst, src, MASK, MUL, ADD) do {                                                        \
-            uint32_t _x;                                                                                 \
-            asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x) : "r"(src), "n"(MASK), "n"(0x64006400u), "n"(0xEAu)); \
-            asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x) : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD))); \
-            (dst) = _x; } while (0)
-        CUTLASS_PRAGMA_UNROLL
-        for (int v = 0; v < 4; ++v) {
-          uint32_t reg = s[v], r8 = reg >> 8;
-          // N-GROUP ROUTING, bases {0,32,2,34}. Do NOT read this as "the converter can only reach 2 N-groups, so
-          // a 4-way variant would unlock the F=4 fold" -- that theory was tested and is FALSE. The fold factor is
-          // capped at 2 by the swzl delivery grid, not by anything here; see fold_traits.hpp for the derivation
-          // (scratchpad/leg1_runword.cpp + leg2_frag.cu). The short version: the two extra columns of an F=4 run
-          // are delivered to DIFFERENT LANES, and a converter only relabels registers inside one thread.
-          // Derived: MixGemmEmit<1>::index(t, v)/2 equals base + {0,1,4,5,8,9,12,13}[t%8] + 16*(t>=8).
-          // NOTE the comment ABOVE this struct describes the STAGE-1 magic-OR implementation, not this one --
-          // encoding it instead of this code cost 120/128 mismatches on l29's first run.
-          //         dst              src  MASK          MUL(2^-b)     ADD(-2^(10-b))   b : mantissa bit, K=2^b
-          _E(h2[MixGemmEmit<1>::index(0, v) / 2], reg, 0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair0
-          _E(h2[MixGemmEmit<1>::index(1, v) / 2], reg, 0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair1
-          _E(h2[MixGemmEmit<1>::index(2, v) / 2], reg, 0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair2
-          _E(h2[MixGemmEmit<1>::index(3, v) / 2], reg, 0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair3
-          _E(h2[MixGemmEmit<1>::index(4, v) / 2], reg, 0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair4
-          _E(h2[MixGemmEmit<1>::index(5, v) / 2], reg, 0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair5
-          _E(h2[MixGemmEmit<1>::index(6, v) / 2], reg, 0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair6
-          _E(h2[MixGemmEmit<1>::index(7, v) / 2], reg, 0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair7
-          _E(h2[MixGemmEmit<1>::index(8, v) / 2], r8,  0x00010001u, 0x3c003c00u, 0xe400e400u); // b0 pair8
-          _E(h2[MixGemmEmit<1>::index(9, v) / 2], r8,  0x00020002u, 0x38003800u, 0xe000e000u); // b1 pair9
-          _E(h2[MixGemmEmit<1>::index(10, v) / 2], r8,  0x00040004u, 0x34003400u, 0xdc00dc00u); // b2 pair10
-          _E(h2[MixGemmEmit<1>::index(11, v) / 2], r8,  0x00080008u, 0x30003000u, 0xd800d800u); // b3 pair11
-          _E(h2[MixGemmEmit<1>::index(12, v) / 2], r8,  0x00100010u, 0x2c002c00u, 0xd400d400u); // b4 pair12
-          _E(h2[MixGemmEmit<1>::index(13, v) / 2], r8,  0x00200020u, 0x28002800u, 0xd000d000u); // b5 pair13
-          _E(h2[MixGemmEmit<1>::index(14, v) / 2], r8,  0x00400040u, 0x24002400u, 0xcc00cc00u); // b6 pair14
-          _E(h2[MixGemmEmit<1>::index(15, v) / 2], r8,  0x00800080u, 0x20002000u, 0xc800c800u); // b7 pair15
-        }
-        #undef _E
+        MixGemmInt1Emit<-1, 1>::emit(reinterpret_cast<uint32_t const*>(&source),
+                                     reinterpret_cast<uint32_t*>(&result));
         return result;
     }
 
