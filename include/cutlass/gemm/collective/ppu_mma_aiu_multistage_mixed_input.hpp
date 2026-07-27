@@ -759,61 +759,40 @@ private:
     }
   }
 
+  // ONE entry point for the scale/zero register fragment, shared by all three collectives so the construction cannot
+  // drift between them. The body is the plain cute idiom, deliberately.
+  //
+  // AN EARLIER VERSION OF THIS FUNCTION HAND-ASSEMBLED A STRIDE-0 "BROADCAST" LAYOUT here, on the theory that the
+  // fragment materialised a 4x replication of each scale (32 half slots holding 8 distinct values). acu says that is
+  // a NO-OP: the slots are register-resident, the loop is fully unrolled and the equalities are provable, so the
+  // compiler had already coalesced them -- and it had CSE'd the copy's filtered iterations down to the 8 distinct
+  // addresses too. Measured registers were IDENTICAL either way (and 186 against estimates of 176/164, i.e. above
+  // both, so the fragment is buried under address arithmetic anyway).
+  //
+  // It was reverted for a second reason that outlives the measurement: that version replaced a one-line cute idiom
+  // with a hand-built stride tuple that hardcoded "mode 2 is MMA_K" by position. Less cute-native, rank-fragile, and
+  // it bought nothing. A cute layout describes what the PROGRAM asks for; whether the hardware does it is a codegen
+  // question, and for register-resident provably-equal values the compiler wins first. Check that a cute-level
+  // redundancy survives to the ISA before trading idiom for it.
   template <class TiledMma, class STensor>
   CUTLASS_DEVICE
   static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS) {
-    return make_tensor<ElementScale>(scale_fragment_layout(thr_mma, sS));
+    return make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
   }
 
-  // The layout, split out of make_scale_fragment so it is HOST-callable and can be witnessed at compile time (see
-  // kScaleFragCosize below). make_scale_fragment is CUTLASS_DEVICE, so it cannot appear even in an unevaluated
-  // context from host code.
+  // The same layout, HOST-callable, for the compile-time witness below (make_scale_fragment is CUTLASS_DEVICE and
+  // cannot appear even unevaluated in a host constexpr context). make_fragment_like<T>(t) is
+  // make_tensor<T>(make_layout_like(t.layout())), so these two stay in step by construction.
   template <class TiledMma, class STensor>
   CUTE_HOST_DEVICE static constexpr auto scale_fragment_layout(TiledMma const& thr_mma, STensor const& sS) {
-#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
-    return make_layout_like(thr_mma.partition_B(sS(_,_,Int<0>{})).layout());   // the MATERIALISED fragment
-#else
-    auto pB0 = thr_mma.partition_B(sS(_,_,Int<0>{}));
-    auto fz  = make_fragment_like(filter_zeros(pB0.layout()));
-    auto bc  = make_layout(pB0.shape(), make_stride(stride<0>(fz), stride<1>(fz), _0{}));
-    // MMA_K must be the mode the scale is invariant along, and mode 0 must have kept its zeros, or the layout above
-    // is not the broadcast it claims to be. Both are checkable right here: cosize is 2*MMA_N exactly when the two k
-    // val-bits are stride 0 and MMA_K is stride 0, and it is what l28 compares against the copy's distinct count.
-    static_assert(cute::is_static<decltype(bc)>::value, "scale broadcast layout must be static");
-    CUTE_STATIC_ASSERT_V(cosize(bc) < size(bc), "scale broadcast: nothing was shared, so no mode was zeroed");
-    return bc;
-#endif
+    return make_layout_like(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})).layout());
   }
 
-  // A COMPILE-TIME WITNESS that THIS collective is what got compiled, and which path it took.
-  //
-  // WHY IT EXISTS. "Every acu counter is identical" in an A/B is ambiguous three ways: the change is inert, or the
-  // box never rebuilt (stale actlize submodule), or the define never reached the device compile. The first two are
-  // invisible in any runtime log, and the second is the likeliest -- the submodule gitlink moves with Kernels but
-  // `git submodule update` is a separate step. If the submodule is stale these members DO NOT EXIST and the harness
-  // FAILS TO COMPILE, which is the one signal that cannot be missed or misread.
-  //
-  // kScaleFragCosize is the number that actually matters: 8 (or 4) for the broadcast against 32 (or 16) for the
-  // materialised fragment, at the shapes in the tree. If an A/B prints the same cosize twice, the two builds really
-  // are the same build.
-  static constexpr bool kScaleBroadcast =
-#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
-      false;
-#else
-      true;
-#endif
+  // Kept from the reverted work because it has independent value: it is what let a STALE submodule be distinguished
+  // from an inert change. cosize is the scale fragment's real register footprint in halves.
   static constexpr int scale_frag_cosize() {
     if constexpr (ModeHasScales) {
       return cute::cosize_v<decltype(scale_fragment_layout(
-          TiledMma{}.get_thread_slice(0),
-          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})))>;
-    } else {
-      return 0;
-    }
-  }
-  static constexpr int scale_frag_size() {
-    if constexpr (ModeHasScales) {
-      return cute::size_v<decltype(scale_fragment_layout(
           TiledMma{}.get_thread_slice(0),
           make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})))>;
     } else {
