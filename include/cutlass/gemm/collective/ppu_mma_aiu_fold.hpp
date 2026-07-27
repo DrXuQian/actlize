@@ -54,6 +54,15 @@
 
 #pragma once
 
+// VERSION GATE for the scale-fragment API. A harness static_asserts on this, so a STALE actlize submodule on the box
+// fails to COMPILE instead of silently producing a binary identical to the previous one -- which is exactly the
+// ambiguity that made an "every acu counter is identical" A/B uninterpretable. Bump it whenever the scale-fragment
+// construction changes in a way a measurement is supposed to see.
+//   1 = materialised fragment (make_fragment_like of partition_fragment_B)
+//   2 = stride-0 broadcast, shared by fold / multistage / 2plane, with kScaleBroadcast + scale_frag_cosize()
+#define PPU_SCALE_FRAGMENT_API 2
+
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
