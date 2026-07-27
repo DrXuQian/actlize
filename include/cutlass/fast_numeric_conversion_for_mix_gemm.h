@@ -575,7 +575,9 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
 // gated with `if constexpr`, which cannot depend on a runtime variable. Relying on a plain `if` plus unrolling and
 // dead-code elimination would have made the register saving depend on the compiler folding the branches -- exactly
 // the assumption the scale-broadcast episode punished. So the per-vreg emission is templated instead.
-template <int Chunk = -1, int NChunk = 1>
+// Rebase=false writes at the FULL output index instead of the chunk-local one. That is the bisection mode: chunked
+// EMISSION into the whole fragment, so a mismatch localises to the gating rather than to the small buffer.
+template <int Chunk = -1, int NChunk = 1, bool Rebase = true>
 struct MixGemmInt1Emit {
   static constexpr int kOut = 128;
   static constexpr int kPer = kOut / NChunk;
@@ -588,10 +590,10 @@ struct MixGemmInt1Emit {
   // h2 index, rebased into this chunk's own buffer when chunking
   static constexpr int at(int t, int v) {
     const int e = MixGemmEmit<1>::index(t, v);
-    return (Chunk < 0 ? e : (e % kPer)) / 2;
+    return (Chunk < 0 || !Rebase ? e : (e % kPer)) / 2;
   }
   // how many half2 this chunk writes -- the caller's buffer size
-  static constexpr int kHalf2 = (Chunk < 0 ? kOut : kPer) / 2;
+  static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
 
   template <int V>
   CUTLASS_DEVICE static void emit_v(uint32_t reg, uint32_t* h2) {

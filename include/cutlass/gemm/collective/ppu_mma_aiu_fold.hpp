@@ -223,12 +223,14 @@ public:
   //
   // int1 is also the only width that needs it: chunks = k-atoms per copy step = slots/delivery, which is 4 for int1,
   // 2 for int2 and 1 for int4 -- int4 has nothing to chunk, and its B fragment is already only 16 registers.
-  static constexpr bool kBChunk =
-#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
-      (cutlass::sizeof_bits<RealInternalElementB>::value == 1);
+  static constexpr int kBChunkMode =
+#if defined(PPU_B_CHUNK)
+      (PPU_B_CHUNK);
 #else
-      false;
+      0;
 #endif
+  static constexpr bool kBChunk = (kBChunkMode != 0)
+                               && (cutlass::sizeof_bits<RealInternalElementB>::value == 1);
   using InternalStrideA  = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using InternalStrideB  = cute::conditional_t<!SwapAB, StrideB, StrideA>;
 
@@ -721,6 +723,16 @@ if constexpr (!kBChunk) {
           __syncthreads();
         }
 
+        // THE STAGE THE CONSUMED DATA BELONGS TO, captured BEFORE smem_pipe_read advances below. The scale reload
+        // must use this, not the post-advance value: with K_BLOCK_MAX == 1 the
+        //   if (k_block == K_BLOCK_MAX-2 || K_BLOCK_MAX == 1) { ++smem_pipe_read; }
+        // block fires EVERY iteration and sits BEFORE the mma loop, so a per-atom transform placed in that loop reads
+        // an already-advanced stage. Measured, not guessed: decoding the mismatching outputs against
+        // scale(g,n) = 1 + (1/16)*((5n+3g) mod 13) gave g = 2 for EVERY printed line where g = 0 was correct, and one
+        // stage is Scale_TileK = 2 groups. The unchunked path never had this because its transform runs at step 2,
+        // before the advance.
+        int const b_consume_stage = smem_pipe_read;
+
         // Load A, B shmem->regs for k_block+1
         auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
@@ -754,14 +766,34 @@ if constexpr (!kBChunk) {
         // N-FOLD: IDENTICAL to the unfolded mainloop. The fold lives only in the load layer -- gmem/smem are
         // (N/FoldF) x (FoldF*K) to satisfy the AIU 32B contiguous minimum, and the swzl ldmatrix already delivers the
         // fragment with ordinary N x K register semantics (same as int4). So no fold-specific compute code at all.
-        if constexpr (kBChunk) {
+        // PPU_B_CHUNK=2 is a BISECTION, not a candidate: chunked EMISSION written at full-fragment indices, so it
+        // keeps tCrB_mma (no register saving) and isolates the gating from the small-buffer plumbing. bad=0 here and
+        // nonzero at PPU_B_CHUNK=1 points at tCrB_one / the pointers / the scale; nonzero here points at keep()/at().
+        constexpr bool kChunkFull = kBChunk && (kBChunkMode == 2);
+        if constexpr (kChunkFull) {
+          for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
+            constexpr int kC = decltype(k_loop)::value;
+            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+            Tensor dst = tCrB_mma(_,_,k_block * K_ATOM_PER_COPY);            // base of this k_block's atoms
+            transform_B_atom<RealInternalElementB, kC, decltype(K_ATOM_PER_COPY)::value, false>(
+                tCrB_copy_view, dst, partitioned_extra_info, k_block, atom_idx,
+                copy_partitions_extra_info, b_consume_stage);
+          });
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
+            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+            cute::transform(tCrA(_,_,atom_idx), TransformA{});
+            cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
+            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
+          }
+        } else if constexpr (kBChunk) {
           // for_each, not a for loop: the chunk must be a TEMPLATE argument so the emission gate stays compile-time.
           for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
             constexpr int kChunk = decltype(k_loop)::value;
             auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-            transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value>(
+            transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value, true>(
                 tCrB_copy_view, tCrB_one, partitioned_extra_info, k_block, atom_idx,
-                copy_partitions_extra_info, smem_pipe_read);
+                copy_partitions_extra_info, b_consume_stage);
             cute::transform(tCrA(_,_,atom_idx), TransformA{});
             cute::transform(tCrB_one, TransformB{});
             cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_one, accum);
@@ -1226,7 +1258,7 @@ private:
   // compile-time predicate (verified static for all widths in l32_chunk_predicate.cu), and a runtime `if` would make
   // the register saving depend on the compiler folding branches -- the assumption the scale-broadcast episode
   // punished.
-  template <class RealB, int Chunk, int NChunk, class TCrB_load, class TCrB_one, class... Ts, class CopyViews>
+  template <class RealB, int Chunk, int NChunk, bool Rebase, class TCrB_load, class TCrB_one, class... Ts, class CopyViews>
   CUTLASS_DEVICE
   void transform_B_atom(
     TCrB_load const& tCrB_load,
@@ -1250,7 +1282,7 @@ private:
     // reinterpret_cast from that class type to uint32_t const* is ill-formed -- which is exactly how the box build
     // failed. convert_tensor already had the right idiom a few lines below: raw_pointer_cast(t.data()) then cast.
     Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
-    cutlass::MixGemmInt1Emit<Chunk, NChunk>::emit(
+    cutlass::MixGemmInt1Emit<Chunk, NChunk, Rebase>::emit(
         reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in.data())),
         reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data())));
 
