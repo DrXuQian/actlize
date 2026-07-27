@@ -577,7 +577,9 @@ struct MixGemmNumericArrayConverter<half_t, uint2b_t, 64>
 // the assumption the scale-broadcast episode punished. So the per-vreg emission is templated instead.
 // Rebase=false writes at the FULL output index instead of the chunk-local one. That is the bisection mode: chunked
 // EMISSION into the whole fragment, so a mismatch localises to the gating rather than to the small buffer.
-template <int Chunk = -1, int NChunk = 1, bool Rebase = true>
+template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
+                                          cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>>
 struct MixGemmInt1Emit {
   static constexpr int kOut = 128;
   static constexpr int kPer = kOut / NChunk;
@@ -596,17 +598,38 @@ struct MixGemmInt1Emit {
   //     keep : ((e/8) % NChunk) == Chunk     because e/8 == MMA_K*n_atom + k_atom
   //     at   : ((e%8) + 8*(e/(8*NChunk))) / 2   == (val + 8*n_atom)/2, the offset in a (val, MMA_N) fragment
   // Both halves of a pair stay in one chunk: e is even and e+1 only flips val's low bit, so e/8 is unchanged.
-  static constexpr int kMmaK = NChunk;
+  // at() AND keep() ARE LAYOUT COMPOSITIONS, not hand arithmetic. The previous version wrote
+  //     keep = ((e/8) % kMmaK) == Chunk        at = ((e%8) + 8*(e/(8*kMmaK))) / 2
+  // where /8, %8 and 8*kMmaK were the MEASURED fragment strides typed out by hand -- and getting those strides wrong
+  // (I assumed a compact (8,32) where the fragment is (32,8)) is what produced 'MMA_N atom 0 right, atoms 1-3 wrong'
+  // on the box. As layouts the same maps are, with L_src taken FROM tCrB_mma rather than restated:
+  //     L_src = ((2,2,2), MMA_N, MMA_K) : ((1,2,4), 32, 8)      the fragment's own layout
+  //     L_dst = same shape              : ((1,2,4),  8, 0)      compact in n, stride-0 in k = ONE k-atom
+  //     L_k   = same shape              : ((0,0,0),  0, 1)      which k-atom an element belongs to
+  //     At = composition(L_dst, right_inverse(L_src))   Ka = composition(L_k, right_inverse(L_src))
+  // cute simplifies both symbolically to (8,MMA_N,MMA_K):(1,8,0) and (8,MMA_N,MMA_K):(0,0,1). Verified identical to
+  // the hand arithmetic on all 64 emission lines, and it now FOLLOWS the fragment layout instead of restating it.
+  using AtL = decltype(cute::composition(
+      cute::make_layout(cute::shape(FragLayout{}),
+                        cute::make_stride(cute::stride<0>(FragLayout{}),
+                                          cute::Int<cute::size<0>(FragLayout{})>{}, cute::_0{})),
+      cute::right_inverse(FragLayout{})));
+  using KaL = decltype(cute::composition(
+      cute::make_layout(cute::shape(FragLayout{}),
+                        cute::make_stride(cute::repeat_like(cute::stride<0>(FragLayout{}), cute::_0{}),
+                                          cute::_0{}, cute::_1{})),
+      cute::right_inverse(FragLayout{})));
+
   static constexpr bool keep(int t, int v) {
-    return Chunk < 0 || ((MixGemmEmit<1>::index(t, v) / 8) % kMmaK) == Chunk;
+    return Chunk < 0 || int(KaL{}(MixGemmEmit<1>::index(t, v))) == Chunk;
   }
   static constexpr int at(int t, int v) {
     const int e = MixGemmEmit<1>::index(t, v);
-    if (Chunk < 0 || !Rebase) return e / 2;
-    return ((e % 8) + 8 * (e / (8 * kMmaK))) / 2;      // val + 8*n_atom
+    return (Chunk < 0 || !Rebase) ? e / 2 : int(AtL{}(e)) / 2;
   }
   // how many half2 this chunk writes -- the caller's buffer size
   static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
+  static_assert(cute::size(FragLayout{}) == kOut, "MixGemmInt1Emit: FragLayout must cover all 128 outputs");
 
   template <int V>
   CUTLASS_DEVICE static void emit_v(uint32_t reg, uint32_t* h2) {
