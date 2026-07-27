@@ -584,13 +584,26 @@ struct MixGemmInt1Emit {
   static_assert(NChunk >= 1 && kOut % NChunk == 0, "MixGemmInt1Emit: NChunk must divide 128");
   static_assert(Chunk < NChunk, "MixGemmInt1Emit: Chunk out of range");
 
+  // AGAINST THE MEASURED FRAGMENT LAYOUT, not an assumed compact one. tCrB_mma is
+  //     ((2,2,2), MMA_N, MMA_K) : ((1,2,4), 32, 8)
+  // i.e. MMA_N stride 32 and MMA_K stride 8, so the element index is
+  //     e = val + 32*n_atom + 8*k_atom      hence  e/32 == n_atom, NOT k_atom
+  // An earlier version of this file used e/kPer as the chunk and called it a k-atom. It is an N-atom. The box found
+  // out: MMA_N atom 0 came out correct and atoms 1..3 wrong, because chunk 0 held n_atom 0's (val x k) data while
+  // cute::gemm read the buffer as (val, MMA_N). l32 had "verified" the split -- correctly, but of the wrong model.
+  //
+  // cute::gemm wants B as (val, MMA_N) at a fixed k, so the chunk must be a K-ATOM:
+  //     keep : ((e/8) % NChunk) == Chunk     because e/8 == MMA_K*n_atom + k_atom
+  //     at   : ((e%8) + 8*(e/(8*NChunk))) / 2   == (val + 8*n_atom)/2, the offset in a (val, MMA_N) fragment
+  // Both halves of a pair stay in one chunk: e is even and e+1 only flips val's low bit, so e/8 is unchanged.
+  static constexpr int kMmaK = NChunk;
   static constexpr bool keep(int t, int v) {
-    return Chunk < 0 || (MixGemmEmit<1>::index(t, v) / kPer) == Chunk;
+    return Chunk < 0 || ((MixGemmEmit<1>::index(t, v) / 8) % kMmaK) == Chunk;
   }
-  // h2 index, rebased into this chunk's own buffer when chunking
   static constexpr int at(int t, int v) {
     const int e = MixGemmEmit<1>::index(t, v);
-    return (Chunk < 0 || !Rebase ? e : (e % kPer)) / 2;
+    if (Chunk < 0 || !Rebase) return e / 2;
+    return ((e % 8) + 8 * (e / (8 * kMmaK))) / 2;      // val + 8*n_atom
   }
   // how many half2 this chunk writes -- the caller's buffer size
   static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
