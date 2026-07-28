@@ -1262,8 +1262,13 @@ private:
       // the two vregs a given low k_block owns are 2 APART (kb and kb+2), not adjacent. Offset by kb here; the
       // converter then indexes hi[2*(v>>1)]. DERIVED from the two validated single-plane converters -- see the
       // derivation block above MixGemm2Plane_uint2_uint1 in fast_numeric_conversion_for_mix_gemm.h.
-      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
-                           + (k_block % P2_DIV_);
+      // PER-PLANE N-FOLD: plane 2 loses N extent when it folds harder than plane 1 (MMA_N 2 -> 1 at Block_K=128), so
+      // cvt_hi(_, ii) is out of range for ii >= MMA_N2 and the surviving N index has to move into the vreg offset.
+      // The offline placement in xplane_offline.hpp is derived against EXACTLY this indexing. When P2_DIV == 1 and
+      // MMA_N2 == MMA_N1 it reduces to the previous expression, so the unfolded path is unchanged.
+      constexpr int N2_ = decltype(cute::size<1>(cvt_hi))::value;
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii % N2_).data()))
+                           + (k_block % P2_DIV_) + P2_DIV_ * (ii / N2_);
       MixGemm2Plane_uint2_uint1<>::convert(lo_p, hi_p, o_p);   // <> == the full 32-half2 delivery
     }
 
