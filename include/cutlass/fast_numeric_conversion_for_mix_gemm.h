@@ -238,7 +238,15 @@ struct MixGemmChunkEmit {
   static constexpr int kPairsPerVreg = kCodesPerVreg / 2;
   static constexpr int kPerLevel     = 8 / Bits;
   static constexpr int kPer          = kOut / NChunk;
-  static_assert(Bits == 1 || Bits == 2, "MixGemmChunkEmit covers int1 and int2; int4 uses the bias/1032 scheme");
+  static_assert(Bits == 1 || Bits == 2 || Bits == 4, "MixGemmChunkEmit covers int1, int2 and int4");
+  // int4 CARRIES A BIAS. add_bias_and_interleave_int4s pre-adds 8 offline (signed -> unsigned), so the converter must
+  // subtract it. That is the ONLY thing that used to make int4 "a different scheme": its mask and mul already match
+  // this rule exactly. With x = 1024 + c*2^bpos in the fp16 mantissa and mul = 2^-bpos,
+  //     y = 1024*2^-bpos + c + add        so   add = -(2^(10-bpos) + Bias)
+  // and 2^(10-bpos) + 8 = 2^(10-bpos) * (1 + 2^(bpos-7)), i.e. exponent field 25-bpos with mantissa 2^(bpos+3). The
+  // two int4 constants that falls out of -- 0xE408 (-1032) at bpos 0 and 0xD480 (-72) at bpos 4 -- are exactly the
+  // FP16_TOP_MAGIC_NUM/NEG_72 pair the shipped int4 converter hardcodes. Gated in fold_derivation/l65.
+  static constexpr int kBias = (Bits == 4) ? 8 : 0;
   static_assert(NChunk >= 1 && kOut % NChunk == 0, "MixGemmChunkEmit: NChunk must divide the output count");
   static_assert(Chunk < NChunk, "MixGemmChunkEmit: Chunk out of range");
   static_assert(Chunk < 0 || cute::size(FragLayout{}) == kOut,
@@ -257,11 +265,13 @@ struct MixGemmChunkEmit {
   }
   static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
 
-  static constexpr uint32_t dup(uint32_t h) { return h | (h << 16); }
+  static constexpr uint32_t dup(uint32_t h) { return h | (h << 16); }   // also used by MixGemm2Plane
   template <int T> static constexpr int      bpos() { return (T % kPerLevel) * Bits; }
   template <int T> static constexpr uint32_t mask() { return dup(uint32_t(((1u << Bits) - 1u) << bpos<T>())); }
   template <int T> static constexpr uint32_t mul()  { return dup(uint32_t((15 - bpos<T>()) << 10)); }
-  template <int T> static constexpr uint32_t add()  { return dup(uint32_t(0x8000u | ((25 - bpos<T>()) << 10))); }
+  template <int T> static constexpr uint32_t add()  {
+    return dup(uint32_t(0x8000u | ((25 - bpos<T>()) << 10) | (kBias ? (1u << (bpos<T>() + 3)) : 0u)));
+  }
 
   template <int T, int V>
   CUTLASS_DEVICE static void emit_one(uint32_t reg, uint32_t* h2) {
@@ -753,48 +763,80 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 // inner. Hence k-atom == at_plain/4 and the in-atom slot == at_plain%4. The single-plane fold path needs the
 // composition because there MmaPermK = TileShape.K puts the fragment in a different mode order; here MmaPermK is the
 // 32 B run span (ppu_mma_builder.inl:588). That one constant is the whole difference.
-// FragLayout is the DELIVERY's view of tCrB_mma -- shape (mode0, NAPC, KAPC), strides taken from tCrB_mma itself --
-// so `Chunk` indexes the k-atom and the n-atom an output belongs to is resolved by the LAYOUT, not by the caller. The
-// previous form had `Chunk` index one of the delivery's 8 atoms and made the collective compute
-// `Chunk + NChunk*n_local` and `out + 4*(ii*NAPC + n_local)` by hand; both are gone. Gated identical to that
-// arithmetic at NAPC 1 and 2 across seven configurations in fold_derivation/l63.
-template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_8>>>
-struct MixGemm2Plane_uint2_uint1
+// TWO BIT PLANES INTO ONE fp16 FRAGMENT, for any (low, high) width pair. Q3 = int2+int1, Q6 = int4+int2,
+// Q5 = int4+int1. Everything below is ONE closed form; there is no per-format index algebra, because writing a second
+// and third hand-derived pairing is precisely what cost this session a day.
+//
+// THE ARITHMETIC. The low plane's crumb lands in the fp16 mantissa at position bpos<T> exactly as in a single-plane
+// conversion, and the high plane's bits are OR'd LowBits positions above it, so the mantissa holds
+// lo + 2^LowBits * hi. The (mask, mul, add) that follow are therefore the LOW plane's own -- MixGemmChunkEmit<LowBits>
+// -- unchanged, including int4's +8 bias removal. Nothing about the second plane touches them.
+//
+// THE PAIRING, derived once. A delivery is 16 B/thread either way, so the low plane brings 128/LowBits codes in 4 vregs
+// while the high plane's 16 B covers 128/HiBits of them, i.e. P2_DIV = LowBits/HiBits times what one low delivery needs.
+// Inside one high vreg the two half2 lanes must sit 16 bits apart, so a pair of high codes is (a, a + 16/HiBits), and
+//     idx(v_local, c) = (c % kPairs) + kPairs*v_local + (16/HiBits)*(c / kPairs),   kPairs = 16/LowBits
+// is a bijection onto that vreg's codes because kPairs * P2_DIV == 16/HiBits. Hence
+//     hshift(T, V) = HiBits * (T + kPairs * (V % P2_DIV))        hi vreg = P2_DIV * (V / P2_DIV)
+//
+// GATED AGAINST SHIPPED CODE, which is the only reason to trust it: at (2,1) the form reproduces Q3's hand-written
+// constants exactly -- hshift == 8*(V&1)+T, hi vreg == 2*(V>>1), and at_plain == MixGemmEmit<2>::index/2, so even the
+// hand-written AtLayout turns out to be the low plane's own emission. It is a bijection for Q6 and Q5 too.
+// fold_derivation/l65, five checks.
+//
+// FragLayout is the DELIVERY's view of tCrB_mma -- shape (mode0, NAPC, KAPC), strides taken from tCrB_mma -- so `Chunk`
+// indexes the k-atom and which n-atom an output belongs to is resolved by the LAYOUT, never by the caller.
+template <int LowBits, int HiBits, int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::Int<4 * (16 / LowBits) / 4>>>>
+struct MixGemm2Plane
 {
-    // (t, v) -> half2 slot in the 32-slot delivery. colex 1-D domain t + 8*v, same idiom as MixGemmEmit.
-    using AtLayout = cute::Layout<cute::Shape <cute::Shape<cute::_2,cute::_4>, cute::Shape<cute::_2, cute::_2>>,
-                                  cute::Stride<cute::Stride<cute::_1,cute::_4>, cute::Stride<cute::_16,cute::_2>>>;
-    static constexpr int kPerAtom = 4;                       // half2 per mma B k-atom (4 half2 == 8 fp16)
-    static constexpr int kAtoms   = 32 / kPerAtom;           // 8 atoms per delivery == K_ATOM_PER_COPY * NAPC
-    static_assert(Chunk < NChunk, "MixGemm2Plane_uint2_uint1: Chunk out of range");
-    static_assert(Chunk < 0 || cute::size(FragLayout{}) == 2 * 32,
-                  "FragLayout must cover exactly one delivery's 64 fp16 outputs");
+    static_assert(LowBits == 2 || LowBits == 4, "low plane is int2 (Q3) or int4 (Q5/Q6)");
+    static_assert(HiBits == 1 || HiBits == 2, "high plane is int1 (Q3/Q5) or int2 (Q6)");
+    static_assert(LowBits > HiBits && LowBits % HiBits == 0, "the high plane must be the sparser one");
 
-    // ONE placement rule, shared with the single-plane converter. The emission ORDERS differ (AtLayout here,
-    // MixGemmEmit there) but the placement does not, and writing a second copy of it is what cost a day.
+    static constexpr int kCodesPerVreg = 32 / LowBits;        // low codes in one vreg    (int2 16, int4 8)
+    static constexpr int kPairs        = kCodesPerVreg / 2;   // half2 pairs per vreg     (int2 8,  int4 4)
+    static constexpr int kOut          = 4 * kCodesPerVreg;   // fp16 outputs per delivery(int2 64, int4 32)
+    static constexpr int kPerAtom      = 4;                   // half2 per mma B k-atom (4 half2 == 8 fp16)
+    static constexpr int kAtoms        = (kOut / 2) / kPerAtom;// mma atoms one delivery covers (int2 8, int4 4)
+    // THE VREG RATIO INSIDE ONE DELIVERY -- deliberately NOT called P2_DIV, which in the collective means the COPY STEP
+    // ratio DL1/DL2. The two coincide only when neither plane folds, and conflating them broke the first version of the
+    // offline generalisation while leaving Block_K=256 (where they agree) passing.
+    static constexpr int kVregRatio    = LowBits / HiBits;
+    static constexpr int kHiStride     = 16 / HiBits;          // high codes between the two half2 lanes
+    static constexpr int kHiVregs      = 4 * HiBits / LowBits; // high vregs one low delivery consumes
+    static constexpr int P2_DIV        = kVregRatio;           // old name, kept for the harnesses that print it
+    static constexpr int kPerLevel     = 8 / LowBits;          // low codes per byte level
+    static constexpr int kLowBitsPub   = LowBits;              // so host-side emulation can read it back
+    static_assert(Chunk < NChunk, "MixGemm2Plane: Chunk out of range");
+    static_assert(Chunk < 0 || cute::size(FragLayout{}) == kOut,
+                  "FragLayout must cover exactly one delivery's outputs");
+
+    // (mask, mul, add, bpos) are the LOW plane's, unchanged. ONE rule, shared with the single-plane converter.
+    using E = MixGemmChunkEmit<LowBits, -1, 1>;
+    // Placement is the low plane's own emission, composed with the fragment layout by the SAME ChunkPlace the
+    // single-plane path uses. The emission ORDERS differ between formats; the placement rule does not.
     using Place = ChunkPlace<FragLayout>;
-    static constexpr int  at_plain(int t, int v) { return int(AtLayout{}(t + 8 * v)); }
+    static constexpr int  at_plain(int t, int v) { return MixGemmEmit<LowBits>::index(t, v) / 2; }
     static constexpr bool keep(int t, int v)     { return Chunk < 0 || Place::ka(2 * at_plain(t, v)) == Chunk; }
     static constexpr int  at(int t, int v)       { return Chunk < 0 ? at_plain(t, v) : Place::at_h2(2 * at_plain(t, v)); }
-    // A chunk touches only TWO of the four vregs (l41), so the other two are not even READ -- gate the vreg, not just
-    // its lines, or a chunked pass still pays for four lo[] and two hi[] loads.
+    // A chunk touches only some of the four vregs (l41), so the others are not even READ -- gate the vreg, not just its
+    // lines, or a chunked pass still pays for all four lo[] loads and their hi[] companions.
     static constexpr bool vreg_used(int v) {
-      for (int t = 0; t < 8; ++t) if (keep(t, v)) return true;
+      for (int t = 0; t < kPairs; ++t) if (keep(t, v)) return true;
       return false;
     }
-
-    // (mask, mul, add, bpos) come from MixGemmChunkEmit<2> -- ONE rule, derived from Bits, shared with the
-    // single-plane int2 converter. The only 2-plane-specific part is the high bit OR into mantissa position b+2.
-    using E = MixGemmChunkEmit<2, -1, 1>;
+    static constexpr int  hshift(int t, int v) { return HiBits * (t + kPairs * (v % kVregRatio)); }
+    static constexpr uint32_t himask() { return E::dup(uint32_t((1u << HiBits) - 1u)); }
 
     template <int T, int V>
     CUTLASS_DEVICE static void emit_one(uint32_t reg, uint32_t r8, uint32_t hreg, uint32_t* h2) {
-      const uint32_t src = (T / 4) ? r8 : reg;               // t>=4 reads the second byte level
+      const uint32_t src = (T / kPerLevel) ? r8 : reg;        // the upper byte level of the low vreg
       uint32_t x;
       asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(x)
                    : "r"(src), "n"(E::template mask<T>()), "n"(0x64006400u), "n"(0xEAu));
-      x |= ((hreg >> (8 * (V & 1) + T)) & 0x00010001u) << (E::template bpos<T>() + 2);
+      // the high plane's bits, LowBits mantissa positions above the low plane's
+      x |= ((hreg >> hshift(T, V)) & himask()) << (E::template bpos<T>() + LowBits);
       asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(x)
                    : "r"(x), "r"(E::template mul<T>()), "r"(E::template add<T>()));
       h2[at(T, V)] = x;
@@ -803,18 +845,17 @@ struct MixGemm2Plane_uint2_uint1
     template <int V>
     CUTLASS_DEVICE static void emit_v(uint32_t const* lo, uint32_t const* hi, uint32_t* h2) {
       const uint32_t reg = lo[V], r8 = reg >> 8;
-      // WHICH high vreg serves low vreg V -- DERIVED from the two validated single-plane converters (see the header
-      // block above), not guessed. hi points at the high fragment already offset by the low k_block parity, and the
-      // two vregs this k_block owns are STRIDE 2 apart, so hi[2*(V>>1)] == absolute vreg kb + 2*(V>=2).
-      const uint32_t hreg = hi[2 * (V >> 1)];
-      cute::for_each(cute::make_int_sequence<8>{}, [&] (auto t) {
+      // hi already points at the high fragment offset by this k_block's parity (HiPlaneSrc in the collective); the
+      // vregs one k_block owns are P2_DIV apart, so this picks the one serving low vreg V.
+      const uint32_t hreg = hi[kVregRatio * (V / kVregRatio)];
+      cute::for_each(cute::make_int_sequence<kPairs>{}, [&] (auto t) {
         constexpr int T = decltype(t)::value;
         if constexpr (keep(T, V)) emit_one<T, V>(reg, r8, hreg, h2);
       });
     }
 
-    // lo: 4 swzl vregs (64 crumbs). hi: base already offset by the low k_block parity.
-    // out: 32 half2 (= 64 fp16) for Chunk < 0, else 4 half2 for k-atom `Chunk`.
+    // lo: the delivery's 4 low vregs. hi: base already offset by the low k_block parity.
+    // out: kOut/2 half2 for Chunk < 0, else kPerAtom half2 for k-atom `Chunk`.
     CUTLASS_DEVICE
     static void convert(uint32_t const* lo, uint32_t const* hi, uint32_t* h2)
     {
@@ -823,6 +864,24 @@ struct MixGemm2Plane_uint2_uint1
         if constexpr (vreg_used(V)) emit_v<V>(lo, hi, h2);
       });
     }
+};
+
+// Q3's name, kept so nothing downstream changes. Q6 and Q5 are the same object at different widths.
+template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_8>>>
+using MixGemm2Plane_uint2_uint1 = MixGemm2Plane<2, 1, Chunk, NChunk, Rebase, FragLayout>;
+template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_4>>>
+using MixGemm2Plane_int4_uint2 = MixGemm2Plane<4, 2, Chunk, NChunk, Rebase, FragLayout>;   // Q6
+template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_4>>>
+using MixGemm2Plane_int4_uint1 = MixGemm2Plane<4, 1, Chunk, NChunk, Rebase, FragLayout>;   // Q5
+
+// The collective picks the pair from the two plane ELEMENTS, so a new format needs no dispatch table.
+template <class LowElem, class HiElem, int Chunk = -1, int NChunk = 1, bool Rebase = true, class FragLayout = void>
+struct MixGemm2PlaneFor {
+  using type = MixGemm2Plane<cutlass::sizeof_bits<LowElem>::value, cutlass::sizeof_bits<HiElem>::value,
+                             Chunk, NChunk, Rebase, FragLayout>;
 };
 
 } // namespace cutlass

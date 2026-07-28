@@ -273,19 +273,26 @@ public:
 
   using RealInternalElementA = cute::conditional_t<!SwapAB, ElementA, ElementB>;
   using RealInternalElementB = cute::conditional_t<!SwapAB, ElementB, ElementA>;
+  // THE TWO PLANE WIDTHS, named once. Q3 = int2+int1, Q6 = int4+int2, Q5 = int4+int1 are the same mainloop at different
+  // widths -- MixGemm2Plane is one closed form over (LowBits, HiBits), gated against Q3's shipped constants in
+  // fold_derivation/l65 and emulated for all three in l66, so there is no per-format dispatch anywhere here.
+  static constexpr int kLowBits = cutlass::sizeof_bits<RealInternalElementB>::value;
+  static constexpr int kHiBits  = cutlass::sizeof_bits<PlaneB2>::value;
+  using Cvt2Plane = cutlass::MixGemm2Plane<kLowBits, kHiBits>;                       // unchunked, full delivery
+  static_assert((kLowBits == 2 && kHiBits == 1) || (kLowBits == 4 && kHiBits == 2) || (kLowBits == 4 && kHiBits == 1),
+                "2-plane mainloop supports Q3 (int2+int1), Q6 (int4+int2) and Q5 (int4+int1)");
+
   // PPU_B_CHUNK on the 2-plane path (task #12). Same flag as the fold collective, and the same reason it is a
   // constexpr bool rather than an #if: an #if leaves the other branch un-type-checked, which is how an int1-only
-  // emitter got instantiated for uint2b_t and produced 576 errors. Gated on the plane WIDTHS, because
-  // MixGemm2Plane_uint2_uint1 is exactly (low int2, high int1) -- any other pair must not reach it.
+  // emitter got instantiated for uint2b_t and produced 576 errors.
   static constexpr int kBChunkMode =
 #if defined(PPU_B_CHUNK)
       (PPU_B_CHUNK);
 #else
       0;
 #endif
-  static constexpr bool kBChunk = (kBChunkMode != 0)
-                               && (cutlass::sizeof_bits<RealInternalElementB>::value == 2)
-                               && (cutlass::sizeof_bits<PlaneB2>::value == 1);
+  // Chunking needs MixGemmChunkEmit for the LOW plane, which covers int1/int2/int4, so every supported pair qualifies.
+  static constexpr bool kBChunk = (kBChunkMode != 0);
   using InternalStrideA  = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using InternalStrideB  = cute::conditional_t<!SwapAB, StrideB, StrideA>;
 
@@ -785,7 +792,7 @@ public:
     // now the fastest configuration on the box. Measured for all three Block_K in fold_derivation/l62.
     static_assert(!kBChunk || decltype(K_ATOM_PER_COPY)::value
                               * (decltype(cute::size<1>(tCrB_mma))::value / decltype(cute::size<1>(tCrB_copy_view))::value)
-                              == MixGemm2Plane_uint2_uint1<>::kAtoms,
+                              == Cvt2Plane::kAtoms,
         "PPU_B_CHUNK (2-plane): K_ATOM_PER_COPY * (MMA_N / CPY_N) must be the kAtoms one int2 delivery carries");
 
     // PPU_MMA_PROBE=1: the same "let the kernel report its own indices" probe the fold collective has, plus the two
@@ -1334,10 +1341,12 @@ private:
     // Mode-0 of cvt_in is one CPY_VEC chunk (64 low codes = 4 vregs); mode-1 is the chunk count.
     Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
     constexpr int NumIter = decltype(cute::size<1>(cvt_in))::value;
-    static_assert(decltype(cute::size<0>(cvt_in))::value == 64,
-      "2-plane convert expects a 64-code low chunk (CPY_VEC for uint2); generalize before changing that width");
-    static_assert(decltype(cute::size<0>(cvt_hi))::value == 128,
-      "expected plane 2's chunk to hold 128 codes (2x the low chunk) -- it is the denser plane");
+    // A delivery is 16 B/thread either way, so each plane's chunk holds 128/bits codes -- 64 low + 128 high for Q3,
+    // 32 + 64 for Q6, 32 + 128 for Q5. Derived from the widths instead of asserting Q3's two literals.
+    static_assert(decltype(cute::size<0>(cvt_in))::value == 128 / kLowBits,
+      "a low-plane delivery is 128/LowBits codes");
+    static_assert(decltype(cute::size<0>(cvt_hi))::value == 128 / kHiBits,
+      "a high-plane delivery is 128/HiBits codes -- it is the sparser plane, so it covers more of them");
     CUTLASS_PRAGMA_UNROLL
     for (int ii = 0; ii < NumIter; ++ii) {
       uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, ii).data()));
@@ -1346,7 +1355,7 @@ private:
       // STRIDE 1, not 2: the high fragment's delivered vreg index decomposes as (k_block parity) + 2*(N-half), so
       // the two vregs a given low k_block owns are 2 APART (kb and kb+2), not adjacent. Offset by kb here; the
       // converter then indexes hi[2*(v>>1)]. DERIVED from the two validated single-plane converters -- see the
-      // derivation block above MixGemm2Plane_uint2_uint1 in fast_numeric_conversion_for_mix_gemm.h.
+      // derivation block above MixGemm2Plane in fast_numeric_conversion_for_mix_gemm.h.
       // PER-PLANE N-FOLD. With the shipped offset (k_block % P2_DIV) a folded plane 2 has P2_DIV == 1, so every ii
       // reads vregs {0, 2} and vregs {1, 3} are NEVER touched -- HALF the tile's high bits cannot arrive, whatever the
       // placement. The surviving N index must move into the vreg offset.
@@ -1364,7 +1373,7 @@ private:
       using HiSrc_ = HiPlaneSrc<N2_, NumIter, P2_DIV_>;                 // (d): ONE definition, shared with the chunked path
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, HiSrc_::slot(ii)).data()))
                            + HiSrc_::base(ii, k_block);
-      MixGemm2Plane_uint2_uint1<>::convert(lo_p, hi_p, o_p);   // <> == the full 32-half2 delivery
+      Cvt2Plane::convert(lo_p, hi_p, o_p);                     // the full delivery, kOut/2 half2
     }
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
@@ -1464,7 +1473,7 @@ private:
     constexpr int MMA_N_ = decltype(cute::size(tCrB_one))::value / 8;        // 8 fp16 per mma B atom
     constexpr int NAPC_  = MMA_N_ / NumIter;                                 // n-atoms carried by one delivery
     static_assert(NAPC_ >= 1 && MMA_N_ == NAPC_ * NumIter, "tCrB_one's n extent must be a multiple of CPY_N");
-    static_assert(NChunk * NAPC_ == MixGemm2Plane_uint2_uint1<>::kAtoms,
+    static_assert(NChunk * NAPC_ == Cvt2Plane::kAtoms,
         "a delivery is kAtoms mma atoms; K_ATOM_PER_COPY * NAPC must account for all of them");
     using DeliveryL_ = decltype(cute::make_layout(
         cute::make_shape (cute::shape<0>(FragL{}), cute::Int<NAPC_>{}, cute::Int<NChunk>{}),
@@ -1489,7 +1498,8 @@ private:
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(
                                  raw_pointer_cast(cvt_hi(_, cute::Int<HiSrc_::slot(ii)>{}).data()))
                            + HiSrc_::base(ii, k_block);
-      MixGemm2Plane_uint2_uint1<Chunk, NChunk, true, DeliveryL_>::convert(lo_p, hi_p, out + 4 * NAPC_ * ii);
+      cutlass::MixGemm2Plane<kLowBits, kHiBits, Chunk, NChunk, true, DeliveryL_>::convert(
+          lo_p, hi_p, out + 4 * NAPC_ * ii);
     });
 
     constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;       // copy steps per k-tile
