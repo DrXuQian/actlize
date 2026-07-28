@@ -192,6 +192,17 @@ static_assert(mixgemm_int4_agrees(),
 // V AND T ARE TEMPLATE PARAMETERS, not loop variables: the gate is `if constexpr (keep(T, V))`, and a plain `if`
 // relying on unrolling plus dead-code elimination would make the register saving depend on the compiler folding
 // branches -- the assumption the scale-broadcast episode punished.
+// (e) THE K-PERMUTATION RULE, in ONE place. The builder computes this at ppu_mma_builder.inl and every offline
+// generator needs the same answer, so it used to be restated by hand -- and a plane_map that hardcoded the non-fold
+// branch silently broke a FOLDED plane: at Block_K=64 with F=2 the composition covered 4160 of 8192 logical elements
+// instead of being a bijection. Unfolded it is the K span one 32 B swzl delivery carries (int4 64 / int2 128 / int1 256);
+// folded, the fragment must keep ordinary N x K register semantics because the fold lives only in the load layer, so it
+// is TileShape.K. Both the builder and the generators now read this.
+template <int Bits, int BlockK, int FoldF>
+struct MixGemmMmaPermK {
+  static constexpr int value = (FoldF > 1) ? BlockK : (32 * 8 / Bits);
+};
+
 // WHERE A CHUNKED OUTPUT GOES, as two compositions over the fragment layout. Extracted so the 2-plane converter can
 // share it: the two converters have DIFFERENT emission orders (MixGemmEmit for one plane, the _E2 lines' AtLayout for
 // two), but the PLACEMENT rule is the same, and re-deriving it for the second one is exactly how this session lost a

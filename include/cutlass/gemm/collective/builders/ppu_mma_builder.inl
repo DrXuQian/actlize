@@ -587,9 +587,12 @@ public:
   // FOLD: the fragment must have ORDINARY N x K register semantics (the fold lives only in the load layer), so the
   // K-permutation is TileShape.K when folding -- NOT the 32B-run span, which would keep the fragment in the folded
   // (N/FoldF) x (FoldF*K) form and force a 2-pass mainloop.
-  static constexpr int MmaPermK = (fold_schedule_traits<KernelScheduleType>::FoldF > 0)
-      ? cute::get<2>(TileShape_MNK{})
-      : (32 * 8 / sizeof_bits<RealInternalElementB>::value);
+  // (e) ONE definition, shared with the offline generators -- see MixGemmMmaPermK in
+  // fast_numeric_conversion_for_mix_gemm.h for why restating it broke a folded plane.
+  static constexpr int MmaPermK =
+      cutlass::MixGemmMmaPermK<sizeof_bits<RealInternalElementB>::value,
+                               cute::get<2>(TileShape_MNK{}),
+                               (fold_schedule_traits<KernelScheduleType>::FoldF > 0 ? 2 : 1)>::value;
   using TiledMma = typename detail::get_tiled_mma<
         Arch, ElementMma, ElementMma, ElementAccumulator, TileShape_MNK, ClusterShape_MNK,
         Int<MmaPermK>>::TiledMma;

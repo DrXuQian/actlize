@@ -66,6 +66,28 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+
+// (d) WHERE PLANE 2's BITS COME FROM, as one object. This rule existed in TWO copies -- the unchunked converter and the
+// chunked one -- and only the first was fixed for the per-plane fold. The stale copy read vregs {0,2} and never touched
+// {1,3} whenever P2_DIV == 1, so half the tile's high bits could not arrive; it cost a box round and showed up as
+// bad ~= 15000/32768 on every folded rung while the Block_K=256 control passed.
+//
+// Written as LAYOUTS over (ii, k_block) rather than arithmetic, because arithmetic is what gets copied:
+//     slot(ii)      = ii % N2                                which N-slice of plane 2's fragment this delivery reads
+//     base(ii, kb)  = kb % P2_DIV + P2_DIV * (ii / N2)        the first of the two vregs that k_block owns
+// The converter then indexes hi[base + 2*(v>>1)] -- stride 2, because the delivered high vreg index decomposes as
+// (k_block parity) + 2*(N-half). Gated for both formulas, old and new, in fold_derivation/l63.
+template <int N2, int CPY_N, int P2_DIV>
+struct HiPlaneSrc {
+  static_assert(N2 >= 1 && CPY_N % N2 == 0, "plane 2's N extent must divide the delivery count");
+  using SlotL = cute::Layout<cute::Shape <cute::Shape<cute::Int<N2>, cute::Int<CPY_N / N2>>>,
+                             cute::Stride<cute::Stride<cute::_1,    cute::_0>>>;
+  using BaseL = cute::Layout<cute::Shape <cute::Shape<cute::Int<N2>, cute::Int<CPY_N / N2>>, cute::Int<P2_DIV>>,
+                             cute::Stride<cute::Stride<cute::_0,     cute::Int<P2_DIV>>,     cute::_1>>;
+  static constexpr int slot(int ii)         { return int(SlotL{}(ii)); }
+  static constexpr int base(int ii, int kb) { return int(BaseL{}(ii, kb % P2_DIV)); }
+};
 namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1339,8 +1361,9 @@ private:
       // portability fixes (template-argument trailing commas, the `template` disambiguator, dim3, cast_smem_ptr_to_uint
       // and mma_ppu.h qualifiers). Two changes, one measurement.
       constexpr int N2_ = decltype(cute::size<1>(cvt_hi))::value;
-      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii % N2_).data()))
-                           + (k_block % P2_DIV_) + P2_DIV_ * (ii / N2_);
+      using HiSrc_ = HiPlaneSrc<N2_, NumIter, P2_DIV_>;                 // (d): ONE definition, shared with the chunked path
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, HiSrc_::slot(ii)).data()))
+                           + HiSrc_::base(ii, k_block);
       MixGemm2Plane_uint2_uint1<>::convert(lo_p, hi_p, o_p);   // <> == the full 32-half2 delivery
     }
 
@@ -1462,9 +1485,10 @@ private:
       // ii indexes the DELIVERY, so this depends on ii and k_block only: the low plane's 64 codes and the high plane's
       // 128 pair up per (t,v) INSIDE a delivery, and the chunk merely selects which of those slots are emitted.
       constexpr int N2_ = decltype(cute::size<1>(cvt_hi))::value;
+      using HiSrc_ = HiPlaneSrc<N2_, NumIter, P2_DIV_>;                 // (d): the SAME object the unchunked path uses
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(
-                                 raw_pointer_cast(cvt_hi(_, cute::Int<ii % N2_>{}).data()))
-                           + (k_block % P2_DIV_) + P2_DIV_ * (ii / N2_);
+                                 raw_pointer_cast(cvt_hi(_, cute::Int<HiSrc_::slot(ii)>{}).data()))
+                           + HiSrc_::base(ii, k_block);
       MixGemm2Plane_uint2_uint1<Chunk, NChunk, true, DeliveryL_>::convert(lo_p, hi_p, out + 4 * NAPC_ * ii);
     });
 
