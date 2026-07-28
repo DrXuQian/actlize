@@ -1448,8 +1448,23 @@ private:
     cute::for_each(cute::make_int_sequence<NumIter>{}, [&] (auto ii_) {
       constexpr int ii = decltype(ii_)::value;
       uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, cute::Int<ii>{}).data()));
-      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, cute::Int<ii>{}).data()))
-                           + (k_block % P2_DIV_);
+      // THE HIGH-PLANE SOURCE INDEX MUST CARRY THE N INDEX, and this copy of the expression did not. The unchunked
+      // path (~line 1340) was fixed for the per-plane fold; this one kept the shipped `k_block % P2_DIV` form, and a
+      // folded plane 2 has P2_DIV == 1, so every ii read vregs {0, 2} while {1, 3} were NEVER touched -- half the
+      // tile's high bits could not arrive, whatever the placement. Measured with PPU_B_CHUNK=1: control (Block_K=256,
+      // where P2_DIV is 2 and the old form happens to be right) MATCH, every folded rung bad ~= 15000/32768, i.e.
+      // ~46% -- the signature of "half the int1 contributions missing", not of a wrong placement.
+      //
+      // ii indexes the DELIVERY, so this depends on ii and k_block only, never on n_local: the low plane's 64 codes
+      // and the high plane's 128 pair up per (t, v) INSIDE a delivery, and the chunk merely selects which of those
+      // slots are emitted. Both n_local values therefore share this base pointer.
+      //
+      // Must stay identical to the unchunked expression. That is now gated rather than trusted -- l63 checks the
+      // high-plane source index of BOTH paths, so a future edit to one of them fails locally instead of on the box.
+      constexpr int N2_ = decltype(cute::size<1>(cvt_hi))::value;
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(
+                                 raw_pointer_cast(cvt_hi(_, cute::Int<ii % N2_>{}).data()))
+                           + (k_block % P2_DIV_) + P2_DIV_ * (ii / N2_);
       cute::for_each(cute::make_int_sequence<NAPC_>{}, [&] (auto nl_) {
         constexpr int nl = decltype(nl_)::value;
         MixGemm2Plane_uint2_uint1<Chunk + NChunk * nl>::convert(lo_p, hi_p, out + 4 * (ii * NAPC_ + nl));
