@@ -192,6 +192,32 @@ static_assert(mixgemm_int4_agrees(),
 // V AND T ARE TEMPLATE PARAMETERS, not loop variables: the gate is `if constexpr (keep(T, V))`, and a plain `if`
 // relying on unrolling plus dead-code elimination would make the register saving depend on the compiler folding
 // branches -- the assumption the scale-broadcast episode punished.
+// WHERE A CHUNKED OUTPUT GOES, as two compositions over the fragment layout. Extracted so the 2-plane converter can
+// share it: the two converters have DIFFERENT emission orders (MixGemmEmit for one plane, the _E2 lines' AtLayout for
+// two), but the PLACEMENT rule is the same, and re-deriving it for the second one is exactly how this session lost a
+// day. Both of the 2-plane defects found were hand-written indices, one of them a second copy of a rule already fixed
+// elsewhere.
+//
+//   ka(e)     the k-atom e belongs to  -- mode2 stride 1, everything else 0, so only the K coordinate survives
+//   at_h2(e)  the compact destination  -- mode0 keeps its stride, mode1 (N) gets size<0>, mode2 (K) gets 0, which is
+//             exactly the layout of a one-k-atom fragment. THIS IS WHY NAPC > 1 NEEDS NO CALLER ARITHMETIC: which
+//             n-atom an output belongs to is something the fragment layout already knows.
+template <class FragLayout>
+struct ChunkPlace {
+  using AtL = decltype(cute::composition(
+      cute::make_layout(cute::shape(FragLayout{}),
+                        cute::make_stride(cute::stride<0>(FragLayout{}),
+                                          cute::Int<cute::size<0>(FragLayout{})>{}, cute::_0{})),
+      cute::right_inverse(FragLayout{})));
+  using KaL = decltype(cute::composition(
+      cute::make_layout(cute::shape(FragLayout{}),
+                        cute::make_stride(cute::repeat_like(cute::stride<0>(FragLayout{}), cute::_0{}),
+                                          cute::_0{}, cute::_1{})),
+      cute::right_inverse(FragLayout{})));
+  static constexpr int ka(int e)    { return int(KaL{}(e)); }
+  static constexpr int at_h2(int e) { return int(AtL{}(e)) / 2; }
+};
+
 template <int Bits, int Chunk = -1, int NChunk = 1, bool Rebase = true,
           class FragLayout = cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
                                           cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>>
@@ -207,23 +233,16 @@ struct MixGemmChunkEmit {
   static_assert(Chunk < 0 || cute::size(FragLayout{}) == kOut,
                 "MixGemmChunkEmit: FragLayout must cover all outputs when chunking");
 
-  using AtL = decltype(cute::composition(
-      cute::make_layout(cute::shape(FragLayout{}),
-                        cute::make_stride(cute::stride<0>(FragLayout{}),
-                                          cute::Int<cute::size<0>(FragLayout{})>{}, cute::_0{})),
-      cute::right_inverse(FragLayout{})));
-  using KaL = decltype(cute::composition(
-      cute::make_layout(cute::shape(FragLayout{}),
-                        cute::make_stride(cute::repeat_like(cute::stride<0>(FragLayout{}), cute::_0{}),
-                                          cute::_0{}, cute::_1{})),
-      cute::right_inverse(FragLayout{})));
+  using Place = ChunkPlace<FragLayout>;
+  using AtL = typename Place::AtL;                 // names kept: several harnesses print them
+  using KaL = typename Place::KaL;
 
   static constexpr bool keep(int t, int v) {
-    return Chunk < 0 || int(KaL{}(MixGemmEmit<Bits>::index(t, v))) == Chunk;
+    return Chunk < 0 || Place::ka(MixGemmEmit<Bits>::index(t, v)) == Chunk;
   }
   static constexpr int at(int t, int v) {
     const int e = MixGemmEmit<Bits>::index(t, v);
-    return (Chunk < 0 || !Rebase) ? e / 2 : int(AtL{}(e)) / 2;
+    return (Chunk < 0 || !Rebase) ? e / 2 : Place::at_h2(e);
   }
   static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
 
@@ -723,19 +742,30 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 // inner. Hence k-atom == at_plain/4 and the in-atom slot == at_plain%4. The single-plane fold path needs the
 // composition because there MmaPermK = TileShape.K puts the fragment in a different mode order; here MmaPermK is the
 // 32 B run span (ppu_mma_builder.inl:588). That one constant is the whole difference.
-template <int Chunk = -1>
+// FragLayout is the DELIVERY's view of tCrB_mma -- shape (mode0, NAPC, KAPC), strides taken from tCrB_mma itself --
+// so `Chunk` indexes the k-atom and the n-atom an output belongs to is resolved by the LAYOUT, not by the caller. The
+// previous form had `Chunk` index one of the delivery's 8 atoms and made the collective compute
+// `Chunk + NChunk*n_local` and `out + 4*(ii*NAPC + n_local)` by hand; both are gone. Gated identical to that
+// arithmetic at NAPC 1 and 2 across seven configurations in fold_derivation/l63.
+template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_8>>>
 struct MixGemm2Plane_uint2_uint1
 {
     // (t, v) -> half2 slot in the 32-slot delivery. colex 1-D domain t + 8*v, same idiom as MixGemmEmit.
     using AtLayout = cute::Layout<cute::Shape <cute::Shape<cute::_2,cute::_4>, cute::Shape<cute::_2, cute::_2>>,
                                   cute::Stride<cute::Stride<cute::_1,cute::_4>, cute::Stride<cute::_16,cute::_2>>>;
     static constexpr int kPerAtom = 4;                       // half2 per mma B k-atom (4 half2 == 8 fp16)
-    static constexpr int kAtoms   = 32 / kPerAtom;           // 8 == K_ATOM_PER_COPY at the 2-plane's TileShape
-    static_assert(Chunk < kAtoms, "MixGemm2Plane_uint2_uint1: Chunk out of range");
+    static constexpr int kAtoms   = 32 / kPerAtom;           // 8 atoms per delivery == K_ATOM_PER_COPY * NAPC
+    static_assert(Chunk < NChunk, "MixGemm2Plane_uint2_uint1: Chunk out of range");
+    static_assert(Chunk < 0 || cute::size(FragLayout{}) == 2 * 32,
+                  "FragLayout must cover exactly one delivery's 64 fp16 outputs");
 
+    // ONE placement rule, shared with the single-plane converter. The emission ORDERS differ (AtLayout here,
+    // MixGemmEmit there) but the placement does not, and writing a second copy of it is what cost a day.
+    using Place = ChunkPlace<FragLayout>;
     static constexpr int  at_plain(int t, int v) { return int(AtLayout{}(t + 8 * v)); }
-    static constexpr bool keep(int t, int v)     { return Chunk < 0 || (at_plain(t, v) / kPerAtom) == Chunk; }
-    static constexpr int  at(int t, int v)       { return Chunk < 0 ? at_plain(t, v) : at_plain(t, v) % kPerAtom; }
+    static constexpr bool keep(int t, int v)     { return Chunk < 0 || Place::ka(2 * at_plain(t, v)) == Chunk; }
+    static constexpr int  at(int t, int v)       { return Chunk < 0 ? at_plain(t, v) : Place::at_h2(2 * at_plain(t, v)); }
     // A chunk touches only TWO of the four vregs (l41), so the other two are not even READ -- gate the vreg, not just
     // its lines, or a chunked pass still pays for four lo[] and two hi[] loads.
     static constexpr bool vreg_used(int v) {

@@ -895,7 +895,8 @@ public:
           for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
             constexpr int kChunk = decltype(k_loop)::value;
             auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-            transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value>(
+            transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value,
+                             decltype(tCrB_mma.layout())>(
                 tCrB_copy_view, tCrB2_copy_view, tCrB_one, partitioned_extra_info, k_block, atom_idx,
                 copy_partitions_extra_info, b_consume_stage);
             cute::transform(tCrA(_,_,atom_idx), TransformA{});
@@ -1406,7 +1407,10 @@ private:
   // NO CROSS-ITERATION HAZARD: tCrB_load has one slot per copy step and the prefetch writes k_block_next while this
   // reads k_block, so deferring the conversion into the mma loop cannot see overwritten codes. Note the plane-2 read
   // is idempotent across the P2_DIV plane-1 k_blocks it serves.
-  template <class RealB, int Chunk, int NChunk,
+  // FragL is tCrB_mma's OWN layout, passed in rather than restated -- the single-plane transform_B_atom already does
+  // this, and for the same reason: at()/keep() are compositions over it, so a change to the mma atom or the warp tile
+  // propagates instead of silently invalidating hand-typed strides.
+  template <class RealB, int Chunk, int NChunk, class FragL,
             class TCrB_load, class TCrB2_load, class TCrB_one, class... Ts, class CopyViews>
   CUTLASS_DEVICE
   void transform_B_atom(
@@ -1426,49 +1430,42 @@ private:
     Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
     Tensor cvt_hi = recast<PlaneB2>(tCrB2_load(_, _, k_block / P2_DIV_));
     constexpr int NumIter = decltype(cute::size<1>(cvt_in))::value;          // CPY_N -- NOT MMA_N in general
-    // ONE DELIVERY IS 8 MMA ATOMS, and tCrB_mma decides how they split between n and k -- 1 n x 8 k while Block_K >= 128,
-    // but 2 n x 4 k at Block_K = 64, where MMA_N is 4 while CPY_N is only 2. The previous form looped Chunk over
-    // K_ATOM_PER_COPY alone and wrote at `out + 4*ii`, which is correct only when CPY_N == MMA_N: at Block_K=64 it
-    // emitted 4 of the delivery's 8 atoms and filled 2 of tCrB_one's 4 n-atoms, leaving the other two never written --
-    // the same class of defect as hi_vreg0 (an index that assumed the copy and mma N extents agree).
-    //
-    // Derived from tCrB_mma's own layout and cvt_in's real mode-1 stride, then GATED at NAPC 1 and 2 across seven
-    // configurations including the shipped Block_K=256 (fold_derivation/l63):
-    //     Chunk_actual = Chunk + NChunk * n_local          destination atom = ii * NAPC + n_local
-    // Both collapse to the previous expression when NAPC == 1, so this is a strict generalisation. NOTE l63's first
-    // version hardcoded cvt_in's stride as 32 half2 and declared Block_K=256 broken; the stride is 64 there. The
-    // harness was wrong, not the code -- ask cute for a stride, never write it down.
+    // THE DESTINATION IS A LAYOUT, NOT ARITHMETIC. One delivery is kAtoms mma atoms and tCrB_mma decides how they split
+    // between n and k -- 1 n x 8 k while Block_K >= 128, 2 n x 4 k at Block_K = 64. This used to be two nested loops
+    // computing `Chunk + NChunk*n_local` and `out + 4*(ii*NAPC + n_local)` by hand. Both are gone: FragLayout below is
+    // the DELIVERY's view of tCrB_mma, with its strides taken FROM tCrB_mma rather than written down, and
+    // ChunkPlace's KaL/AtL resolve the n-atom themselves -- which n-atom an output belongs to is something the fragment
+    // layout knows and no caller should recompute. Gated identical to the arithmetic it replaces at NAPC 1 and 2 across
+    // seven configurations (fold_derivation/l63). Both defects this path produced were hand-written indices, so the
+    // arithmetic disappearing is the point, not a tidy-up.
     constexpr int MMA_N_ = decltype(cute::size(tCrB_one))::value / 8;        // 8 fp16 per mma B atom
     constexpr int NAPC_  = MMA_N_ / NumIter;                                 // n-atoms carried by one delivery
     static_assert(NAPC_ >= 1 && MMA_N_ == NAPC_ * NumIter, "tCrB_one's n extent must be a multiple of CPY_N");
     static_assert(NChunk * NAPC_ == MixGemm2Plane_uint2_uint1<>::kAtoms,
         "a delivery is kAtoms mma atoms; K_ATOM_PER_COPY * NAPC must account for all of them");
+    using DeliveryL_ = decltype(cute::make_layout(
+        cute::make_shape (cute::shape<0>(FragL{}), cute::Int<NAPC_>{}, cute::Int<NChunk>{}),
+        cute::make_stride(cute::stride<0>(FragL{}), cute::stride<1>(FragL{}), cute::stride<2>(FragL{}))));
     uint32_t* out = reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data()));
-    // for_each, not a loop: Chunk_actual must be a TEMPLATE argument so the emission gate stays compile-time.
+    // ONE loop, over DELIVERIES -- each has its own source pointer pair, which is a genuine source-side fact and not a
+    // destination computation. Its half2 offset in the compact tCrB_one is 4 half2 per n-atom times the NAPC n-atoms a
+    // delivery covers.
     cute::for_each(cute::make_int_sequence<NumIter>{}, [&] (auto ii_) {
       constexpr int ii = decltype(ii_)::value;
       uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, cute::Int<ii>{}).data()));
-      // THE HIGH-PLANE SOURCE INDEX MUST CARRY THE N INDEX, and this copy of the expression did not. The unchunked
-      // path (~line 1340) was fixed for the per-plane fold; this one kept the shipped `k_block % P2_DIV` form, and a
-      // folded plane 2 has P2_DIV == 1, so every ii read vregs {0, 2} while {1, 3} were NEVER touched -- half the
-      // tile's high bits could not arrive, whatever the placement. Measured with PPU_B_CHUNK=1: control (Block_K=256,
-      // where P2_DIV is 2 and the old form happens to be right) MATCH, every folded rung bad ~= 15000/32768, i.e.
-      // ~46% -- the signature of "half the int1 contributions missing", not of a wrong placement.
+      // THE HIGH-PLANE SOURCE INDEX MUST CARRY THE N INDEX. This copy of the expression did not, and a folded plane 2
+      // has P2_DIV == 1, so every ii read vregs {0,2} while {1,3} were NEVER touched -- half the tile's high bits could
+      // not arrive, whatever the placement. Measured: Block_K=256 control MATCH (P2_DIV is 2 there and the old form
+      // happens to be right), every folded rung bad ~= 15000/32768. It must stay identical to the unchunked expression
+      // near line 1340; l63 gates the high-plane source of BOTH, so drift fails locally instead of on the box.
       //
-      // ii indexes the DELIVERY, so this depends on ii and k_block only, never on n_local: the low plane's 64 codes
-      // and the high plane's 128 pair up per (t, v) INSIDE a delivery, and the chunk merely selects which of those
-      // slots are emitted. Both n_local values therefore share this base pointer.
-      //
-      // Must stay identical to the unchunked expression. That is now gated rather than trusted -- l63 checks the
-      // high-plane source index of BOTH paths, so a future edit to one of them fails locally instead of on the box.
+      // ii indexes the DELIVERY, so this depends on ii and k_block only: the low plane's 64 codes and the high plane's
+      // 128 pair up per (t,v) INSIDE a delivery, and the chunk merely selects which of those slots are emitted.
       constexpr int N2_ = decltype(cute::size<1>(cvt_hi))::value;
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(
                                  raw_pointer_cast(cvt_hi(_, cute::Int<ii % N2_>{}).data()))
                            + (k_block % P2_DIV_) + P2_DIV_ * (ii / N2_);
-      cute::for_each(cute::make_int_sequence<NAPC_>{}, [&] (auto nl_) {
-        constexpr int nl = decltype(nl_)::value;
-        MixGemm2Plane_uint2_uint1<Chunk + NChunk * nl>::convert(lo_p, hi_p, out + 4 * (ii * NAPC_ + nl));
-      });
+      MixGemm2Plane_uint2_uint1<Chunk, NChunk, true, DeliveryL_>::convert(lo_p, hi_p, out + 4 * NAPC_ * ii);
     });
 
     constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;       // copy steps per k-tile
