@@ -668,8 +668,22 @@ public:
   // NOTE Block_K here must ALSO be the folded one (BFoldBlockK): even in single-plane builds this type gets
   // instantiated (it feeds the unused BPlanes fallback), so with a fold the plain blockK would give a sub-32B
   // contiguous run and trip MixGemm_AIU_Operand's `BlockContSize % 32 == 0` static_assert.
+  // PER-PLANE N-FOLD. The fold factor is a per-plane quantity -- F_p = contig_p >= 32 ? 1 : 32/contig_p with
+  // contig_p = Block_K * bits_p / 8 -- and plane 2 is the SPARSER plane, so at the same Block_K its contiguous run is
+  // 2x/4x smaller and can fall below the AIU's 32 B minimum. Giving both planes ONE fold factor is exactly what pinned
+  // the 2-plane path to Block_K >= 256: the only K where int2 and int1 both reach 32 B unfolded. Plane 2 now folds the
+  // EXTRA amount it needs on top of plane 1's (BFoldBlockK already carries plane 1's), so Q3 reaches Block_K = 128
+  // (int2 F=1, int1 F=2) and 64 (F=2 / F=4). Derived (fold_derivation/l42_2plane_fold.cu): every folded configuration
+  // comes out with P2_DIV = 1, simpler than today's 2, and at Block_K=64 the shared logical mma fragment is the same
+  // ((2,2,2),4,4):((1,2,4),32,8) as the single-plane int1 config that measures 63.7%.
+  using P2Elem = cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>;
+  static constexpr int P2Contig = BFoldBlockK * cutlass::sizeof_bits<P2Elem>::value / 8;  // bytes AFTER plane 1's fold
+  static constexpr int P2Fold   = P2Contig >= 32 ? 1 : 32 / P2Contig;   // the extra fold plane 2 needs
+  static_assert(P2Contig * P2Fold >= 32 || !HasPlane2,
+      "plane 2 cannot reach the AIU 32 B contiguous minimum at this Block_K even folded -- raise Block_K");
+  static_assert(BFoldBlockN % P2Fold == 0 || !HasPlane2, "plane 2's fold must divide Block_N");
   using DefaultOperandB2 = detail::MixGemm_AIU_Operand<
-      cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>, false, Int<BFoldBlockN>, Int<BFoldBlockK>, true>;
+      P2Elem, false, Int<BFoldBlockN / P2Fold>, Int<BFoldBlockK * P2Fold>, true>;
 
   // Both planes' atoms ride the EXISTING single template params (CollectiveMma's parameter list is fixed by its
   // primary template). collective::BPlanes is the marker -- NOT cute::is_tuple, since a cute Layout is itself

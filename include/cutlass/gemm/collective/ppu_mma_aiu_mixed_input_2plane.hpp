@@ -273,11 +273,22 @@ public:
       InternalSmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
-  // Plane 2 covers the SAME logical (N,K,Stages) extent; only its element width (hence byte footprint and atom)
-  // differ. This collective requires !SwapAB (asserted below), so the atom is used directly.
+  // PER-PLANE N-FOLD. Plane 2 covers the same LOGICAL (N,K) extent, but PHYSICALLY it may be folded harder than plane
+  // 1: the builder gave it (Block_N/P2Fold, P2Fold*Block_K) so its contiguous run reaches the AIU's 32 B minimum. The
+  // fold factor is read straight OFF THE ATOM rather than passed in again -- the builder already encoded it, and a
+  // second copy of the rule is where the next divergence comes from.
+  //
+  // Physical, not logical, exactly as the single-plane fold collective does: the AIU writes and the swzl atom reads
+  // the physical shape, and presenting a logical view to them is what produced "TSM out of range" there. Plane 2 never
+  // feeds the mma fragment (only plane 1 does, through tCrB_mma), so no logical view is needed for it at all.
+  static constexpr int P2Fold = size<1>(SmemLayoutAtomB2{}) / size<2>(TileShape{});
+  static_assert(P2Fold >= 1 && (size<1>(SmemLayoutAtomB2{}) % size<2>(TileShape{})) == 0,
+      "plane 2's atom K must be an integer multiple of TileShape.K (that multiple IS its fold factor)");
+  static_assert((size<1>(TileShape{}) % P2Fold) == 0, "plane 2's fold must divide TileShape.N");
   using SmemLayoutB2 = decltype(tile_to_shape(
       SmemLayoutAtomB2{},
-      make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+      make_shape(Int<size<1>(TileShape{}) / P2Fold>{}, Int<P2Fold * size<2>(TileShape{})>{},
+                 Int<DispatchPolicy::Stages>{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
   using SmemLayoutScale = decltype(tile_to_shape(
@@ -356,9 +367,13 @@ public:
     ElementZero const* ptr_Z = nullptr;
     int const* group_row_offsets = nullptr;   // ragged grouped: per-expert cumulative A row start; null=uniform
     // 2nd bit plane. Deliberately LAST so callers' positional brace-init of the fields above is unchanged; set it
-    // separately (args.mainloop.ptr_B2 = ...). Same logical [N][K] extent, so dB is reused (strides are in
-    // ELEMENTS) -- only the byte footprint differs.
+    // separately (args.mainloop.ptr_B2 = ...).
     PlaneB2 const* ptr_B2 = nullptr;
+    // PER-PLANE N-FOLD: plane 2 may be folded harder than plane 1, in which case its PHYSICAL buffer is
+    // (N/P2Fold) rows x (K*P2Fold) codes and its row pitch differs from dB. Leave dB2_valid false to reuse dB, which
+    // is correct exactly when the two planes share a fold factor (P2Fold == 1) -- the pre-existing behaviour.
+    StrideB dB2{};
+    bool dB2_valid = false;
   };
 
   // Device side kernel params
@@ -371,6 +386,8 @@ public:
     RealInternalElementB const* ptr_B = nullptr;
     InternalStrideB dB{};
     PlaneB2 const* ptr_B2 = nullptr;
+    StrideB dB2{};
+    bool dB2_valid = false;
 
     NonVoidElementScale const* ptr_S = nullptr;
     NonVoidElementZero const* ptr_Z = nullptr;
@@ -411,6 +428,8 @@ public:
     // Bit-plane concat only makes sense with the narrow operand as B; the 2nd plane rides the same dB.
     static_assert(!SwapAB, "2-plane mainloop requires the narrow operand to be B (SwapAB=false)");
     p.ptr_B2 = args.ptr_B2;
+    p.dB2 = args.dB2;
+    p.dB2_valid = args.dB2_valid;
     p.group_row_offsets = args.group_row_offsets;
 
     if constexpr (ModeHasScales) {
@@ -864,26 +883,36 @@ private:
   auto load_init_B2(Params const& mainloop_params, int N, int K, int L, int l_coord) {
     auto kCon = kContinous{};
     using TilerB2 = typename GmemTiledCopyB2::Tiler_MN;
+    // PER-PLANE N-FOLD: a folded plane-2 buffer is (N/P2Fold) physical rows of (K*P2Fold) codes, so BOTH the shape and
+    // the stride must be folded here. The single-plane fold collective learned this the expensive way: the
+    // interleaved branch builds its own shape/stride from N,K,kCon WITHOUT consulting dB, so patching only the
+    // non-interleaved branch is dead code for a %256-aligned shape -- four different offline placements then all
+    // measured the same ~72% random result because the gmem WALK was wrong independently of the placement.
+    // P2Fold == 1 reproduces the previous code exactly.
+    const int N2 = N / P2Fold, K2 = K * P2Fold;
     if constexpr (kCon != 1) {
       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2),
-        make_shape(N, make_shape(kCon, K / kCon), L),
-        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N),
-                    int64_t(N) * int64_t(K) * sizeof_bits<PlaneB2>::value / 8)
+        make_shape(N2, make_shape(kCon, K2 / kCon), L),
+        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N2),
+                    int64_t(N) * int64_t(K) * sizeof_bits<PlaneB2>::value / 8)   // L-stride is fold-invariant (bytes)
       );
       Tensor mB_nk = mB_nkl(_,_,l_coord);
       auto layout_counting = make_layout(
         mB_nk.shape(),
-        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N}))
+        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N2}))
       );
       Tensor mB_nk_counting = make_counting_tensor(layout_counting);
       gmem_tiled_copy_B2.desc_.template init<PlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
-            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N * K / kCon, kCon, mB_nk.stride());
+            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N2 * K2 / kCon, kCon, mB_nk.stride());
       return mB_nk_counting;
     } else {
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2), make_shape(N,K,L), mainloop_params.dB);
+      // dB2 carries plane 2's OWN folded row pitch (set in launch); the SHAPE must match it. Falls back to dB when the
+      // caller has not supplied one, which is the unfolded case where the two coincide.
+      auto d2 = mainloop_params.dB2_valid ? mainloop_params.dB2 : mainloop_params.dB;
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2), make_shape(N2, K2, L), d2);
       Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
       gmem_tiled_copy_B2.desc_.template init<PlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
-            nullptr, N, K, mainloop_params.dB);
+            nullptr, N2, K2, d2);
       return mB_nk;
     }
   }
