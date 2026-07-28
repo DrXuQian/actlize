@@ -553,6 +553,14 @@ public:
     Tensor gB = get<1>(load_inputs);
     Tensor gB2 = get<sizeof...(Ts) - 1>(load_inputs);      // plane 2 is tuple_cat'd last by load_init
     auto k_iter_shape = cute::shape<2>(gB);
+    // PER-PLANE N-FOLD: plane 2's k-iteration shape is NOT plane 1's. local_tile divides the interleaved counting
+    // tensor's NESTED K mode (kCon, K/kCon) by the tiler's K, and the two planes now use different tiler Ks -- so at
+    // Block_K=128 plane 1's k mode comes out NESTED (2,1) while plane 2's folded tiler (F2*TK == kCon) divides it
+    // exactly and leaves a SCALAR. Feeding plane 1's tuple coordinate to plane 2 is the box failure at 2plane.hpp:808
+    // ("no matching function", Coords = <Underscore, packed_tuple<int,int>>): it is a COORDINATE SHAPE mismatch, not
+    // the rank mismatch it first looked like -- both partition_S results are rank 4 (derived in
+    // fold_derivation/l43_partition_rank.cu, with the real AIU copy atom). Identical shapes when P2Fold == 1.
+    auto k_iter_shape_b2 = cute::shape<2>(gB2);
 
     // Construct shared memory tiles
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -588,13 +596,14 @@ public:
     // Start async loads for all pipes but the last
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
-      auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+      auto k_iter_crd    = cute::idx2crd(*k_tile_iter, k_iter_shape);
+      auto k_iter_crd_b2 = cute::idx2crd(*k_tile_iter, k_iter_shape_b2);
       copy_aiu(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe),
         warp_idx
       );
-      copy_aiu(gmem_tiled_copy_B2, slice_last(tB2gB2, k_iter_crd), slice_last(tB2sB2, k_pipe), warp_idx);
+      copy_aiu(gmem_tiled_copy_B2, tB2gB2(_,_,_,k_iter_crd_b2), tB2sB2(_,_,_,k_pipe), warp_idx);
       copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, k_pipe);
       cp_async_fence();
       --k_tile_count;
@@ -799,13 +808,14 @@ public:
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
         {
-          auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+          auto k_iter_crd    = cute::idx2crd(*k_tile_iter, k_iter_shape);
+          auto k_iter_crd_b2 = cute::idx2crd(*k_tile_iter, k_iter_shape_b2);
           copy_aiu(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
             gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write),
             warp_idx
           );
-          copy_aiu(gmem_tiled_copy_B2, slice_last(tB2gB2, k_iter_crd), slice_last(tB2sB2, smem_pipe_write), warp_idx);
+          copy_aiu(gmem_tiled_copy_B2, tB2gB2(_,_,_,k_iter_crd_b2), tB2sB2(_,_,_,smem_pipe_write), warp_idx);
           copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, smem_pipe_write);
           cp_async_fence();
           if (k_tile_count > 1) { ++k_tile_iter; }
@@ -884,17 +894,6 @@ private:
             nullptr, N, K, mainloop_params.dB);
       return mB_nk;
     }
-  }
-
-  // RANK-AGNOSTIC LAST-MODE SLICE. tB2gB2's rank is NOT fixed at 4: it depends on how plane 2's (possibly folded)
-  // tiler divides the interleaved counting tensor's NESTED K mode -- the box reported five modes against a hardcoded
-  // (_,_,_,k_iter_crd). Rather than track which configuration yields which rank, slice the last mode and leave every
-  // leading mode alone. Spelling verified locally against synthetic rank-4 and rank-5 tensors; at rank 4 it is exactly
-  // (_,_,_,c), so the unfolded path is byte-for-byte the previous code.
-  template <class T, class C>
-  CUTLASS_DEVICE static auto slice_last(T const& t, C const& c) {
-    constexpr int R = decltype(cute::rank(t))::value;
-    return t(cute::append<R>(cute::repeat<R-1>(cute::_), c));
   }
 
   // Plane 2's gmem tensor + AIU descriptor. Exact mirror of load_init_B; note the per-expert L-stride uses
