@@ -230,6 +230,19 @@ public:
 
   using RealInternalElementA = cute::conditional_t<!SwapAB, ElementA, ElementB>;
   using RealInternalElementB = cute::conditional_t<!SwapAB, ElementB, ElementA>;
+  // PPU_B_CHUNK on the 2-plane path (task #12). Same flag as the fold collective, and the same reason it is a
+  // constexpr bool rather than an #if: an #if leaves the other branch un-type-checked, which is how an int1-only
+  // emitter got instantiated for uint2b_t and produced 576 errors. Gated on the plane WIDTHS, because
+  // MixGemm2Plane_uint2_uint1 is exactly (low int2, high int1) -- any other pair must not reach it.
+  static constexpr int kBChunkMode =
+#if defined(PPU_B_CHUNK)
+      (PPU_B_CHUNK);
+#else
+      0;
+#endif
+  static constexpr bool kBChunk = (kBChunkMode != 0)
+                               && (cutlass::sizeof_bits<RealInternalElementB>::value == 2)
+                               && (cutlass::sizeof_bits<PlaneB2>::value == 1);
   using InternalStrideA  = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using InternalStrideB  = cute::conditional_t<!SwapAB, StrideB, StrideA>;
 
@@ -569,6 +582,10 @@ public:
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor tCrA     = thr_mma.partition_fragment_A(sA(_,_,0));                // (MMA,MMA_M,MMA_K)
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
+    // PPU_B_CHUNK: one k-atom of converted B, reused across atoms, instead of tCrB_mma's MMA_K atoms held at once:
+    // 4*MMA_N*MMA_K fp16 registers -> 4*MMA_N. Declared unconditionally and dead-code-eliminated when kBChunk is
+    // false, because the mainloop lambda captures it by reference.
+    Tensor tCrB_one = make_fragment_like(tCrB_mma(_,_,Int<0>{}));
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) == size<2>(accum));                // MMA_N
@@ -646,6 +663,13 @@ public:
     constexpr int P2_DIV = decltype(cute::size<2>(tCrB_copy_view))::value
                          / decltype(cute::size<2>(tCrB2_copy_view))::value;
     static_assert(P2_DIV >= 1, "plane 2's CPY_K must not exceed plane 1's");
+    // The chunk gate splits ONE int2 delivery (16 B = 64 codes per n = 8 mma B atoms) into 8 chunks, so the collective
+    // must agree that a copy step is 8 atoms. It is structurally so for int2 -- the delivery width fixes it, and l40
+    // confirms 8 at both (64,64,256) and (32,128,256) -- but assert it rather than trust it: if K_ATOM_PER_COPY were
+    // SMALLER the loop would emit only part of the delivery and silently drop half2 slots, which is the failure mode
+    // that reads as a plausible-but-wrong result rather than a crash.
+    static_assert(!kBChunk || decltype(K_ATOM_PER_COPY)::value == MixGemm2Plane_uint2_uint1<>::kAtoms,
+        "PPU_B_CHUNK (2-plane): a copy step must be exactly the 8 k-atoms one int2 delivery carries");
 
     // PPU_MMA_PROBE=1: the same "let the kernel report its own indices" probe the fold collective has, plus the two
     // LAYOUTS -- because chunking B here needs to know what the emission's index space actually is, and a local cute
@@ -689,8 +713,11 @@ public:
       // the controlled-input probe measured (rung1 got == exp-4 for high=ALL ONES, decoded index identically 0).
       copy(smem_tiled_copy_B2, tCsB2(_,_,Int<0>{},smem_pipe_read), tCrB2_copy_view(_,_,Int<0>{}));
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
-      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
-          copy_partitions_extra_info, smem_pipe_read);
+      // Chunked: the mma loop converts each atom just before its gemm, so there is nothing to do for the whole step.
+      if constexpr (!kBChunk) {
+        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, 0,
+          K_ATOM_PER_COPY, copy_partitions_extra_info, smem_pipe_read);
+      }
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -712,17 +739,34 @@ public:
           __syncthreads();
         }
 
+        // THE STAGE THIS ITERATION'S B CODES CAME FROM, captured BEFORE the advance below. With K_BLOCK_MAX == 1 the
+        //   if (k_block == K_BLOCK_MAX-2 || K_BLOCK_MAX == 1) { ++smem_pipe_read; }
+        // block fires EVERY iteration and sits BEFORE the mma loop, so the chunked per-atom transform -- which runs
+        // inside that loop -- would otherwise read the ALREADY-ADVANCED stage for its scale. On the fold path that
+        // showed up as bad=85545 with every wrong line decoding to scale group g=2 where g=0 was right.
+        int const b_consume_stage = smem_pipe_read;
+
         // Load A, B shmem->regs for k_block+1
         auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
         // Plane 2 (see the prologue site). Re-reading the same plane-2 k_block on each of the P2_DIV plane-1
         // k_blocks it serves is idempotent; gate it on (k_block_next % P2_DIV == 0) once this MATCHes.
-        copy(smem_tiled_copy_B2, tCsB2(_,_,Int<decltype(k_block_next)::value / P2_DIV>{},smem_pipe_read),
-             tCrB2_copy_view(_,_,Int<decltype(k_block_next)::value / P2_DIV>{}));
+        // CHUNKED: this prefetch is a READ-AFTER-CLOBBER hazard and is skipped. Plane 2 has P2_DIV times FEWER copy
+        // slots than plane 1 -- at the shipping shape it has exactly ONE, shared by both k_blocks -- so on the last
+        // k_block, where smem_pipe_read has already advanced, it overwrites that slot with the NEXT tile's codes. In
+        // the unchunked flow that is harmless (the conversion already ran, the registers hold fp16); with the
+        // conversion deferred into the mma loop the loop would read the next tile's high bits for half its k-atoms.
+        // Wrong but plausible-looking output -- so plane 2 is instead re-read per k_block from b_consume_stage below.
+        if constexpr (!kBChunk) {
+          copy(smem_tiled_copy_B2, tCsB2(_,_,Int<decltype(k_block_next)::value / P2_DIV>{},smem_pipe_read),
+               tCrB2_copy_view(_,_,Int<decltype(k_block_next)::value / P2_DIV>{}));
+        }
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
-          copy_partitions_extra_info, smem_pipe_read);
+        if constexpr (!kBChunk) {
+          transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB2_copy_view, tCrB_mma, partitioned_extra_info,
+            k_block_next, K_ATOM_PER_COPY, copy_partitions_extra_info, smem_pipe_read);
+        }
 
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
@@ -745,14 +789,33 @@ public:
           smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
         }
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
-          auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
-          // Transform before compute
-          cute::transform(tCrA(_,_,atom_idx), TransformA{});
-          cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
-          // gemm for one tiled_mma atom on K
-          cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
+        if constexpr (kBChunk) {
+          // Plane 2, read HERE from the stage this iteration actually consumes -- see the skipped prefetch above.
+          // Idempotent and cheap (one swzl read of a slot that serves P2_DIV k_blocks), and it removes the hazard
+          // rather than reasoning about when the clobber is survivable.
+          constexpr int kP2Slot = decltype(k_block)::value / P2_DIV;
+          copy(smem_tiled_copy_B2, tCsB2(_,_,Int<kP2Slot>{}, b_consume_stage), tCrB2_copy_view(_,_,Int<kP2Slot>{}));
+          // for_each, not a for loop: the chunk must be a TEMPLATE argument so the emission gate stays compile-time.
+          for_each(make_int_sequence<decltype(K_ATOM_PER_COPY)::value>{}, [&] (auto k_loop) {
+            constexpr int kChunk = decltype(k_loop)::value;
+            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+            transform_B_atom<RealInternalElementB, kChunk, decltype(K_ATOM_PER_COPY)::value>(
+                tCrB_copy_view, tCrB2_copy_view, tCrB_one, partitioned_extra_info, k_block, atom_idx,
+                copy_partitions_extra_info, b_consume_stage);
+            cute::transform(tCrA(_,_,atom_idx), TransformA{});
+            cute::transform(tCrB_one, TransformB{});
+            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_one, accum);
+          });
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
+            auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+            // Transform before compute
+            cute::transform(tCrA(_,_,atom_idx), TransformA{});
+            cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
+            // gemm for one tiled_mma atom on K
+            cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
+          }
         }
       });
 
@@ -1153,7 +1216,7 @@ private:
       // derivation block above MixGemm2Plane_uint2_uint1 in fast_numeric_conversion_for_mix_gemm.h.
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
                            + (k_block % P2_DIV_);
-      MixGemm2Plane_uint2_uint1::convert(lo_p, hi_p, o_p);
+      MixGemm2Plane_uint2_uint1<>::convert(lo_p, hi_p, o_p);   // <> == the full 32-half2 delivery
     }
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
@@ -1161,71 +1224,100 @@ private:
     constexpr bool FINE   = (int(Scale_TileK) > KBM_);                  // gs < copy-step K -> per-atom scale
     constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;    // mma atoms per scale group (FINE only)
 
-    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      // do nothing
+    // ONE per-atom scale rule (apply_scale_atom below), looped over this copy step's atoms. This block used to be
+    // four hand-rolled copies of the FINE / APG_ / reload-at-group-boundary logic -- and two of them used a LOCAL
+    // `auto tCrS`, which make_fragment_like makes OWNING, so it snapshots stale rmem after a reload. The chunked path
+    // added below needs the same rule for a single atom, and one rule with two implementations is where the next
+    // divergence comes from; the fold collective was de-duplicated the same way for the same reason.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
+      int const atom_idx = k_block * K_ATOM_PER_COPY + i;
+      apply_scale_atom<FINE, APG_>(tCrB_mma(_, _, atom_idx), partitioned_extra_info,
+                                   tiled_copy_and_views, atom_idx, read_stage);
     }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      auto tCrS = cute::get<1>(partitioned_extra_info);
-      if constexpr (!FINE) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
-        }
-      } else {
-        // FINE: write via tCrS_copy_view (a retile VIEW of the ORIGINAL fragment) then read the ORIGINAL back --
-        // NOT the local `tCrS` copy above (make_fragment_like is owning, so `auto tCrS` snapshots stale rmem).
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCsS              = cute::get<0>(partitioned_extra_info);
-        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          int g = atom_idx / APG_;                                      // this atom's scale group within the tile
-          if (atom_idx % APG_ == 0)                                     // reload only at a group's first atom
-            copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
-          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
-        }
-      }
-    }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      auto tCrS = cute::get<1>(partitioned_extra_info);
-      auto tCrZ = cute::get<3>(partitioned_extra_info);
-      if constexpr (!FINE) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
-          cute::transform(tCrB_mma(_, _, atom_idx), tCrZ(_, _, 0), tCrB_mma(_, _, atom_idx), cute::plus{});
-        }
-      } else {
-        // FINE: see ConvertAndScale note -- write via the copy VIEWs, read the ORIGINAL fragments back.
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCsS              = cute::get<0>(partitioned_extra_info);
-        auto tCsZ              = cute::get<2>(partitioned_extra_info);
-        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          int g = atom_idx / APG_;
-          if (atom_idx % APG_ == 0) {                                   // reload only at a group's first atom
-            const int sk = read_stage * int(Scale_TileK) + g;
-            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+  }
+
+  // ONE place for the per-atom scale rule -- transform_B_kblock loops its atoms and calls this, transform_B_atom calls
+  // it once. Always reads get<1>/get<3>(info) directly rather than a local snapshot, which is correct with and without
+  // a reload (without one, they are the same object).
+  template <bool FINE, int APG, class BSlice, class... Ts, class CopyViews>
+  CUTLASS_DEVICE
+  void apply_scale_atom(BSlice&& b_slice,
+                        cute::tuple<Ts...> const& info,
+                        CopyViews const& views,
+                        int const atom_idx,
+                        int const read_stage) {
+    if constexpr (ModeHasScales) {
+      if constexpr (FINE) {
+        auto smem_tiled_copy_S = cute::get<0>(views);
+        auto tCsS              = cute::get<0>(info);
+        auto tCrS_copy_view    = cute::get<1>(views);
+        if (atom_idx % APG == 0) {                        // reload only at a scale group's first atom
+          const int sk = read_stage * int(Scale_TileK) + atom_idx / APG;
+          copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto tCsZ           = cute::get<2>(info);
+            auto tCrZ_copy_view = cute::get<2>(views);
             copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
           }
-          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
-          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<3>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, atom_idx), cute::plus{});
         }
       }
+      cute::transform(b_slice, cute::get<1>(info)(_,_,0), b_slice, cute::multiplies{});
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        cute::transform(b_slice, cute::get<3>(info)(_,_,0), b_slice, cute::plus{});
+      }
     }
-    else {
-      assert(false);
-    //   static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
+  }
+
+  // PPU_B_CHUNK (task #12): convert ONE k-atom of BOTH planes into a one-atom fp16 buffer, so B costs 4*MMA_N
+  // registers instead of 4*MMA_N*MMA_K. Chunk must be a TEMPLATE parameter -- the emission gate is
+  // `if constexpr (keep(T, V))`, and a runtime `if` would make the saving depend on the compiler folding branches.
+  //
+  // ONE GATE COVERS BOTH PLANES, and that is what makes this small rather than a fourth hand-derived index map: each
+  // _E2 line reads the low crumb AND the high bit and writes ONE half2, so gating the line gates both
+  // (fold_derivation/l38, verified for NChunk 2 and 4). The gate itself is at_plain/4 == Chunk, at_plain%4 -- a plain
+  // division rather than the fold path's right_inverse composition, because l40 showed cvt_in's mode-1 stride equals
+  // tCrB_mma's MMA_N stride here, so each `ii` fills 64 CONTIGUOUS fp16 = 8 k-atoms of one n with k inner.
+  //
+  // NO CROSS-ITERATION HAZARD: tCrB_load has one slot per copy step and the prefetch writes k_block_next while this
+  // reads k_block, so deferring the conversion into the mma loop cannot see overwritten codes. Note the plane-2 read
+  // is idempotent across the P2_DIV plane-1 k_blocks it serves.
+  template <class RealB, int Chunk, int NChunk,
+            class TCrB_load, class TCrB2_load, class TCrB_one, class... Ts, class CopyViews>
+  CUTLASS_DEVICE
+  void transform_B_atom(
+    TCrB_load const& tCrB_load,
+    TCrB2_load const& tCrB2_load,
+    TCrB_one& tCrB_one,
+    cute::tuple<Ts...> const& partitioned_extra_info,
+    int const k_block,
+    int const atom_idx,
+    CopyViews const& tiled_copy_and_views,
+    int const read_stage) {
+
+    constexpr int P2_DIV_ = decltype(cute::size<2>(tCrB_load))::value
+                          / decltype(cute::size<2>(tCrB2_load))::value;
+    // raw_pointer_cast FIRST -- these are SUBBYTE tensors, so .data() is a cute::subbyte_iterator and
+    // reinterpret_cast from that class type is ill-formed (exactly how the fold build failed on the box).
+    Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
+    Tensor cvt_hi = recast<PlaneB2>(tCrB2_load(_, _, k_block / P2_DIV_));
+    constexpr int NumIter = decltype(cute::size<1>(cvt_in))::value;          // == MMA_N
+    // tCrB_one is make_fragment_like'd from a single mma atom, so it is COMPACT: n stride is 8 fp16 == 4 half2. That
+    // recompaction is why the destination here is `+ 4*ii` and not cvt_in's mode-1 stride.
+    uint32_t* out = reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data()));
+    CUTLASS_PRAGMA_UNROLL
+    for (int ii = 0; ii < NumIter; ++ii) {
+      uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, ii).data()));
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
+                           + (k_block % P2_DIV_);
+      MixGemm2Plane_uint2_uint1<Chunk>::convert(lo_p, hi_p, out + 4 * ii);
     }
+
+    constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;       // copy steps per k-tile
+    constexpr int MMA_KA_ = NChunk * KBM_;                                   // total mma-K atoms in the tile
+    constexpr bool FINE   = (int(Scale_TileK) > KBM_);
+    constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;
+    apply_scale_atom<FINE, APG_>(tCrB_one, partitioned_extra_info, tiled_copy_and_views, atom_idx, read_stage);
   }
 
   /// Utilities for transforming the A operand prior to issuing tensor cell math.

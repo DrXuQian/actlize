@@ -710,43 +710,77 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 // Placement trick that keeps ONE correction per half2: the low code sits at mantissa base b = 2*(t%4) (the four
 // int2 masks 0x03/0x0c/0x30/0xc0), so the high bit is placed at mantissa b+2, i.e. it contributes exactly
 // 4 * 2^b == 2^bl * 2^b. The single per-mask fma (2^-b, -2^(10-b)) then yields (low + 4*high) directly.
+// CHUNKING (task #12): Chunk >= 0 emits ONLY the half2 belonging to k-atom `Chunk`, into a 4-half2 one-atom buffer,
+// so the mainloop can hold 4*MMA_N fp16 registers for B instead of 4*MMA_N*MMA_K. Chunk = -1 is the full delivery and
+// is bit-identical to the version that shipped -- the eight destinations below used to be hardcoded as
+// h2[base + {0,1,4,5,8,9,12,13}] with base = 16*(v&1) + 2*(v>=2), and AtLayout reproduces all 32 of them exactly
+// (fold_derivation/l41_2plane_chunk_gate.cu, 0/32 differ).
+//
+// WHY THE GATE IS A DIVISION AND NOT A right_inverse COMPOSITION (unlike the single-plane MixGemmChunkEmit). l40
+// derived the real layouts from the builder's own type algebra and found cvt_in's mode-1 stride (128) EQUAL to
+// tCrB_mma's MMA_N stride (128) at the 2-plane's TileShape, so the flat pointer write the collective already does is
+// an exact partition of the fragment: per `ii` the converter fills 64 CONTIGUOUS fp16 = 8 k-atoms of ONE n, with k
+// inner. Hence k-atom == at_plain/4 and the in-atom slot == at_plain%4. The single-plane fold path needs the
+// composition because there MmaPermK = TileShape.K puts the fragment in a different mode order; here MmaPermK is the
+// 32 B run span (ppu_mma_builder.inl:588). That one constant is the whole difference.
+template <int Chunk = -1>
 struct MixGemm2Plane_uint2_uint1
 {
-    // lo: 4 swzl vregs (64 crumbs). hi: base already offset by the low k_block parity; this k_block's two vregs
-    // are STRIDE 2 apart, so low vreg v uses hi[2*(v>>1)], half selected by v&1 (see the derivation above).
-    // out: 32 half2 (= 64 fp16), laid out exactly like the validated single-plane uint2 converter.
+    // (t, v) -> half2 slot in the 32-slot delivery. colex 1-D domain t + 8*v, same idiom as MixGemmEmit.
+    using AtLayout = cute::Layout<cute::Shape <cute::Shape<cute::_2,cute::_4>, cute::Shape<cute::_2, cute::_2>>,
+                                  cute::Stride<cute::Stride<cute::_1,cute::_4>, cute::Stride<cute::_16,cute::_2>>>;
+    static constexpr int kPerAtom = 4;                       // half2 per mma B k-atom (4 half2 == 8 fp16)
+    static constexpr int kAtoms   = 32 / kPerAtom;           // 8 == K_ATOM_PER_COPY at the 2-plane's TileShape
+    static_assert(Chunk < kAtoms, "MixGemm2Plane_uint2_uint1: Chunk out of range");
+
+    static constexpr int  at_plain(int t, int v) { return int(AtLayout{}(t + 8 * v)); }
+    static constexpr bool keep(int t, int v)     { return Chunk < 0 || (at_plain(t, v) / kPerAtom) == Chunk; }
+    static constexpr int  at(int t, int v)       { return Chunk < 0 ? at_plain(t, v) : at_plain(t, v) % kPerAtom; }
+    // A chunk touches only TWO of the four vregs (l41), so the other two are not even READ -- gate the vreg, not just
+    // its lines, or a chunked pass still pays for four lo[] and two hi[] loads.
+    static constexpr bool vreg_used(int v) {
+      for (int t = 0; t < 8; ++t) if (keep(t, v)) return true;
+      return false;
+    }
+
+    // (mask, mul, add, bpos) come from MixGemmChunkEmit<2> -- ONE rule, derived from Bits, shared with the
+    // single-plane int2 converter. The only 2-plane-specific part is the high bit OR into mantissa position b+2.
+    using E = MixGemmChunkEmit<2, -1, 1>;
+
+    template <int T, int V>
+    CUTLASS_DEVICE static void emit_one(uint32_t reg, uint32_t r8, uint32_t hreg, uint32_t* h2) {
+      const uint32_t src = (T / 4) ? r8 : reg;               // t>=4 reads the second byte level
+      uint32_t x;
+      asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(x)
+                   : "r"(src), "n"(E::template mask<T>()), "n"(0x64006400u), "n"(0xEAu));
+      x |= ((hreg >> (8 * (V & 1) + T)) & 0x00010001u) << (E::template bpos<T>() + 2);
+      asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(x)
+                   : "r"(x), "r"(E::template mul<T>()), "r"(E::template add<T>()));
+      h2[at(T, V)] = x;
+    }
+
+    template <int V>
+    CUTLASS_DEVICE static void emit_v(uint32_t const* lo, uint32_t const* hi, uint32_t* h2) {
+      const uint32_t reg = lo[V], r8 = reg >> 8;
+      // WHICH high vreg serves low vreg V -- DERIVED from the two validated single-plane converters (see the header
+      // block above), not guessed. hi points at the high fragment already offset by the low k_block parity, and the
+      // two vregs this k_block owns are STRIDE 2 apart, so hi[2*(V>>1)] == absolute vreg kb + 2*(V>=2).
+      const uint32_t hreg = hi[2 * (V >> 1)];
+      cute::for_each(cute::make_int_sequence<8>{}, [&] (auto t) {
+        constexpr int T = decltype(t)::value;
+        if constexpr (keep(T, V)) emit_one<T, V>(reg, r8, hreg, h2);
+      });
+    }
+
+    // lo: 4 swzl vregs (64 crumbs). hi: base already offset by the low k_block parity.
+    // out: 32 half2 (= 64 fp16) for Chunk < 0, else 4 half2 for k-atom `Chunk`.
     CUTLASS_DEVICE
     static void convert(uint32_t const* lo, uint32_t const* hi, uint32_t* h2)
     {
-        #define _E2(dst, losrc, MASK, MUL, ADD, HISRC, HISH, HIPOS) do {                                   \
-            uint32_t _x;                                                                                   \
-            asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(_x)                                       \
-                         : "r"(losrc), "n"(MASK), "n"(0x64006400u), "n"(0xEAu));                           \
-            _x |= (((HISRC) >> (HISH)) & 0x00010001u) << (HIPOS);   /* high bit -> mantissa b+2 */          \
-            asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(_x)                                     \
-                         : "r"(_x), "r"((uint32_t)(MUL)), "r"((uint32_t)(ADD)));                            \
-            (dst) = _x; } while (0)
-        CUTLASS_PRAGMA_UNROLL
-        for (int v = 0; v < 4; ++v) {
-          uint32_t reg = lo[v], r8 = reg >> 8;
-          // WHICH high vreg serves low vreg v -- DERIVED from the two validated single-plane converters (see the
-          // header block above), not guessed. hi points at the high fragment already offset by the low k_block
-          // parity, and the two vregs this k_block owns are STRIDE 2 apart, so hi[2*(v>>1)] == absolute vreg
-          // kb + 2*(v>=2).  hs is unchanged: pair index t + 8*(v&1) is what the alignment yields.
-          uint32_t hreg = hi[2 * (v >> 1)];
-          int hs   = 8 * (v & 1);
-          int base = 16 * (v & 1) + 2 * (v >= 2); // same N-half placement as the single-plane uint2 converter
-          //   pair t : low mask (mantissa base b=2*(t%4)), level reg/r8 for t<4 / t>=4, high bit at b+2
-          _E2(h2[base + 0 ], reg, 0x00030003u, 0x3c003c00u, 0xe400e400u, hreg, hs + 0, 2);   // t=0 b=0
-          _E2(h2[base + 1 ], reg, 0x000c000cu, 0x34003400u, 0xdc00dc00u, hreg, hs + 1, 4);   // t=1 b=2
-          _E2(h2[base + 4 ], reg, 0x00300030u, 0x2c002c00u, 0xd400d400u, hreg, hs + 2, 6);   // t=2 b=4
-          _E2(h2[base + 5 ], reg, 0x00c000c0u, 0x24002400u, 0xcc00cc00u, hreg, hs + 3, 8);   // t=3 b=6
-          _E2(h2[base + 8 ], r8,  0x00030003u, 0x3c003c00u, 0xe400e400u, hreg, hs + 4, 2);   // t=4 b=0
-          _E2(h2[base + 9 ], r8,  0x000c000cu, 0x34003400u, 0xdc00dc00u, hreg, hs + 5, 4);   // t=5 b=2
-          _E2(h2[base + 12], r8,  0x00300030u, 0x2c002c00u, 0xd400d400u, hreg, hs + 6, 6);   // t=6 b=4
-          _E2(h2[base + 13], r8,  0x00c000c0u, 0x24002400u, 0xcc00cc00u, hreg, hs + 7, 8);   // t=7 b=6
-        }
-        #undef _E2
+      cute::for_each(cute::make_int_sequence<4>{}, [&] (auto v) {
+        constexpr int V = decltype(v)::value;
+        if constexpr (vreg_used(V)) emit_v<V>(lo, hi, h2);
+      });
     }
 };
 
