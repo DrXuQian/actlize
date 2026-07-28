@@ -481,7 +481,16 @@ public:
     // Plane 2: same tiling as gB, appended LAST to the returned tuple. Safe because both kernels only index
     // get<0>/get<1>, static_assert size>=2, and forward the tail opaquely.
     auto mB2_nk = load_init_B2(mainloop_params, N, K, L, l_coord);
-    Tensor gB2 = local_tile(mB2_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});
+    // PER-PLANE N-FOLD: plane 2's gmem tensor is PHYSICALLY (N/P2Fold, K*P2Fold), so it must be cut with the folded
+    // tiler. Cutting it with TileShape gives a (TileN, TileK) gmem tile against a (TileN/P2Fold, P2Fold*TileK) smem
+    // tile -- the copy's `size<1>(src) == size<1>(dst)` static_assert then fires, which is exactly how the box build
+    // failed. The single-plane fold collective carries the same FoldTilerB for the same reason (there the symptom was
+    // an AIU descriptor built for the unfolded shape -> "TSM out of range" at runtime, which is worse than a compile
+    // error). P2Fold == 1 reproduces TileShape exactly.
+    using FoldTilerB2 = Shape<Int<size<0>(TileShape{})>,
+                              Int<size<1>(TileShape{}) / P2Fold>,
+                              Int<P2Fold * size<2>(TileShape{})>>;
+    Tensor gB2 = local_tile(mB2_nk, FoldTilerB2{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple(gA, gB, gB2);
