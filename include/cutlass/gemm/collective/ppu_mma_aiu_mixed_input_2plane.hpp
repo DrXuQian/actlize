@@ -1262,14 +1262,22 @@ private:
       // the two vregs a given low k_block owns are 2 APART (kb and kb+2), not adjacent. Offset by kb here; the
       // converter then indexes hi[2*(v>>1)]. DERIVED from the two validated single-plane converters -- see the
       // derivation block above MixGemm2Plane_uint2_uint1 in fast_numeric_conversion_for_mix_gemm.h.
-      // REVERTED to the shipped expression. The "surviving N index moves into the vreg offset" rewrite
-      //     &cvt_hi(_, ii % MMA_N2) + (k_block % P2_DIV) + P2_DIV * (ii / MMA_N2)
-      // was DERIVED but not gated against anything that already works, and it made the box WORSE: bad 15010 -> 29666
-      // out of 32768 at Block_K=128. Reverting restores the known reference point. The high-plane vreg pairing under a
-      // fold is now a question for a CONTROLLED-INPUT PROBE (scale=1, zero=0, high plane labelled by logical column so
-      // D exposes the map directly), not for more layout algebra -- three derivations in a row have missed it.
-      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
-                           + (k_block % P2_DIV_);
+      // PER-PLANE N-FOLD. With the shipped offset (k_block % P2_DIV) a folded plane 2 has P2_DIV == 1, so every ii
+      // reads vregs {0, 2} and vregs {1, 3} are NEVER touched -- HALF the tile's high bits cannot arrive, whatever the
+      // placement. The surviving N index must move into the vreg offset.
+      //
+      // This is the same expression that was reverted once. It is back because the derivation behind it is now GATED
+      // END TO END, which it was not then: fold_derivation/l49 composes offline o delivery o converter-pairing and
+      // requires the identity, and BOTH sides are validated byte-for-byte against the shipped offline -- plane 1 in
+      // l52 (int2, DL=1 and DL=2), plane 2 in l51/l53 (int1 folded, at K=512 and at the box's K=256). At the unfolded
+      // config, which measures bad=0 on the box, the composition reports 0 mispaired out of 32768.
+      //
+      // The run that measured 29666 was NOT a clean test of this: that pull also carried the whole batch of actlize
+      // portability fixes (template-argument trailing commas, the `template` disambiguator, dim3, cast_smem_ptr_to_uint
+      // and mma_ppu.h qualifiers). Two changes, one measurement.
+      constexpr int N2_ = decltype(cute::size<1>(cvt_hi))::value;
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii % N2_).data()))
+                           + (k_block % P2_DIV_) + P2_DIV_ * (ii / N2_);
       MixGemm2Plane_uint2_uint1<>::convert(lo_p, hi_p, o_p);   // <> == the full 32-half2 delivery
     }
 
