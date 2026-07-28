@@ -259,8 +259,15 @@ public:
   static_assert((size<2>(TileShape{}) % size<1>(InternalSmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
 
   static_assert(rank(InternalSmemLayoutAtomB{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
-  static_assert((size<1>(TileShape{}) % size<0>(InternalSmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
-  static_assert((size<2>(TileShape{}) % size<1>(InternalSmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+  // PER-PLANE N-FOLD: B's atom N is the PHYSICAL row count (TileShape.N / Fold) and its atom K is the FOLDED run
+  // (Fold * TileShape.K), so the unfolded "atom must divide the tile" relations do not hold -- the FOLDED ones do. The
+  // single-plane fold collective carries the same pair for the same reason. Both degenerate to the originals at
+  // Fold == 1. (P1Fold/P2Fold are defined below, next to the smem layouts they size.)
+  static_assert((size<1>(TileShape{}) % (size<0>(InternalSmemLayoutAtomB{})
+                * (size<1>(InternalSmemLayoutAtomB{}) / size<2>(TileShape{})))) == 0,
+                "fold: TileShape.N must be divisible by atomB.N * FoldF");
+  static_assert((size<1>(InternalSmemLayoutAtomB{}) % size<2>(TileShape{})) == 0,
+                "fold: B atom K must be an integer multiple of TileShape.K (that multiple IS the fold factor)");
 
   static_assert(rank(SmemLayoutAtomScale{}) == 2, "SmemLayoutAtomScale must be rank 2");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must equal the tile shape.");
@@ -595,7 +602,11 @@ public:
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
     CUTE_STATIC_ASSERT_V(size<0>(gB) == size<0>(sB));                          // BLK_N
     CUTE_STATIC_ASSERT_V(size<1>(gB) == size<1>(sB));                          // BLK_K
-    CUTE_STATIC_ASSERT_V(size<1>(sA) == size<1>(sB));                          // BLK_K
+    // PER-PLANE N-FOLD: sB's K extent is the PHYSICAL folded run (P1Fold * BLK_K) while sA's is the real BLK_K, so the
+    // equality only holds unfolded. Assert the folded relation instead of dropping the check -- it still catches a
+    // mismatched B operand Block_K, which is what it was there for.
+    static_assert(size<1>(SmemLayoutB{}) == P1Fold * size<2>(TileShape{}),
+                  "fold: sB's physical BLK_K must be P1Fold * TileShape.K");
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));        // PIPE
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));        // PIPE
 
