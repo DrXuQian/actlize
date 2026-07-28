@@ -269,9 +269,23 @@ public:
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+  // PER-PLANE N-FOLD, LOW plane. Its fold factor is read off its OWN atom, which the builder already sizes folded
+  // (BFoldBlockK = FoldF * blockK) -- the same trick P2Fold uses, so no fold factor has to travel through the dispatch
+  // policy. P1Fold == 1 reproduces the previous layout exactly.
+  static constexpr int P1Fold = size<1>(InternalSmemLayoutAtomB{}) / size<2>(TileShape{});
+  static_assert(P1Fold >= 1 && (size<1>(InternalSmemLayoutAtomB{}) % size<2>(TileShape{})) == 0,
+      "plane 1's atom K must be an integer multiple of TileShape.K (that multiple IS its fold factor)");
+  static_assert((size<1>(TileShape{}) % P1Fold) == 0, "plane 1's fold must divide TileShape.N");
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
-      make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+      make_shape(Int<size<1>(TileShape{}) / P1Fold>{}, Int<P1Fold * size<2>(TileShape{})>{},
+                 Int<DispatchPolicy::Stages>{})));
+  // The fold-in-N LOGICAL view the MMA fragment must be partitioned from when P1Fold > 1: (n'=(f,g), k) -> phys
+  // (g, f*TKe + k). Partitioning the PHYSICAL shape would give MMA_N = Ng and MMA_K = P1Fold*TKe/16, mismatching the
+  // accumulator's N and A's MMA_K. Verified in the single-plane fold collective, whose comment block this mirrors.
+  using SmemLayoutB_MmaView = decltype(make_layout(
+      make_shape (make_shape(Int<P1Fold>{}, Int<size<1>(TileShape{}) / P1Fold>{}), Int<size<2>(TileShape{})>{}),
+      make_stride(make_stride(Int<size<2>(TileShape{})>{}, Int<P1Fold * size<2>(TileShape{})>{}), _1{})));
 
   // PER-PLANE N-FOLD. Plane 2 covers the same LOGICAL (N,K) extent, but PHYSICALLY it may be folded harder than plane
   // 1: the builder gave it (Block_N/P2Fold, P2Fold*Block_K) so its contiguous run reaches the AIU's 32 B minimum. The
@@ -476,7 +490,12 @@ public:
 
     // B init (include init aiu desc)
     auto mB_nk = load_init_B(mainloop_params, N, K, L, l_coord);                                                // (n,k)
-    Tensor gB = local_tile(mB_nk, TileShape{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});                    // (BLK_N,BLK_K,k)
+    // PER-PLANE N-FOLD: same as plane 2 -- a folded gmem tensor is (N/P1Fold, K*P1Fold) physically, so the per-CTA
+    // tile must be cut with the folded tiler or copy.hpp's size<1>(src) == size<1>(dst) fires.
+    using FoldTilerB1 = Shape<Int<size<0>(TileShape{})>,
+                              Int<size<1>(TileShape{}) / P1Fold>,
+                              Int<P1Fold * size<2>(TileShape{})>>;
+    Tensor gB = local_tile(mB_nk, FoldTilerB1{}, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});                    // (BLK_N_phys,BLK_K_phys,k)
 
     // Plane 2: same tiling as gB, appended LAST to the returned tuple. Safe because both kernels only index
     // get<0>/get<1>, static_assert size>=2, and forward the tail opaquely.
@@ -618,7 +637,10 @@ public:
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor tCrA     = thr_mma.partition_fragment_A(sA(_,_,0));                // (MMA,MMA_M,MMA_K)
-    Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
+    // PER-PLANE N-FOLD: the MMA must see B through the fold-in-N LOGICAL view, not the physical smem shape. At
+    // P1Fold == 1 SmemLayoutB_MmaView is the plain row-major (TN, TK) and this is the previous expression.
+    Tensor tCrB_mma = thr_mma.partition_fragment_B(
+        make_tensor(sB(_,_,0).data(), SmemLayoutB_MmaView{}));                 // (MMA,MMA_N,MMA_K) ordinary N x K
     // PPU_B_CHUNK: one k-atom of converted B, reused across atoms, instead of tCrB_mma's MMA_K atoms held at once:
     // 4*MMA_N*MMA_K fp16 registers -> 4*MMA_N. Declared unconditionally and dead-code-eliminated when kBChunk is
     // false, because the mainloop lambda captures it by reference.
@@ -866,32 +888,36 @@ public:
 private:
   CUTLASS_DEVICE
   auto load_init_B(Params const& mainloop_params, int N, int K, int L, int l_coord) {
+    // PER-PLANE N-FOLD: a folded plane-1 buffer is (N/P1Fold) physical rows of (K*P1Fold) codes, so BOTH shape and
+    // stride must be folded. dB already carries the folded pitch (moe_grouped_ppu builds it from n/MOEG_FOLD), so the
+    // SHAPE has to match it. P1Fold == 1 is the previous code exactly.
+    const int N1_ = N / P1Fold, K1_ = K * P1Fold;
     auto kCon = kContinous{};
     using TilerB = typename GmemTiledCopyB::Tiler_MN;
     if constexpr (kCon != 1) {
       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B),
-        make_shape(N, make_shape(kCon, K / kCon), L),
+        make_shape(N1_, make_shape(kCon, K1_ / kCon), L),
         // GROUPED FIX: interleaved desc base = (uint8_t*)raw_pointer_cast(mB_nk.data()) treats the packed
         // ELEMENT L-stride as a BYTE count, so the stride must be in bytes: one expert weight is
         // N*K * sizeof_bits<B>/8 bytes (int4 -> N*K/2, int2 -> N*K/4, int8 -> N*K). (Was Int<0> -> every expert
         // read plane 0; wrong scale -> e>=2 read OOB garbage. This lands each expert exactly. No effect on L=1.)
-        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N), int64_t(N) * int64_t(K) * sizeof_bits<RealInternalElementB>::value / 8)
+        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N1_), int64_t(N) * int64_t(K) * sizeof_bits<RealInternalElementB>::value / 8)
       );
       Tensor mB_nk = mB_nkl(_,_,l_coord);
       auto layout_counting = make_layout(
         mB_nk.shape(),
-        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N}))
+        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N1_}))
       );
       Tensor mB_nk_counting = make_counting_tensor(layout_counting);
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
-            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N * K / kCon, kCon, mB_nk.stride());
+            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N1_ * K1_ / kCon, kCon, mB_nk.stride());
       return mB_nk_counting;
     } else {
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B), make_shape(N,K,L), mainloop_params.dB);
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B), make_shape(N1_, K1_, L), mainloop_params.dB);
       Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
 
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
-            nullptr, N, K, mainloop_params.dB);
+            nullptr, N1_, K1_, mainloop_params.dB);
       return mB_nk;
     }
   }

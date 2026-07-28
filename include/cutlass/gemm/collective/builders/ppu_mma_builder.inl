@@ -620,10 +620,16 @@ public:
   static constexpr bool HasFold = FoldF > 0;
   using BaseSchedule = typename fold_schedule_traits<KernelScheduleType>::Base;   // == KernelScheduleType if no fold
 
-  using DispatchPolicy = cute::conditional_t<HasFold,
-      MainloopPPUAiuFold<PipelineStages, kContinous, (HasFold ? FoldF : 2), BaseSchedule>,
-      cute::conditional_t<HasPlane2,
-          MainloopPPUAiuMixedInput2Plane<PipelineStages, kContinous, BaseSchedule>,
+  // HasPlane2 must WIN over HasFold. It used to be the other way round, which meant a 2-plane build whose LOW plane
+  // needs a fold (int2 at Block_K=64 -> F1=2) was routed to the single-plane fold collective and plane 2 was silently
+  // dropped. FoldF does not need to enter the 2-plane dispatch policy: each plane's fold factor is readable off its own
+  // SmemLayoutAtom, which the builder already sizes folded (BFoldBlockK / the per-plane B2 block), exactly as the
+  // collective already does for P2Fold. BaseSchedule keeps the group-size schedule either way, and MmaPermK above is
+  // already the fold rule whenever FoldF > 0, which is what a folded low plane needs.
+  using DispatchPolicy = cute::conditional_t<HasPlane2,
+      MainloopPPUAiuMixedInput2Plane<PipelineStages, kContinous, BaseSchedule>,
+      cute::conditional_t<HasFold,
+          MainloopPPUAiuFold<PipelineStages, kContinous, (HasFold ? FoldF : 2), BaseSchedule>,
           MainloopPPUAiuMixedInput<PipelineStages, kContinous, BaseSchedule>>>;
 
   using GmemLayoutA = cutlass::layout::RowMajor;
