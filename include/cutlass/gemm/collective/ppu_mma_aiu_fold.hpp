@@ -217,20 +217,36 @@ public:
   using RealInternalElementA = cute::conditional_t<!SwapAB, ElementA, ElementB>;
   using RealInternalElementB = cute::conditional_t<!SwapAB, ElementB, ElementA>;
 
-  // PPU_B_CHUNK is int1-ONLY, and the box found out the hard way: transform_B_atom calls MixGemmInt1Emit
-  // unconditionally, so with the flag on it was instantiated for uint2b_t too and 576 errors followed. The gate is a
-  // constexpr bool rather than #if so BOTH branches type-check for every width and only one is instantiated.
+  // PPU_B_CHUNK gate. This USED to be `sizeof_bits == 1` for two reasons, and BOTH are now stale:
   //
-  // int1 is also the only width that needs it: chunks = k-atoms per copy step = slots/delivery, which is 4 for int1,
-  // 2 for int2 and 1 for int4 -- int4 has nothing to chunk, and its B fragment is already only 16 registers.
+  //   * "transform_B_atom calls MixGemmInt1Emit unconditionally, so the flag instantiated it for uint2b_t and 576
+  //     errors followed" -- it now calls MixGemmChunkEmit<sizeof_bits<RealB>::value, ...>, width-templated, since the
+  //     emission source was unified (task #5). There is no int1-specific emitter left to protect.
+  //   * "int1 is the only width that needs it: chunks per copy step are 4 for int1, 2 for int2, 1 for int4" -- that
+  //     counted the tile set of the time. Per-plane fold reaches Block_K=64, where int2 has MMA_K=4 / CPY_K=1, i.e.
+  //     FOUR chunks, and int2's own recorded optimum (64,64,64) w32x32 F=2 sits exactly there.
+  //
+  // So the gate is now a CAPABILITY predicate rather than a width whitelist: a width the emitter covers, AND a
+  // fragment that is exactly one delivery. MixGemmChunkEmit static_asserts size(FragLayout) == kOut, and 8*MMA_N*MMA_K
+  // is only kOut for some (TileN, warpN) combinations -- excluding those here keeps a build that instantiates several
+  // configurations from failing to compile on one of them, instead of a hard error the caller cannot act on.
+  // int4 stays out: its B fragment is 16 registers already, so there is nothing to win.
   static constexpr int kBChunkMode =
 #if defined(PPU_B_CHUNK)
       (PPU_B_CHUNK);
 #else
       0;
 #endif
+  static constexpr int kBChunkBits_ = cutlass::sizeof_bits<RealInternalElementB>::value;
+  // one mma B atom is 8 fp16, so the fragment holds 8*MMA_N*MMA_K; a delivery is 4*(32/bits) fp16 (kOut).
+  // PermN comes from the TiledMma itself (same expression the mainloop uses at line ~633), not from a re-derived
+  // blockN/warpN -- re-deriving a rule that already exists is how the rung-5 defect survived five rounds of checking.
+  static constexpr int kBChunkMmaN_ = cute::size<1>(TileShape{})
+                                    / cute::size(decltype(TiledMma{}.template permutation_mnk<1>()){});
+  static constexpr int kBChunkMmaK_ = cute::size<2>(TileShape{}) / 16;
   static constexpr bool kBChunk = (kBChunkMode != 0)
-                               && (cutlass::sizeof_bits<RealInternalElementB>::value == 1);
+                               && (kBChunkBits_ == 1 || kBChunkBits_ == 2)
+                               && (8 * kBChunkMmaN_ * kBChunkMmaK_ == 4 * (32 / kBChunkBits_));
   using InternalStrideA  = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using InternalStrideB  = cute::conditional_t<!SwapAB, StrideB, StrideA>;
 

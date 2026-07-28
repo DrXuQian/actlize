@@ -758,8 +758,13 @@ public:
     // confirms 8 at both (64,64,256) and (32,128,256) -- but assert it rather than trust it: if K_ATOM_PER_COPY were
     // SMALLER the loop would emit only part of the delivery and silently drop half2 slots, which is the failure mode
     // that reads as a plausible-but-wrong result rather than a crash.
-    static_assert(!kBChunk || decltype(K_ATOM_PER_COPY)::value == MixGemm2Plane_uint2_uint1<>::kAtoms,
-        "PPU_B_CHUNK (2-plane): a copy step must be exactly the 8 k-atoms one int2 delivery carries");
+    // A delivery is kAtoms mma atoms, split between n and k by tCrB_mma: K_ATOM_PER_COPY * NAPC == kAtoms. Testing
+    // K_ATOM_PER_COPY alone was equivalent only while NAPC == 1, i.e. Block_K >= 128; it fired at Block_K=64, which is
+    // now the fastest configuration on the box. Measured for all three Block_K in fold_derivation/l62.
+    static_assert(!kBChunk || decltype(K_ATOM_PER_COPY)::value
+                              * (decltype(cute::size<1>(tCrB_mma))::value / decltype(cute::size<1>(tCrB_copy_view))::value)
+                              == MixGemm2Plane_uint2_uint1<>::kAtoms,
+        "PPU_B_CHUNK (2-plane): K_ATOM_PER_COPY * (MMA_N / CPY_N) must be the kAtoms one int2 delivery carries");
 
     // PPU_MMA_PROBE=1: the same "let the kernel report its own indices" probe the fold collective has, plus the two
     // LAYOUTS -- because chunking B here needs to know what the emission's index space actually is, and a local cute
@@ -1420,17 +1425,36 @@ private:
     // reinterpret_cast from that class type is ill-formed (exactly how the fold build failed on the box).
     Tensor cvt_in = recast<RealB>(tCrB_load(_, _, k_block));
     Tensor cvt_hi = recast<PlaneB2>(tCrB2_load(_, _, k_block / P2_DIV_));
-    constexpr int NumIter = decltype(cute::size<1>(cvt_in))::value;          // == MMA_N
-    // tCrB_one is make_fragment_like'd from a single mma atom, so it is COMPACT: n stride is 8 fp16 == 4 half2. That
-    // recompaction is why the destination here is `+ 4*ii` and not cvt_in's mode-1 stride.
+    constexpr int NumIter = decltype(cute::size<1>(cvt_in))::value;          // CPY_N -- NOT MMA_N in general
+    // ONE DELIVERY IS 8 MMA ATOMS, and tCrB_mma decides how they split between n and k -- 1 n x 8 k while Block_K >= 128,
+    // but 2 n x 4 k at Block_K = 64, where MMA_N is 4 while CPY_N is only 2. The previous form looped Chunk over
+    // K_ATOM_PER_COPY alone and wrote at `out + 4*ii`, which is correct only when CPY_N == MMA_N: at Block_K=64 it
+    // emitted 4 of the delivery's 8 atoms and filled 2 of tCrB_one's 4 n-atoms, leaving the other two never written --
+    // the same class of defect as hi_vreg0 (an index that assumed the copy and mma N extents agree).
+    //
+    // Derived from tCrB_mma's own layout and cvt_in's real mode-1 stride, then GATED at NAPC 1 and 2 across seven
+    // configurations including the shipped Block_K=256 (fold_derivation/l63):
+    //     Chunk_actual = Chunk + NChunk * n_local          destination atom = ii * NAPC + n_local
+    // Both collapse to the previous expression when NAPC == 1, so this is a strict generalisation. NOTE l63's first
+    // version hardcoded cvt_in's stride as 32 half2 and declared Block_K=256 broken; the stride is 64 there. The
+    // harness was wrong, not the code -- ask cute for a stride, never write it down.
+    constexpr int MMA_N_ = decltype(cute::size(tCrB_one))::value / 8;        // 8 fp16 per mma B atom
+    constexpr int NAPC_  = MMA_N_ / NumIter;                                 // n-atoms carried by one delivery
+    static_assert(NAPC_ >= 1 && MMA_N_ == NAPC_ * NumIter, "tCrB_one's n extent must be a multiple of CPY_N");
+    static_assert(NChunk * NAPC_ == MixGemm2Plane_uint2_uint1<>::kAtoms,
+        "a delivery is kAtoms mma atoms; K_ATOM_PER_COPY * NAPC must account for all of them");
     uint32_t* out = reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data()));
-    CUTLASS_PRAGMA_UNROLL
-    for (int ii = 0; ii < NumIter; ++ii) {
-      uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, ii).data()));
-      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, ii).data()))
+    // for_each, not a loop: Chunk_actual must be a TEMPLATE argument so the emission gate stays compile-time.
+    cute::for_each(cute::make_int_sequence<NumIter>{}, [&] (auto ii_) {
+      constexpr int ii = decltype(ii_)::value;
+      uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, cute::Int<ii>{}).data()));
+      uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_hi(_, cute::Int<ii>{}).data()))
                            + (k_block % P2_DIV_);
-      MixGemm2Plane_uint2_uint1<Chunk>::convert(lo_p, hi_p, out + 4 * ii);
-    }
+      cute::for_each(cute::make_int_sequence<NAPC_>{}, [&] (auto nl_) {
+        constexpr int nl = decltype(nl_)::value;
+        MixGemm2Plane_uint2_uint1<Chunk + NChunk * nl>::convert(lo_p, hi_p, out + 4 * (ii * NAPC_ + nl));
+      });
+    });
 
     constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;       // copy steps per k-tile
     constexpr int MMA_KA_ = NChunk * KBM_;                                   // total mma-K atoms in the tile
