@@ -63,7 +63,7 @@ template <bool UseEpilogueEvt, typename... T>
 using ChooseEpilogue = typename platform::conditional<
   UseEpilogueEvt,
   cutlass::epilogue::collective::EpilogueEvt<T...>,
-  cutlass::epilogue::collective::Epilogue<T...>,
+  cutlass::epilogue::collective::Epilogue<T...>
 >::type;
 
 // callbacks builder with aux out

@@ -61,7 +61,11 @@ namespace cute
 {
 
 /// CUTE helper to cast SMEM pointer to unsigned
-CUTE_DEVICE
+// CUTE_HOST_DEVICE, matching upstream CUTLASS. As CUTE_DEVICE it was called from CUTE_HOST_DEVICE copy() in
+// copy_ppu.hpp, which clang tolerates and nvcc/EDG rejects -- twelve errors that pushed the local front-end gate past
+// its instantiation budget, so the entire mainloop stayed invisible and static errors shipped to the box. The host
+// path is the existing #else branch (printf + return 0); nothing on device changes.
+CUTE_HOST_DEVICE
 uint32_t
 cast_smem_ptr_to_uint(void const* const ptr)
 {

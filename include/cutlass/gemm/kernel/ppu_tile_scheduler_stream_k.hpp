@@ -244,8 +244,10 @@ public:
   PersistentTileSchedulerPPUStreamK() { };
 
   CUTLASS_DEVICE
-  // block_id_in_cluster, cta_m_in_cluster, cta_n_in_cluster, cta_l_in_cluster,always {0,0,0}
-  PersistentTileSchedulerPPUStreamK(Params const& params_) : scheduler_params(params_), block_id_in_cluster_({0,0,0}) {
+  // block_id_in_cluster, cta_m_in_cluster, cta_n_in_cluster, cta_l_in_cluster, always 0.
+  // dim3(0,0,0), NOT {0,0,0}: the braced form is ambiguous between dim3(uint3) and dim3(dim3&&) under
+  // nvcc/EDG (clang resolves it silently), and that one error was enough to blind the local gate.
+  PersistentTileSchedulerPPUStreamK(Params const& params_) : scheduler_params(params_), block_id_in_cluster_(dim3(0,0,0)) {
     if (params_.raster_order_ == RasterOrder::AlongN) {
       current_work_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
     }

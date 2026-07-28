@@ -428,7 +428,7 @@ template<
     typename platform::conditional<
       platform::is_same<LayoutA, cutlass::layout::ColumnMajor>::value,
       PPU_2x1x1_F16F16F16F16,
-      PPU_1x2x1_F16F16F16F16,
+      PPU_1x2x1_F16F16F16F16
     >::type,
     PPU_UniversalFMA<ElementAcc, ElementA, ElementB, ElementAcc>
   >::type;
@@ -504,7 +504,7 @@ template<
   using WarpOnM = typename platform::conditional<
     platform::is_same<LayoutA, cutlass::layout::ColumnMajor>::value,
     Int<BlockM / 32>,
-    Int<BlockM / 16>,
+    Int<BlockM / 16>
   >::type;
 
 #if SAIL_EPILOGUE_OPT >= 2
@@ -908,7 +908,7 @@ template<
       ElementAcc,
       TileShape, ClusterShape,
       Int<Stage>,
-      KernelSchedule,
+      KernelSchedule
     >::CollectiveOp;
 
   using GemmKernel = typename cutlass::gemm::kernel::GemmUniversal<

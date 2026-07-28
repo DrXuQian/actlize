@@ -69,7 +69,10 @@ struct Mma<
   using Operator = OpMultiplyAdd;
   using ElementC = half_t;
 
-  CUTLASS_HOST_DEVICE
+  CUTLASS_DEVICE   // was CUTLASS_HOST_DEVICE: the body calls __hfma2, a __device__ intrinsic, so the
+                   // host qualifier was never honest. nvcc/EDG rejects it and -- crucially -- ANY error
+                   // stops template instantiation, which is what kept the whole mainloop invisible to
+                   // the local gate while three static bugs shipped to the box.
   void operator()(
     Array<half_t, 2> &d,
     Array<half_t, 2> const &a,
@@ -107,7 +110,10 @@ struct Mma<
   using Operator = OpMultiplyAdd;
   using ElementC = half_t;
 
-  CUTLASS_HOST_DEVICE
+  CUTLASS_DEVICE   // was CUTLASS_HOST_DEVICE: the body calls __hfma2, a __device__ intrinsic, so the
+                   // host qualifier was never honest. nvcc/EDG rejects it and -- crucially -- ANY error
+                   // stops template instantiation, which is what kept the whole mainloop invisible to
+                   // the local gate while three static bugs shipped to the box.
   void operator()(
     Array<half_t, 2> &d,
     Array<half_t, 1> const &a,
@@ -145,7 +151,10 @@ struct Mma <
   using Operator = OpMultiplyAdd;
   using ElementC = half_t;
 
-  CUTLASS_HOST_DEVICE
+  CUTLASS_DEVICE   // was CUTLASS_HOST_DEVICE: the body calls __hfma2, a __device__ intrinsic, so the
+                   // host qualifier was never honest. nvcc/EDG rejects it and -- crucially -- ANY error
+                   // stops template instantiation, which is what kept the whole mainloop invisible to
+                   // the local gate while three static bugs shipped to the box.
   void operator()(
     Array<half_t, 4> &d,
     Array<half_t, 2> const &a,
@@ -189,7 +198,10 @@ struct Mma<
   using Operator = OpMultiplyAdd;
   using ElementC = half_t;
 
-  CUTLASS_HOST_DEVICE
+  CUTLASS_DEVICE   // was CUTLASS_HOST_DEVICE: the body calls __hfma2, a __device__ intrinsic, so the
+                   // host qualifier was never honest. nvcc/EDG rejects it and -- crucially -- ANY error
+                   // stops template instantiation, which is what kept the whole mainloop invisible to
+                   // the local gate while three static bugs shipped to the box.
   void operator()(
     Array<half_t, 4> &d,
     Array<half_t, 2> const &a,

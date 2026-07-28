@@ -117,7 +117,10 @@ template <
   false,
   Block_MN,
   Block_K,
-  Swap,
+  Swap    // NO trailing comma: a trailing comma in a template-argument-list is ill-formed C++. clang (hence hgcc)
+          // accepts it as an extension; nvcc's EDG front end rejects it, which made this specialization -- and
+          // therefore CollectiveMma and EVERY collective downstream of it -- fail to instantiate under the local
+          // nvcc front-end gate. Two static errors reached the box behind that one character.
 > {
   static constexpr int BlockContSize = Block_K{} * sizeof_bits<cutlass::int4b_t>::value / 8;
   static_assert(BlockContSize % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");

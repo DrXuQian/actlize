@@ -180,8 +180,8 @@ struct CollectiveMma<
     using TilerA = typename GmemTiledCopyA::Tiler_MN;
     using TilerB = typename GmemTiledCopyB::Tiler_MN;
 
-    gmem_tiled_copy_A.desc_.init<ElementA, TransA, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, strideA);
-    gmem_tiled_copy_B.desc_.init<ElementB, TransB, get<0>(TilerB{}), get<1>(TilerB{})>(nullptr, N, K, strideB);
+    gmem_tiled_copy_A.desc_.template init<ElementA, TransA, get<0>(TilerA{}), get<1>(TilerA{})>(nullptr, M, K, strideA);
+    gmem_tiled_copy_B.desc_.template init<ElementB, TransB, get<0>(TilerB{}), get<1>(TilerB{})>(nullptr, N, K, strideB);
   };
 
   template <class ProblemShape>
