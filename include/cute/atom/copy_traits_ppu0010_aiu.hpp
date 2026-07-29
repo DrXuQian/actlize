@@ -45,6 +45,20 @@ struct Copy_Traits<PPU0010_AIU_LOAD<NumBitsPerAIU, Element, Trans, Swzl>>
 {
   using ThrID   = Layout<_1>;
 
+  // (i) WHY THERE IS NO 2-D LAYOUT HERE, and where the structure actually lives. The AIU bulk load is issued by ONE
+  // thread and moves a whole (cube_h x cube_w) tile, so from cute's point of view it is an opaque blob of NumBitsPerAIU
+  // bits -- hence the flat Src/Dst layouts. The cube's 2-D structure is not missing, it is in AiuDesc (dim_h, dim_w,
+  // cube_h, cube_w), which is why the collective's load_init_B* now derives those extents from the gmem TENSOR rather
+  // than restating the folded row/column counts (see the note there for what restating them cost).
+  //
+  // AND WHY NO LogicalTV. The read atom (PPU0010_TSM_LD_SWZL) carries one, but it is already the map of write-then-read:
+  // both instructions carry `.swzl` and the two swizzles cancel, so what its LogicalTV describes is the GMEM-RELATIVE
+  // word, not an smem address. A separate write-side LogicalTV would therefore be the identity on the cube -- vacuous --
+  // and decomposing the cancellation into two halves would mean inventing a factorisation neither instruction exposes.
+  // The checkable statement is the one the read side already makes: its LogicalTV is a bijection onto the cube's words,
+  // verified for fp16 (where no converter or offline exists to hide a compensating error) in
+  // fold_derivation/l17_fp16_identity.cu.
+  //
   // Map from (src-thr,src-val) to bit
   using SrcLayout = Layout<Shape<_1,NumBitsPerAIU>>;
   // Map from (dst-thr,dst-val) to bit

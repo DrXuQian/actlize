@@ -827,7 +827,31 @@ struct MixGemm2Plane
       for (int t = 0; t < kPairs; ++t) if (keep(t, v)) return true;
       return false;
     }
-    static constexpr int  hshift(int t, int v) { return HiBits * (t + kPairs * (v % kVregRatio)); }
+    // (g) THE PAIRING AS LAYOUTS, and as the SINGLE definition both sides use. The converter used to state it as
+    // arithmetic while the offline (xplane::tile_map_hi) stated the SAME rule as cute Layouts -- two forms of one rule,
+    // which is exactly the class that produced both of this session's 2-plane defects: hi_vreg0 was one rule in two
+    // copies with only one fixed, and PDcopy/kVregRatio were two quantities sharing a name. So the layouts live here and
+    // the offline reads them.
+    //
+    //   LoCodeL : (T, half)     -> the LOW code index inside a low vreg          T + kPairs*half
+    //   HiCodeL : (T, V, half)  -> the HIGH code index inside its high vreg      T + kPairs*(V % VR) + hstride*half
+    //   HVregL  : (V)           -> which high vreg low vreg V reads               VR * (V / VR)
+    //
+    // V's two roles are the nested mode (VR, 4/VR): the low part selects which of the VR low vregs share a high vreg
+    // (stride kPairs in HiCodeL, 0 in HVregL) and the high part selects the high vreg (stride 0 in HiCodeL, VR in
+    // HVregL). At (2,1) these evaluate to T + 8*(V&1) and 2*(V>>1) -- Q3's shipped constants (fold_derivation/l65).
+    using LoCodeL = cute::Layout<cute::Shape <cute::Int<kPairs>, cute::_2>,
+                                 cute::Stride<cute::_1,          cute::Int<kPairs>>>;
+    using HiCodeL = cute::Layout<cute::Shape <cute::Int<kPairs>, cute::Shape<cute::Int<kVregRatio>, cute::Int<4 / kVregRatio>>, cute::_2>,
+                                 cute::Stride<cute::_1,          cute::Stride<cute::Int<kPairs>,    cute::_0>,                 cute::Int<16 / HiBits>>>;
+    using HVregL  = cute::Layout<cute::Shape <cute::Shape<cute::Int<kVregRatio>, cute::Int<4 / kVregRatio>>>,
+                                 cute::Stride<cute::Stride<cute::_0,             cute::Int<kVregRatio>>>>;
+    static constexpr int  lo_code(int t, int half)        { return int(LoCodeL{}(t, half)); }
+    static constexpr int  hi_code(int t, int v, int half) { return int(HiCodeL{}(t, v, half)); }
+    static constexpr int  hi_vreg(int v)                  { return int(HVregL{}(v)); }
+    // the converter needs the same thing in BITS, for lane 0; the dup'd mask reaches lane 1 sixteen bits up, which is
+    // hstride codes and therefore HiCodeL's `half` mode -- so this is one layout, not two.
+    static constexpr int  hshift(int t, int v) { return HiBits * hi_code(t, v, 0); }
     static constexpr uint32_t himask() { return E::dup(uint32_t((1u << HiBits) - 1u)); }
 
     // THE HIGH PLANE'S BITS, LowBits mantissa positions above the low plane's. Written the plain way on purpose.
@@ -863,7 +887,7 @@ struct MixGemm2Plane
       const uint32_t reg = lo[V], r8 = reg >> 8;
       // hi already points at the high fragment offset by this k_block's parity (HiPlaneSrc in the collective); the
       // vregs one k_block owns are P2_DIV apart, so this picks the one serving low vreg V.
-      const uint32_t hreg = hi[kVregRatio * (V / kVregRatio)];
+      const uint32_t hreg = hi[hi_vreg(V)];                   // (g) HVregL, shared with the offline
       cute::for_each(cute::make_int_sequence<kPairs>{}, [&] (auto t) {
         constexpr int T = decltype(t)::value;
         if constexpr (keep(T, V)) emit_one<T, V>(reg, r8, hreg, h2);

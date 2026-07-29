@@ -975,15 +975,39 @@ private:
         make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N1_}))
       );
       Tensor mB_nk_counting = make_counting_tensor(layout_counting);
+    // (i) THE DESCRIPTOR'S EXTENTS COME OFF THE TENSOR. The folded row/column counts used to be restated in the
+    // AiuDesc::init call (and in the counting layout) after already defining the tensor, i.e. one rule written three or
+    // four times per branch across four branches. The comment in load_init_B2 records what that costs: the interleaved
+    // branch builds its own shape and stride without consulting dB, so patching only the non-interleaved one is dead
+    // code for a %256-aligned shape, and four different offline placements then all measured the same ~72% random
+    // result because the gmem WALK was wrong independently of the placement. Reading size<0>/size<1> off mB_nk means a
+    // fold can only be got right or wrong once.
+    //
+    // The interleaved form needs kCon | K1_ for size(mB_nk)/kCon to equal the old (N1_*K1_)/kCon -- the tensor's own
+    // shape carries K1_/kCon, so the two agree exactly when kCon divides it. That is guaranteed: the interleaved path is
+    // selected only when n % 256 == 0 && k % 256 == 0 (moe_grouped_ppu.cuh's `il`), so K1_ = K * fold is a multiple of
+    // kCon = 256.
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
-            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N1_ * K1_ / kCon, kCon, mB_nk.stride());
+            (uint8_t*)(raw_pointer_cast(mB_nk.data())), int(cute::size(mB_nk)) / kCon, kCon, mB_nk.stride());
       return mB_nk_counting;
     } else {
       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B), make_shape(N1_, K1_, L), mainloop_params.dB);
       Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
 
+    // (i) THE DESCRIPTOR'S EXTENTS COME OFF THE TENSOR. The folded row/column counts used to be restated in the
+    // AiuDesc::init call (and in the counting layout) after already defining the tensor, i.e. one rule written three or
+    // four times per branch across four branches. The comment in load_init_B2 records what that costs: the interleaved
+    // branch builds its own shape and stride without consulting dB, so patching only the non-interleaved one is dead
+    // code for a %256-aligned shape, and four different offline placements then all measured the same ~72% random
+    // result because the gmem WALK was wrong independently of the placement. Reading size<0>/size<1> off mB_nk means a
+    // fold can only be got right or wrong once.
+    //
+    // The interleaved form needs kCon | K1_ for size(mB_nk)/kCon to equal the old (N1_*K1_)/kCon -- the tensor's own
+    // shape carries K1_/kCon, so the two agree exactly when kCon divides it. That is guaranteed: the interleaved path is
+    // selected only when n % 256 == 0 && k % 256 == 0 (moe_grouped_ppu.cuh's `il`), so K1_ = K * fold is a multiple of
+    // kCon = 256.
       gmem_tiled_copy_B.desc_.template init<RealInternalElementB, false, get<0>(TilerB{}), get<1>(TilerB{})>(
-            nullptr, N1_, K1_, mainloop_params.dB);
+            nullptr, int(cute::size<0>(mB_nk)), int(cute::size<1>(mB_nk)), mainloop_params.dB);
       return mB_nk;
     }
   }
@@ -1010,11 +1034,11 @@ private:
       Tensor mB_nk = mB_nkl(_,_,l_coord);
       auto layout_counting = make_layout(
         mB_nk.shape(),
-        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{N2}))
+        make_stride(ScaledBasis<_1, 1>{}, make_stride(ScaledBasis<_1, 0>{}, ScaledBasis<int, 1>{int(cute::size<0>(mB_nk))}))
       );
       Tensor mB_nk_counting = make_counting_tensor(layout_counting);
       gmem_tiled_copy_B2.desc_.template init<PlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
-            (uint8_t*)(raw_pointer_cast(mB_nk.data())), N2 * K2 / kCon, kCon, mB_nk.stride());
+            (uint8_t*)(raw_pointer_cast(mB_nk.data())), int(cute::size(mB_nk)) / kCon, kCon, mB_nk.stride());
       return mB_nk_counting;
     } else {
       // dB2 carries plane 2's OWN folded row pitch (set in launch); the SHAPE must match it. Falls back to dB when the
@@ -1023,7 +1047,7 @@ private:
       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B2), make_shape(N2, K2, L), d2);
       Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,l_coord));
       gmem_tiled_copy_B2.desc_.template init<PlaneB2, false, get<0>(TilerB2{}), get<1>(TilerB2{})>(
-            nullptr, N2, K2, d2);
+            nullptr, int(cute::size<0>(mB_nk)), int(cute::size<1>(mB_nk)), d2);
       return mB_nk;
     }
   }
@@ -1478,10 +1502,13 @@ private:
     using DeliveryL_ = decltype(cute::make_layout(
         cute::make_shape (cute::shape<0>(FragL{}), cute::Int<NAPC_>{}, cute::Int<NChunk>{}),
         cute::make_stride(cute::stride<0>(FragL{}), cute::stride<1>(FragL{}), cute::stride<2>(FragL{}))));
-    uint32_t* out = reinterpret_cast<uint32_t*>(raw_pointer_cast(tCrB_one.data()));
     // ONE loop, over DELIVERIES -- each has its own source pointer pair, which is a genuine source-side fact and not a
-    // destination computation. Its half2 offset in the compact tCrB_one is 4 half2 per n-atom times the NAPC n-atoms a
-    // delivery covers.
+    // destination computation.
+    //
+    // (h) THE DESTINATION BASE IS A SLICE, NOT AN OFFSET. This used to be `out + 4 * NAPC_ * ii` -- a hand-multiplied
+    // half2 stride, the last such expression in the B chain. Delivery ii owns tCrB_one's n-atoms [ii*NAPC, +NAPC), so
+    // slicing mode 1 at n-atom NAPC_*ii and taking .data() gives the same pointer with cute supplying the stride. The
+    // arithmetic that remains is a COORDINATE, which is the caller's business; strides are not.
     cute::for_each(cute::make_int_sequence<NumIter>{}, [&] (auto ii_) {
       constexpr int ii = decltype(ii_)::value;
       uint32_t const* lo_p = reinterpret_cast<uint32_t const*>(raw_pointer_cast(cvt_in(_, cute::Int<ii>{}).data()));
@@ -1498,8 +1525,9 @@ private:
       uint32_t const* hi_p = reinterpret_cast<uint32_t const*>(
                                  raw_pointer_cast(cvt_hi(_, cute::Int<HiSrc_::slot(ii)>{}).data()))
                            + HiSrc_::base(ii, k_block);
-      cutlass::MixGemm2Plane<kLowBits, kHiBits, Chunk, NChunk, true, DeliveryL_>::convert(
-          lo_p, hi_p, out + 4 * NAPC_ * ii);
+      uint32_t* out_ii = reinterpret_cast<uint32_t*>(
+          raw_pointer_cast(tCrB_one(_, cute::Int<NAPC_ * ii>{}).data()));
+      cutlass::MixGemm2Plane<kLowBits, kHiBits, Chunk, NChunk, true, DeliveryL_>::convert(lo_p, hi_p, out_ii);
     });
 
     constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;       // copy steps per k-tile
