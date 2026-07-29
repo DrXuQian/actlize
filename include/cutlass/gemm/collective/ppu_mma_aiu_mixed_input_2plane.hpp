@@ -78,6 +78,20 @@
 //     base(ii, kb)  = kb % P2_DIV + P2_DIV * (ii / N2)        the first of the two vregs that k_block owns
 // The converter then indexes hi[base + 2*(v>>1)] -- stride 2, because the delivered high vreg index decomposes as
 // (k_block parity) + 2*(N-half). Gated for both formulas, old and new, in fold_derivation/l63.
+// (j) AN INDEX SPLIT INTO (POSITION WITHIN ITS SCALE GROUP, WHICH GROUP), as layouts rather than / and %. Same idiom as
+// HVregL: a two-coordinate map written as a divide/mod pair is one rule that two call sites can drift apart on, and this
+// one has two call sites -- the COARSE path splits k_block by GroupK and the FINE path splits atom_idx by APG. Verified
+// equal to % and / for every index at four (Per, NGroups) combinations in fold_derivation/l68.
+template <int Per, int NGroups>
+struct ScaleSplit {
+  using InGroupL = cute::Layout<cute::Shape <cute::Int<Per>, cute::Int<NGroups>>,
+                                cute::Stride<cute::_1,       cute::_0>>;
+  using GroupL   = cute::Layout<cute::Shape <cute::Int<Per>, cute::Int<NGroups>>,
+                                cute::Stride<cute::_0,       cute::Int<1>>>;
+  static constexpr int in_group(int i) { return int(InGroupL{}(i)); }   // == i % Per
+  static constexpr int group(int i)    { return int(GroupL{}(i));   }   // == i / Per
+};
+
 template <int N2, int CPY_N, int P2_DIV>
 struct HiPlaneSrc {
   static_assert(N2 >= 1 && CPY_N % N2 == 0, "plane 2's N extent must divide the delivery count");
@@ -232,6 +246,11 @@ public:
   static_assert(Scale_ThrH * Scale_TileK <= Scale_NumThreads,
       "scale copy asks for more thread slots than the CTA has -- the modulo slice would silently truncate it");
   constexpr static int Scale_ElemsPerThr = Scale_TileN / Scale_ThrH;
+  // (j3) thread_idx -> thread slot, with the duplication explicit. Slots <= Scale_NumThreads is enforced above.
+  constexpr static int Scale_Slots = Scale_ThrH * Scale_TileK;
+  using ScaleThrDupL = cute::Layout<cute::Shape <cute::Int<Scale_Slots>,
+                                                 cute::Int<(Scale_NumThreads + Scale_Slots - 1) / Scale_Slots>>,
+                                    cute::Stride<cute::_1, cute::_0>>;
   using Scale_GmemCopyThrLayoutH = Int<Scale_ThrH>;
   using Scale_GmemCopyThrLayoutW = Int<Scale_TileK>;
   using GmemTiledCopyScale = decltype(
@@ -645,7 +664,13 @@ public:
 
     // get extra inputs
     auto extra_input_partitions = partition_extra_inputs(
-        mainloop_params, load_inputs, storage, thread_idx % (Scale_GmemCopyThrLayoutH{} * Scale_GmemCopyThrLayoutW{}));
+        // (j3) THE WRAP AS A LAYOUT, so the duplication is in the type rather than in a comment. The scale copy has
+        // Slots = ThrH*ThrW thread slots and the CTA has Scale_NumThreads; the static_assert above forbids Slots >
+        // NumThreads (that was the rung-4 defect -- 128 slots against a 64-thread CTA silently truncated to half the
+        // scale groups), so what remains is Slots <= NumThreads, where several threads issue the SAME copy. The stride-0
+        // mode says exactly that: ScaleThrDupL(thread_idx) == thread_idx % Slots, with the second mode marking the
+        // duplicates. Same value as the modulo, but the layout states the intent.
+        mainloop_params, load_inputs, storage, int(ScaleThrDupL{}(thread_idx)));
 
     CUTE_STATIC_ASSERT_V(size<0>(gA) == size<0>(sA));                          // BLK_M
     CUTE_STATIC_ASSERT_V(size<1>(gA) == size<1>(sA));                          // BLK_K
@@ -1164,8 +1189,12 @@ private:
   // redundancy survives to the ISA before trading idiom for it.
   template <class TiledMma, class STensor>
   CUTLASS_DEVICE
-  static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS) {
-    return make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
+  // (j) TAKES AN ALREADY RANK-2 TILE. The scale copy view now carries (group, stage) as two modes rather than one
+  // flattened one, so slicing "mode 2" inside here would mean this helper knowing the view's rank. The caller owns the
+  // rank; this owns the fragment. scale_fragment_layout below does the same, so the two still stay in step by
+  // construction (make_fragment_like<T>(t) is make_tensor<T>(make_layout_like(t.layout()))).
+  static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS_tile) {
+    return make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS_tile));
   }
 
   // The same layout, HOST-callable, for the compile-time witness below (make_scale_fragment is CUTLASS_DEVICE and
@@ -1182,7 +1211,7 @@ private:
     if constexpr (ModeHasScales) {
       return cute::cosize_v<decltype(scale_fragment_layout(
           TiledMma{}.get_thread_slice(0),
-          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})))>;
+          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})(_,_,Int<0>{})))>;
     } else {
       return 0;
     }
@@ -1205,12 +1234,17 @@ private:
       auto smem_tiled_copy_S   = make_tiled_copy_B(SmemCopyAtomScale{}, tiled_mma);
       auto smem_thr_copy_S     = smem_tiled_copy_S.get_thread_slice(thread_idx);
 
-      static constexpr int smem_scale_k = Scale_TileK * DispatchPolicy::Stages;
+      // (j) (GROUP, STAGE) ARE TWO MODES, not one flattened product. They used to be Scale_TileK * Stages in a single
+      // mode, so BOTH consumers re-flattened by hand -- `read_stage * Scale_TileK + k_block / GroupK` in the COARSE path
+      // and `read_stage * Scale_TileK + atom_idx / APG` in the FINE one. One rule, two copies, structurally the same as
+      // the hi_vreg0 defect. The STORAGE layout (SmemLayoutScale) already kept them separate; only this copy view
+      // flattened them. Verified the same memory -- identical offsets for every (n, group, stage) and identical cosize --
+      // at six real (TileN, TileK, Stages) combinations in fold_derivation/l68.
       using SmemCopyLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{},
-          make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<smem_scale_k>{})));
+          make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<Scale_TileK>{}, Int<DispatchPolicy::Stages>{})));
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemCopyLayoutScale{});
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
-      Tensor tCrS = make_scale_fragment(thr_mma, sS);
+      Tensor tCrS = make_scale_fragment(thr_mma, sS(_,_,Int<0>{},Int<0>{}));
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         return cute::make_tuple(tCsS, tCrS);
@@ -1218,7 +1252,7 @@ private:
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemCopyLayoutScale{});
         Tensor tCsZ = smem_thr_copy_S.partition_S(sZ);
-        Tensor tCrZ = make_scale_fragment(thr_mma, sZ);
+        Tensor tCrZ = make_scale_fragment(thr_mma, sZ(_,_,Int<0>{},Int<0>{}));
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
       }
       else {
@@ -1292,24 +1326,28 @@ private:
     // group can't cover the whole step; there the scale is loaded PER mma-atom in transform_B_kblock instead.
     constexpr int KBM_ = decltype(cute::size<2>(tCrB_copy_view))::value;
     if constexpr (int(Scale_TileK) <= KBM_) {
-     auto GroupK= size<2>(tCrB_copy_view) / Scale_TileK;
-     if (k_block % GroupK == 0) {
+     // (j) same split object the FINE path uses; only the divisor differs (copy steps per group, not atoms per group).
+     // The divisor has to come off size<2>'s cute integral constant, not off `auto GroupK = size<2>(...) / Scale_TileK` --
+     // that expression is Int / constexpr-int, which decays to a runtime int and cannot be a template argument.
+     constexpr int GroupK = int(decltype(cute::size<2>(tCrB_copy_view))::value) / int(Scale_TileK);
+     using SplitC = ScaleSplit<GroupK, int(Scale_TileK)>;
+     if (SplitC::in_group(k_block) == 0) {
       // We are starting a new group k-tile so copy the scale
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
         // nothing to do
       }
       else if constexpr (ModeHasScales) {
-        const int scale_k_idx = read_stage * Scale_TileK + k_block / GroupK;
+        const int g = SplitC::group(k_block);
         auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
         auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
         auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
+        copy(smem_tiled_copy_S, tCsS(_,_,0,g,read_stage), tCrS_copy_view(_,_,0));
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           // Nothing extra to do
         } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
           auto tCsZ              = cute::get<2>(partitioned_mma_extra_info);
           auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
-          copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
+          copy(smem_tiled_copy_S, tCsZ(_,_,0,g,read_stage), tCrZ_copy_view(_,_,0));
         } else {
           // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
           assert(false);
@@ -1433,13 +1471,16 @@ private:
         auto smem_tiled_copy_S = cute::get<0>(views);
         auto tCsS              = cute::get<0>(info);
         auto tCrS_copy_view    = cute::get<1>(views);
-        if (atom_idx % APG == 0) {                        // reload only at a scale group's first atom
-          const int sk = read_stage * int(Scale_TileK) + atom_idx / APG;
-          copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+        // (j) the group boundary and the group index from ONE object, and (group, stage) as COORDINATES -- the flat
+        // `read_stage * Scale_TileK + atom_idx / APG` used to be written here and again in the COARSE path.
+        using Split = ScaleSplit<APG, int(Scale_TileK)>;
+        if (Split::in_group(atom_idx) == 0) {              // reload only at a scale group's first atom
+          const int g = Split::group(atom_idx);
+          copy(smem_tiled_copy_S, tCsS(_,_,0,g,read_stage), tCrS_copy_view(_,_,0));
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
             auto tCsZ           = cute::get<2>(info);
             auto tCrZ_copy_view = cute::get<2>(views);
-            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+            copy(smem_tiled_copy_S, tCsZ(_,_,0,g,read_stage), tCrZ_copy_view(_,_,0));
           }
         }
       }
