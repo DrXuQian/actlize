@@ -266,7 +266,8 @@ struct MixGemmChunkEmit {
   static constexpr int kHalf2 = (Chunk < 0 || !Rebase ? kOut : kPer) / 2;
 
   static constexpr uint32_t dup(uint32_t h) { return h | (h << 16); }   // also used by MixGemm2Plane
-  template <int T> static constexpr int      bpos() { return (T % kPerLevel) * Bits; }
+  static  constexpr int bpos_of(int t)             { return (t % kPerLevel) * Bits; }
+  template <int T> static constexpr int      bpos() { return bpos_of(T); }
   template <int T> static constexpr uint32_t mask() { return dup(uint32_t(((1u << Bits) - 1u) << bpos<T>())); }
   template <int T> static constexpr uint32_t mul()  { return dup(uint32_t((15 - bpos<T>()) << 10)); }
   template <int T> static constexpr uint32_t add()  {
@@ -829,14 +830,34 @@ struct MixGemm2Plane
     static constexpr int  hshift(int t, int v) { return HiBits * (t + kPairs * (v % kVregRatio)); }
     static constexpr uint32_t himask() { return E::dup(uint32_t((1u << HiBits) - 1u)); }
 
+    // FOUR MACHINE OPERATIONS PER half2, not six. The obvious form is
+    //     x |= ((hreg >> hshift) & himask) << (bpos + LowBits)          -- shift, and, shift, or
+    // and both shifts are compile-time, so they COMPOSE into one:
+    //     hreg << d,   d = bpos + LowBits - hshift        (a right shift when d < 0)
+    // with the mask pre-shifted to the destination. Then `x | (y & m)` is a legal 3-input LUT -- immLut for a | (b & c)
+    // is 0xF0 | (0xCC & 0xAA) = 0xF8 -- so the and and the or fuse into one lop3. Net: lop3, shift, lop3, fma.
+    //
+    // The single shift is EXACTLY equivalent, not an approximation. Shifting left, a low-half bit can spill into the
+    // high half, but for it to land on the high mask's position its ORIGINAL position would have to be 16 + hshift >= 16,
+    // which contradicts it being a low-half bit; shifting right is the mirror image. Both directions are emulated
+    // bit-exactly in fold_derivation/l66, which is also why this is worth doing at all: the 2-plane converter cost 6 ops
+    // against a single plane's 2, and cvt/mma is only 2 at the winning WM=64, so the conversion sits right at the
+    // amortisation ceiling. Q3/Q5/Q6 measured 1.14x / 1.18x / 1.24x a single int4 GEMM -- ordered by total bit width,
+    // with total HBM traffic LOWER than the int4 winner's, so the residual is this ALU and not bandwidth.
+    static constexpr int hdest(int t)  { return E::bpos_of(t) + LowBits; }
+    template <int T, int V> static constexpr int hshift_net() { return hdest(T) - hshift(T, V); }
+
     template <int T, int V>
     CUTLASS_DEVICE static void emit_one(uint32_t reg, uint32_t r8, uint32_t hreg, uint32_t* h2) {
       const uint32_t src = (T / kPerLevel) ? r8 : reg;        // the upper byte level of the low vreg
       uint32_t x;
       asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(x)
                    : "r"(src), "n"(E::template mask<T>()), "n"(0x64006400u), "n"(0xEAu));
-      // the high plane's bits, LowBits mantissa positions above the low plane's
-      x |= ((hreg >> hshift(T, V)) & himask()) << (E::template bpos<T>() + LowBits);
+      // the high plane's bits, LowBits mantissa positions above the low plane's, in one shift and one lop3
+      constexpr int d = hshift_net<T, V>();
+      const uint32_t hs = (d >= 0) ? (hreg << (d >= 0 ? d : 0)) : (hreg >> (d < 0 ? -d : 0));
+      asm volatile("ppu.lop3.b32 %0,%1,%2,%3,%4;\n" : "=r"(x)
+                   : "r"(x), "r"(hs), "n"(himask() << hdest(T)), "n"(0xF8u));
       asm volatile("ppu.fma.rtte.f16x2 %0,%1,%2,%3;\n" : "=r"(x)
                    : "r"(x), "r"(E::template mul<T>()), "r"(E::template add<T>()));
       h2[at(T, V)] = x;
