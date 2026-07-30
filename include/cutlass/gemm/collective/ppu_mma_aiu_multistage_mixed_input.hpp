@@ -178,6 +178,23 @@ public:
   // using InternalElementB = cute::conditional_t<!SwapAB, ConvertedElementB, ConvertedElementA>;
 
   using RealInternalElementA = cute::conditional_t<!SwapAB, ElementA, ElementB>;
+  // PPU_A_CPASYNC: A's own gmem->smem copy, one row, plain cp.async instead of the AIU.
+  //
+  // The AIU/swzl pair cannot deliver a one-row A tile: l82 replays the read's simulator and shows the 16 rows come
+  // from vreg_row_idx = (v/2)*8 + lane/4 + coord_h, the instruction's lane/vreg structure, with m16n16 in the
+  // mnemonic. There is no stride operand to zero -- the asm takes only (base, coord_h, CUBE_H, channel offset) --
+  // and CUBE_H scales the SLICE stride, so shrinking it aliases 360 of 512 reads instead of collapsing rows.
+  //
+  // A plain cp.async has none of that: cute computes the address from the layout, so a stride-0 M mode genuinely
+  // aliases and one row is enough. Atom and the thread_idx % n slicing are copied from GmemTiledCopyScale, which
+  // already moves a small operand this way in this same collective and rides the same cp_async_fence.
+  static constexpr int kACpElemsPerThr = 8;                                  // 128-bit, as the scale copy uses
+  static constexpr int kACpThreads     = shape<2>(TileShape{}) / kACpElemsPerThr;
+  using GmemTiledCopyACp = decltype(
+    make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, RealInternalElementA>{},
+                    Layout<Shape<Int<kACpThreads>>>{},
+                    Layout<Shape<Int<kACpElemsPerThr>>>{}));
+
   using RealInternalElementB = cute::conditional_t<!SwapAB, ElementB, ElementA>;
   using InternalStrideA  = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using InternalStrideB  = cute::conditional_t<!SwapAB, StrideB, StrideA>;
@@ -249,9 +266,23 @@ public:
   // Nor is there gmem traffic left to save. AiuDesc::init takes dim_h from the problem's M -- per expert in the
   // grouped kernel -- and the instruction is ...padz..., so at one row per expert the AIU already fetches exactly
   // one row per k-tile and zero-fills the rest of the cube.
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+  // Stride 0 on M: cosize_v drops from TileM*TileK*Stages to TileK*Stages, so SharedStorage allocates ONE row.
+  // Legal here and not under the AIU because every A access on this path is a plain copy, which takes its address
+  // from this layout. Sound only at Mmax == 1; launch() enforces that.
+  using SmemLayoutA = decltype(make_layout(
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
+      make_stride(_0{}, _1{}, shape<2>(TileShape{}))));
+  // A compact twin, never allocated, used only to shape the mma fragment: partition_fragment_A on the stride-0
+  // layout would inherit the zero and allocate fewer registers than the mma reads.
+  using SmemLayoutAFrag = decltype(tile_to_shape(
+      InternalSmemLayoutAtomA{},
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+#else
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+#endif
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
@@ -424,8 +455,14 @@ public:
                                                           : int64_t(l_coord) * int64_t(M);
     Tensor mA_mkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_A + a_row_off * K),
                                 make_shape(M,K,cute::Int<1>{}), mainloop_params.dA);                            // (m,k,1)
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+    // PLAIN, not make_mix_tensor_like: that wrapper carries (ptr, coordinate) for the AIU descriptor and has no
+    // addressable strides (l74), and cp.async needs real ones.
+    Tensor gA = local_tile(mA_mkl(_,_,0), TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});            // (BLK_M,BLK_K,k)
+#else
     Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,0));                                                         // (m,k)
     Tensor gA = local_tile(mA_mk, TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});                    // (BLK_M,BLK_K,k)
+#endif
 
     // B init (include init aiu desc)
     auto mB_nk = load_init_B(mainloop_params, N, K, L, l_coord);                                                // (n,k)
@@ -513,8 +550,17 @@ public:
     auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
 
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+    // ROW 0 ONLY. sA's M stride is 0, so row 0 IS the single physical row and every other m index aliases onto it.
+    // thread_idx % kACpThreads mirrors the scale copy's slicing; the guard keeps the surplus threads out instead of
+    // having them re-issue the same cp.async, which is what the scale path settles for.
+    auto a_cp_thr = GmemTiledCopyACp{}.get_slice(thread_idx % kACpThreads);
+    Tensor tAgA = a_cp_thr.partition_S(gA(Int<0>{},_,_));                      // (ACPY,ACPY_K,k)
+    Tensor tAsA = a_cp_thr.partition_D(sA(Int<0>{},_,_));                      // (ACPY,ACPY_K,PIPE)
+#else
     Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
+#endif
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
@@ -522,11 +568,16 @@ public:
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+      copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe), warp_idx);
+      if (thread_idx < kACpThreads) copy(GmemTiledCopyACp{}, tAgA(_,_,*k_tile_iter), tAsA(_,_,k_pipe));
+#else
       copy_aiu(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe),
         warp_idx
       );
+#endif
       copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, k_pipe);
       cp_async_fence();
       --k_tile_count;
@@ -540,7 +591,15 @@ public:
     // Tile MMA compute thread partitions and allocate accumulators
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+    // Shape the fragment from the COMPACT twin: sA's M stride is 0, and partition_fragment_A would inherit it and
+    // allocate fewer registers than the mma reads (measured on the gmem variant: ((2,2,2),1):((1,2,0),0), cosize 4
+    // instead of 8). Null pointer -- layout only.
+    Tensor sA_frag = make_tensor(make_smem_ptr(static_cast<RealInternalElementA*>(nullptr)), SmemLayoutAFrag{});
+    Tensor tCrA     = thr_mma.partition_fragment_A(sA_frag(_,_,0));            // (MMA,MMA_M,MMA_K)
+#else
     Tensor tCrA     = thr_mma.partition_fragment_A(sA(_,_,0));                // (MMA,MMA_M,MMA_K)
+#endif
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
@@ -568,9 +627,22 @@ public:
     TiledMma_S8 tiled_mma_s8;
     auto thr_mma_s8 = tiled_mma_s8.get_thread_slice(thread_idx);
 
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+    // Plain vectorised copy, addressed from sA's layout -- so the stride-0 M mode aliases and every m slot of the
+    // fragment gets row 0. Sliced per thread (not per warp-group like the AIU atom) because this one is a normal
+    // load, and partition_S takes the PLAIN sA, not a mix tensor.
+    auto smem_tiled_copy_A = make_tiled_copy_A(
+        Copy_Atom<DefaultCopy, RealInternalElementA>{}, tiled_mma);   // DefaultCopy: width from the layouts, no
+                                                                     // alignment assumed -- a per-thread offset
+                                                                     // that is not 16-B aligned would fault under
+                                                                     // AssumedAlignment<128>.
+    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(thread_idx);
+    Tensor tCsA            = smem_thr_copy_A.partition_S(sA);                                     // (CPY,CPY_M,CPY_K,PIPE)
+#else
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
     auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(aiu_warp_group_thread_idx);
     Tensor tCsA            = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));                // (CPY,CPY_M,CPY_K,PIPE)
+#endif
     Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                                       // (CPY,CPY_M,CPY_K)
 
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
@@ -654,11 +726,17 @@ public:
         if (k_block == 0)
         {
           auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+          copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write), warp_idx);
+          if (thread_idx < kACpThreads)
+            copy(GmemTiledCopyACp{}, tAgA(_,_,*k_tile_iter), tAsA(_,_,smem_pipe_write));
+#else
           copy_aiu(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
             gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write),
             warp_idx
           );
+#endif
           copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, smem_pipe_write);
           cp_async_fence();
           if (k_tile_count > 1) { ++k_tile_iter; }
