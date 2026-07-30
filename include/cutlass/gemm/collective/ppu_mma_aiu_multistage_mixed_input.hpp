@@ -308,12 +308,14 @@ public:
   {
     static constexpr int scale_elements = elements_per_smem_scale();
     static constexpr int zero_elements = elements_per_smem_zero();
-#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
-    // A never reaches shared memory here. One element keeps SharedStorage's shape and sA's pointer valid; sA is
-    // used only for its LAYOUT (the static shape checks and partition_fragment_A) and is never dereferenced.
-    cute::ArrayEngine<RealInternalElementA, 1> smem_a;
-#else
+#if !defined(PPU_A_IN_REG) || (PPU_A_IN_REG == 0)
     cute::ArrayEngine<RealInternalElementA, cute::cosize_v<SmemLayoutA>> smem_a;
+    // A HAS NO MEMBER HERE UNDER PPU_A_IN_REG, and a one-element placeholder is not a smaller version of that --
+    // it is a bug. array_aligned's default alignment is 16 B, so smem_b sits immediately after smem_a; at the
+    // full size (cosize*2 B, a multiple of 32) smem_b lands 32-B aligned, which PPU0010's AIU load requires
+    // (align_bytes = 32 in gemm_operands.hpp). A 2-byte smem_a puts smem_b at offset 2 and the descriptor becomes
+    // invalid -- 'AIU_ld TSM size out of range', which is exactly how the first attempt at this failed. With the
+    // member absent, smem_b is at offset 0 and inherits the smem allocation's own alignment.
 #endif
     cute::ArrayEngine<RealInternalElementB, cute::cosize_v<SmemLayoutB>> smem_b;
     cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
@@ -496,7 +498,13 @@ public:
 
     // Construct shared memory tiles
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+    // Layout only: the static shape checks below and partition_fragment_A need SmemLayoutA's shape, and neither
+    // touches the pointer. Every read and write of A's shared tile is gone, so there is nothing to point at.
+    Tensor sA = make_tensor(make_smem_ptr(static_cast<RealInternalElementA*>(nullptr)), SmemLayoutA{});
+#else
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.begin()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
+#endif
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.begin()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
 
     // get extra inputs
