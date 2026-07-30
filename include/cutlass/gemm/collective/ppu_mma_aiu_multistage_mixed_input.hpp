@@ -1291,51 +1291,65 @@ private:
     // about 1.8 of 34. With for_each the index is Int<i>, the guard folds to if constexpr and disappears, and the
     // division and modulo fold away. Same reason the main loop uses for_each -- see its comment about needing
     // k_block to be Int<x>. Numerics are unchanged; this is constant folding only.
+        // PREFETCH IS AN APPLICABILITY, NOT A REQUIREMENT. Two register sets cover a copy step with at most two
+        // scale groups; TileK=64 configs have more and must keep the original per-group reload. Writing that as a
+        // static_assert made three units fail to compile instead of falling back -- the same shape of mistake as a
+        // boundary check that only guards one end.
+        constexpr int GRP = (K_ATOM_PER_COPY % APG_ == 0) ? (K_ATOM_PER_COPY / APG_) : 0;
+        constexpr bool kPfOk =
 #if defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
-        // BOTH of this copy step's groups load BEFORE any transform, group gi into register set gi % 2, so the
-        // second group's data has a whole group of atoms to arrive in instead of being used one instruction after
-        // its load. pf carries the second set: fragments 0,1 and their copy views 2,3.
-        constexpr int GRP = K_ATOM_PER_COPY / APG_;
-        static_assert(GRP <= 2, "PPU_SCALE_PREFETCH: only two scale register sets exist");
-        constexpr int g0 = (K_BLOCK_STATIC * K_ATOM_PER_COPY) / APG_;
-        cute::for_each(cute::make_int_sequence<GRP>{}, [&] (auto gi_) {
-          constexpr int GI = decltype(gi_)::value;
-          const int sk = read_stage * int(Scale_TileK) + g0 + GI;
-          if constexpr (GI % 2 == 0) {
-            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
-            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
-          } else {
-            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), cute::get<2>(pf)(_,_,0));
-            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), cute::get<3>(pf)(_,_,0));
-          }
-        });
-        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
-          constexpr int I        = decltype(i_)::value;
-          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
-          constexpr int GI       = I / APG_;
-          if constexpr (GI % 2 != 0) {
-            cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<0>(pf)(_,_,0),
-                            tCrB_mma(_,_,Int<atom_idx>{}), cute::multiplies{});
-            cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(pf)(_,_,0),
-                            tCrB_mma(_,_,Int<atom_idx>{}), cute::plus{});
-            return;
-          }
+            (GRP == 2) && (cute::tuple_size<PfPack>::value == 4);
 #else
-        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
-          constexpr int I = decltype(i_)::value;
-          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
-          constexpr int g = atom_idx / APG_;
-          if constexpr (atom_idx % APG_ == 0) {                          // reload only at a group's first atom
-            const int sk = read_stage * int(Scale_TileK) + g;
-            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
-            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
-          }
+            false;
 #endif
-          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
-          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
-        });
+        if constexpr (kPfOk) {
+          // BOTH groups load before any transform, group gi into register set gi % 2, so the second group's data has
+          // a whole group of atoms to arrive in instead of being used one instruction after its load. pf carries the
+          // second set: fragments 0,1 and their copy views 2,3.
+          constexpr int g0 = (K_BLOCK_STATIC * K_ATOM_PER_COPY) / APG_;
+          cute::for_each(cute::make_int_sequence<GRP>{}, [&] (auto gi_) {
+            constexpr int GI = decltype(gi_)::value;
+            const int sk = read_stage * int(Scale_TileK) + g0 + GI;
+            if constexpr (GI % 2 == 0) {
+              copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+              copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+            } else {
+              copy(smem_tiled_copy_S, tCsS(_,_,0,sk), cute::get<2>(pf)(_,_,0));
+              copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), cute::get<3>(pf)(_,_,0));
+            }
+          });
+          cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+            constexpr int I        = decltype(i_)::value;
+            constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
+            constexpr int GI       = I / APG_;
+            if constexpr (GI % 2 == 0) {
+              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_,_,0),
+                              tCrB_mma(_,_,Int<atom_idx>{}), cute::multiplies{});
+              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_,_,0),
+                              tCrB_mma(_,_,Int<atom_idx>{}), cute::plus{});
+            } else {
+              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<0>(pf)(_,_,0),
+                              tCrB_mma(_,_,Int<atom_idx>{}), cute::multiplies{});
+              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(pf)(_,_,0),
+                              tCrB_mma(_,_,Int<atom_idx>{}), cute::plus{});
+            }
+          });
+        } else {
+          cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+            constexpr int I = decltype(i_)::value;
+            constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
+            constexpr int g = atom_idx / APG_;
+            if constexpr (atom_idx % APG_ == 0) {                        // reload only at a group's first atom
+              const int sk = read_stage * int(Scale_TileK) + g;
+              copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+              copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+            }
+            cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
+                            tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+            cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_, _, 0),
+                            tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
+          });
+        }
       }
     }
     else {
