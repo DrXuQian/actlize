@@ -509,9 +509,11 @@ public:
                                                           : int64_t(l_coord) * int64_t(M);
     Tensor mA_mkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_A + a_row_off * K),
                                 make_shape(M,K,cute::Int<1>{}), mainloop_params.dA);                            // (m,k,1)
-#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
-    // PLAIN, not make_mix_tensor_like: that wrapper carries (ptr, coordinate) for the AIU descriptor and has no
-    // addressable strides (l74), and cp.async needs real ones.
+#if (defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)) || (defined(PPU_A_PACK) && (PPU_A_PACK != 0))
+    // PLAIN, not make_mix_tensor_like: that wrapper carries (ptr, coordinate) for the AIU descriptor and has NO
+    // addressable strides (l74), so &gA(...) yields a meaningless address. Both macros write A with cp.async and
+    // therefore need real strides -- PPU_A_PACK was missing from this condition and faulted at
+    // s.wait commit_group(1), the async copy's own address check.
     Tensor gA = local_tile(mA_mkl(_,_,0), TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});            // (BLK_M,BLK_K,k)
 #else
     Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,0));                                                         // (m,k)
