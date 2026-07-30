@@ -103,7 +103,24 @@ template <
                            Stride<_1,_1>>{},
                     Layout<Shape <Block_MN, AiuContElemSize>>{}));
 
-  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Block_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
+  // CUBE_H IS Block_MN AND THIS IS THE ONE THAT MATTERS FOR A. Verified by printing the atom the collective
+  // actually uses on sA (InternalSmemCopyAtomA), which came back as
+  //     PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>
+  // -- half_t, so SwapAB is false and the A slot really is the activations; and 16/64/4 matches THIS struct's
+  // (Block_MN, AiuContElemSize, InstNum) exactly, not DefaultGemm_AIU_Operand's. An earlier CubeH override went
+  // into that other struct and was therefore inert, which is why the box faulted a second time with the
+  // disassembly's M step unchanged at 512 B.
+  //
+  // PPU_A_CUBE_H shrinks the rows one cube covers, so a decode tile whose TileM-1 rows are padding (one row per
+  // expert against TileM >= 16) can have its shared memory collapse. bits_per_aiu follows, so the AIU
+  // gmem->smem write stays paired with the swzl smem->reg read.
+#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H > 0)
+  static constexpr int CubeH = PPU_A_CUBE_H;
+  static_assert(Block_MN{} % CubeH == 0, "PPU_A_CUBE_H must divide Block_MN");
+#else
+  static constexpr int CubeH = Block_MN{};
+#endif
+  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, CubeH, AiuContElemSize{}, Swap, false, InstNum>;
   using SmemCopyAtom = Copy_Atom<SmemCopyOp, Element>;
   using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
 };

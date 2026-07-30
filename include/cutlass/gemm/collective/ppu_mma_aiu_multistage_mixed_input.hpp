@@ -235,39 +235,39 @@ public:
   // warps/block 2 -> 8 at fixed total work and bought 1.066x within a single run (22.68 -> 21.28 us), so
   // occupancy is a weak lever for this kernel. 2.6x of theoretical occupancy would not be expected to behave
   // differently from 1.78x of it.
-  // A's SMEM CANNOT BE SHRUNK FROM HERE. Two attempts, two illegal accesses on ppu001, and the second one also
-  // exposed why the local evidence was a false green light. Recorded so it is not attempted a third time.
+  // PPU_A_CUBE_H: A's smem tile keeps its TileM x TileK SHAPE but only one row of FOOTPRINT.
   //
-  // The motivation is real: at decode every expert has ONE row against TileM >= 16 (every MMA atom is
-  // Shape<_16,...>), so 15/16 of A's tile is padding whose results the epilogue's residue mask discards, and
-  // A is 62% of the block's 26,624 B. 9 blocks/CU would become 23, 18 warps/CU would become 46.
+  // At decode every expert has ONE row against TileM >= 16 (every MMA atom is Shape<_16,...>), so 15/16 of this
+  // tile is padding whose results the epilogue's residue mask discards -- and A is 62% of the block's 26,624 B.
+  // 26,624 -> 11,264 takes 9 blocks/CU to 23 and 18 warps/CU to 46.
   //
-  // ATTEMPT 1 -- stride 0 on this layout. Faulted. fold_derivation/l74_swzl_coord_not_stride.cu measures why: the
-  // mma-side read is partition_S(make_mix_tensor_like(sA)), a mix tensor carries a COORDINATE, and the coordinate
-  // at (m,0,0) is (0,m,_0,0) for the compact AND the stride-0 layout -- identical. Strides never reach the
-  // addressing; the asm resolves it from the coordinate with the cube pitch.
+  // THREE THINGS MUST MOVE TOGETHER, and two earlier attempts faulted on the box because only some of them did:
+  //   (1) A's copy atom CUBE_H, so one cube covers one row instead of TileM. That lives in the builder's
+  //       MixGemm_AIU_Operand -- NOT DefaultGemm_AIU_Operand, which is what the second attempt patched and why it
+  //       was inert. Verified by printing InternalSmemCopyAtomA, the atom the collective actually uses on sA:
+  //           default          PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>
+  //           PPU_A_CUBE_H=1   PPU0010_TSM_LD_SWZL<half_t,  1, 64, true, false, 4>
+  //       (half_t there also settles that SwapAB is false and the A slot is the activations -- an earlier reading
+  //       mistook an unresolved conditional_t branch, integer_subbyte<4>, for the selected type.)
+  //   (2) stride 0 in the M mode here, so cosize_v<SmemLayoutA> drops TileM*TileK*Stages -> TileK*Stages
+  //       (8192 -> 512 halfs at 16x32:256 s2, measured in fold_derivation/l77) and the gmem->smem partition_D --
+  //       a plain tensor, so it DOES follow the layout -- writes every row to the same place.
+  //   (3) the gmem m-stride at 0, which moe_grouped_ppu::launch forces whenever this macro is on, so the sources
+  //       those aliased writes carry are all the SAME row rather than racing with different values.
   //
-  // ATTEMPT 2 -- shrink CUBE_H so a cube is one row (PPU_A_CUBE_H, still present but INERT for this path).
-  // Faulted identically, with the disassembly's M step unchanged at 512 B where CUBE_H=1/CUBE_W=64 would give
-  // 128 B. Two gaps in the local verification explain that:
-  //   * l76 exercised DefaultGemm_AIU_Operand DIRECTLY, not through the builder. The mixed-input path's A atom is
-  //     MixGemm_AIU_Operand, which hardcodes CUBE_H = Block_MN{} with no override point -- so the override very
-  //     likely never reached A's atom at all.
-  //   * l77 probed Mainloop::SmemCopyAtomA, but this collective uses InternalSmemCopyAtomA =
-  //     conditional_t<!SwapAB, SmemCopyAtomA, SmemCopyAtomB>, and SwapAB is true here because the operand that
-  //     goes through the converter occupies the "A" slot. The atom I printed came back as integer_subbyte<4> --
-  //     the QUANTIZED one. So l77's CPY_M, tCsA layout and fragment-size readings were all for the wrong atom.
-  // The only thing that genuinely held is that cosize_v<SmemLayoutA> follows the layout, which was never in doubt.
+  // What is NOT needed: pinning an M coordinate in the copy. CPY_M = size<1>(tCsA) is 1 either way, because the
+  // copy's M coverage never lived on that mode -- the atom's cube geometry carries it.
   //
-  // NOT WORTH A THIRD ATTEMPT at the measured payoff. The TileN ladder raised theoretical occupancy 28% -> 50%
-  // at constant total work and bought 1.066x within one run (22.68 -> 21.28 us). Occupancy is a weak lever for
-  // this kernel, so the ~2.6x of theoretical occupancy this would unlock is worth well under 1.1x. Bound the
-  // direction with a dummy-padding occupancy sweep before touching the collective again -- that needs no
-  // collective change at all, only a padding member in the kernel's own SharedStorage, and it measures the slope
-  // in the direction that IS reachable (more smem -> fewer blocks/CU).
+  // Sound only at Mmax == 1; launch() refuses above that.
+#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H == 1)
+  using SmemLayoutA = decltype(make_layout(
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
+      make_stride(_0{}, _1{}, shape<2>(TileShape{}))));
+#else
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+#endif
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
