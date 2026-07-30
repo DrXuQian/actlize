@@ -337,9 +337,29 @@ public:
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
 
   // It is assumed that the scales and zero-points share the same smem layout
+  // PPU_SCALE_PAD: break the bank period on the GROUP stride.
+  //
+  // The natural layout is (Scale_TileN, Scale_TileK, Stages) : (1, Scale_TileN, Scale_TileN*Scale_TileK), and at
+  // Scale_TileN = 64 halfs the group stride is 128 B -- exactly 32 banks x 4 B, so consecutive groups start on the
+  // SAME bank. N is contiguous inside a group, so a single group covers the banks once and is fine; the conflicts
+  // come from accesses that step in the group or stage direction. acu, sz against pc: +252k conflicts on +272k scale
+  // reads, about 1.02 each, and they double the channel's transactions (+504k) while shared memory sits at 28% of
+  // peak -- so this is transactions times latency, and padding is free apart from the extra bytes.
+  //
+  // Padding by 8 halfs (16 B) shifts each group by 4 banks. The data, the gmem->smem copy and every read all go
+  // through this layout, so nothing else changes.
+#if defined(PPU_SCALE_PAD) && (PPU_SCALE_PAD > 0)
+  static constexpr int kScalePad = PPU_SCALE_PAD;
+  using SmemLayoutScale = decltype(make_layout(
+    make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<DispatchPolicy::Stages>{}),
+    make_stride(_1{},
+                Int<int(shape<0>(ScaleTileShape{})) + kScalePad>{},
+                Int<(int(shape<0>(ScaleTileShape{})) + kScalePad) * int(shape<1>(ScaleTileShape{}))>{})));
+#else
   using SmemLayoutScale = decltype(tile_to_shape(
     SmemLayoutAtomScale{},
     make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<DispatchPolicy::Stages>{})));
+#endif
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
