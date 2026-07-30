@@ -94,25 +94,39 @@ template <
   using AiuContElemSize = Int<AiuContByteSize / sizeof_bits<Element>::value * 8>;
   static constexpr int InstNum = Block_K{} / AiuContElemSize{};
 
-  static constexpr int bits_per_aiu = Block_MN{} * AiuContElemSize{} * sizeof_bits<Element>::value;
+  // THE AIU WRITE AND THE SWZL READ ARE ONE MATCHED TRIPLE, all three legs derived from Block_MN:
+  //
+  //     write payload   bits_per_aiu = Block_MN * AiuContElemSize * bits    -> PPU0010_AIU_LOAD<C<16384>,...>
+  //     write cube      GmemTiledCopy's value layout (Block_MN, AiuCont)    -> Tiler_MN, hence desc_.cube_h
+  //     read cube       PPU0010_TSM_LD_SWZL<Element, Block_MN, AiuCont,...> -> CUBE_H
+  //
+  // and both asm forms carry .swzl, so write-then-read is a byte identity only while the three agree. An earlier
+  // PPU_A_CUBE_H changed the READ leg alone: a 16-row swizzled cube was written and reinterpreted as a 1-row cube,
+  // and the kernel returned NaN. That was a one-sided edit, not a hardware limit -- printed side by side in
+  // fold_derivation/l81_aiu_pair.cu.
+  //
+  // PPU_A_CUBE_MN moves all three together. Its purpose is decode, where TileM >= 16 is forced by the mma atom
+  // while an expert owns one row, so 15/16 of A's shared tile is padding.
+#if defined(PPU_A_CUBE_MN) && (PPU_A_CUBE_MN > 0)
+  using Cube_MN = Int<PPU_A_CUBE_MN>;
+  static_assert(Block_MN{} % PPU_A_CUBE_MN == 0, "PPU_A_CUBE_MN must divide Block_MN");
+#else
+  using Cube_MN = Block_MN;
+#endif
+  static constexpr int bits_per_aiu = Cube_MN{} * AiuContElemSize{} * sizeof_bits<Element>::value;
   using CopyInst = PPU0010_AIU_LOAD<cute::C<bits_per_aiu>, Element, false>;
 
   using GmemTiledCopy = decltype(
     make_tiled_copy(Copy_Atom<CopyInst, Element>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Block_MN, AiuContElemSize>>{}));
+                    Layout<Shape <Cube_MN, AiuContElemSize>>{}));
 
-  // CUBE_H is Block_MN, and THIS is the struct that builds A's atom on the mixed-input path -- printing
+  // The read leg of the triple above. THIS is the struct that builds A's atom on the mixed-input path -- printing
   // InternalSmemCopyAtomA gives PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>, whose (Block_MN,
-  // AiuContElemSize, InstNum) match here and not DefaultGemm_AIU_Operand's.
-  //
-  // CUBE_H IS NOT A FOOTPRINT KNOB. Shrinking it to 1 dropped cosize_v<SmemLayoutA> 16x while the copy op's
-  // SrcLayout/DstLayout stayed at 4096 bits and size(tCrA) stayed at 128, so the same bits landed in different
-  // registers under a different swzl permutation and the results were wrong on hardware. Keeping the allocation
-  // small with CUBE_H=16 faults instead. Both directions are dead; the reachable route was taking A out of shared
-  // memory altogether (PPU_A_IN_REG in ppu_mma_aiu_multistage_mixed_input.hpp), which touches no atom at all.
-  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Block_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
+  // AiuContElemSize, InstNum) match here and not DefaultGemm_AIU_Operand's, which is why an override placed there
+  // was inert.
+  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Cube_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
   using SmemCopyAtom = Copy_Atom<SmemCopyOp, Element>;
   using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
 };
