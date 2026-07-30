@@ -195,9 +195,16 @@ public:
   static constexpr int kACubeH      = shape<0>(TileShape{});                  // CUBE_H = Block_MN = TileM for A
   static constexpr int kACubeW      = 64;                                    // AiuContElemSize for fp16
   static constexpr int kASlices     = kACubeW / 16;                          // 8 words per slice
-  static constexpr int kAPackPitch  = 16;                                    // halfs; the run width, so packing tiles
+  // PITCH 64 HALFS = 128 B, not the minimum 16. The tight pack faulted on the box in B's AIU load
+  // (vmem.aiu.ld.tsm ... .b8) because smem_b FOLLOWS smem_a and cute::array_aligned only guarantees 16 B, while
+  // PPU0010's AIU needs 32 -- the old alignment held only because A's byte count happened to be a multiple of 32.
+  // At 64 halfs every cube base and the whole span are 128-B multiples, so the alignment is structural instead of
+  // arithmetic. Costs 2944 B against 2272 at pitch 16, still 5.6x under the unpacked 16,384.
+  static constexpr int kAPackPitch  = 64;                                    // halfs = 128 B
   static constexpr int kACubes      = shape<2>(TileShape{}) / kACubeW;       // cubes per stage = InstNum
-  static constexpr int kAPackSpan   = kAPackPitch * (kACubes * DispatchPolicy::Stages - 1) + kACubeH * kACubeW;
+  // Rounded up to 64 halfs so smem_b starts 128-B aligned whatever the cube geometry is.
+  static constexpr int kAPackSpanRaw = kAPackPitch * (kACubes * DispatchPolicy::Stages - 1) + kACubeH * kACubeW;
+  static constexpr int kAPackSpan    = ((kAPackSpanRaw + 63) / 64) * 64;
   static constexpr int kAWrThreads  = kACubes * kASlices * 2;                // cube x run x (16 halfs / 8 per thread)
   // Row 0's run offsets, derived from ppu_tsm_ld_swzl_sim rather than tabulated: row 0 means lane/4 == 0 and
   // v/2 == 0, which leaves vreg_line_idx = 0 and vreg_vec_idx = v%2, so the run starts at the slice base plus
