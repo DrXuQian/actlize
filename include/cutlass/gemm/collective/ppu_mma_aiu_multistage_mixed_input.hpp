@@ -691,7 +691,7 @@ public:
     // CUBE_H=1 cute instead moves mode 2 from basis 2 to basis 0 with stride 64 and halves the A register
     // fragment (ArrayEngine 128 -> 64, with a stride-0 component), i.e. it re-derives the geometry itself.
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
-      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
+      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, Int<0>{}, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
     }
 
@@ -1079,17 +1079,24 @@ private:
             class TCrB_mma,
             int K_ATOM_PER_COPY,
             class... Ts,
-            class CopyViews>
+            class CopyViews,
+            class KBlockT>
   CUTLASS_DEVICE
   void transform_B_kblock(
     TCrB_load const& tCrB_load,
     TCrB_mma& tCrB_mma,
     cute::tuple<Ts...> const& partitioned_extra_info,
-    int const k_block,
+    // KBlockT, NOT int: the callers already hold a static k_block (for_each gives Int<x>, and k_block_next is
+    // (Int<x> + _1) % K_BLOCK_MAX, also static). Taking it as an int erased that, so atom_idx, g = atom_idx/APG_
+    // and the `% APG_ == 0` guard all turned into runtime work -- s.cmp 0.54 + s.csel 0.41 + s.cbr 0.56 +
+    // s.shra 0.09 + s.mull 0.16 per mma in the profile, ~1.8 of 34. Kept static, the guard folds to if constexpr
+    // and vanishes with the division and modulo. Constant folding only; numerics unchanged.
+    KBlockT const& k_block,
     cute::Int<K_ATOM_PER_COPY> k_atom,
     CopyViews const& tiled_copy_and_views,
     int const read_stage) {
 
+    static constexpr int K_BLOCK_STATIC = int(KBlockT{});
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
     Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
 
@@ -1107,38 +1114,42 @@ private:
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       auto tCrS = cute::get<1>(partitioned_extra_info);
       if constexpr (!FINE) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
-        }
+        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + decltype(i_)::value;
+          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrS(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+        });
       } else {
         // FINE: write via tCrS_copy_view (a retile VIEW of the ORIGINAL fragment) then read the ORIGINAL back --
         // NOT the local `tCrS` copy above (make_fragment_like is owning, so `auto tCrS` snapshots stale rmem).
         auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
         auto tCsS              = cute::get<0>(partitioned_extra_info);
         auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          int g = atom_idx / APG_;                                      // this atom's scale group within the tile
-          if (atom_idx % APG_ == 0)                                     // reload only at a group's first atom
+    // COMPILE-TIME ATOM INDEX. i used to be a runtime int, so atom_idx, g = atom_idx / APG_ and the
+    // `atom_idx % APG_ == 0` guard all became runtime work even though K_ATOM_PER_COPY, APG_ and k_block are
+    // constants: the profile showed s.cmp 0.54 + s.csel 0.41 + s.cbr 0.56 + s.shra 0.09 + s.mull 0.16 per mma,
+    // about 1.8 of 34. With for_each the index is Int<i>, the guard folds to if constexpr and disappears, and the
+    // division and modulo fold away. Same reason the main loop uses for_each -- see its comment about needing
+    // k_block to be Int<x>. Numerics are unchanged; this is constant folding only.
+        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+          constexpr int I = decltype(i_)::value;
+          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
+          constexpr int g = atom_idx / APG_;                            // this atom's scale group within the tile
+          if constexpr (atom_idx % APG_ == 0)                            // reload only at a group's first atom
             copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
-          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
-        }
+          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+        });
       }
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       auto tCrS = cute::get<1>(partitioned_extra_info);
       auto tCrZ = cute::get<3>(partitioned_extra_info);
       if constexpr (!FINE) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          cute::transform(tCrB_mma(_, _, atom_idx), tCrS(_, _, 0), tCrB_mma(_, _, atom_idx), cute::multiplies{});
-          cute::transform(tCrB_mma(_, _, atom_idx), tCrZ(_, _, 0), tCrB_mma(_, _, atom_idx), cute::plus{});
-        }
+        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + decltype(i_)::value;
+          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrS(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrZ(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
+        });
       } else {
         // FINE: see ConvertAndScale note -- write via the copy VIEWs, read the ORIGINAL fragments back.
         auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
@@ -1146,20 +1157,26 @@ private:
         auto tCsZ              = cute::get<2>(partitioned_extra_info);
         auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
         auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_ATOM_PER_COPY; ++i) {
-          int atom_idx = k_block * K_ATOM_PER_COPY + i;
-          int g = atom_idx / APG_;
-          if (atom_idx % APG_ == 0) {                                   // reload only at a group's first atom
+    // COMPILE-TIME ATOM INDEX. i used to be a runtime int, so atom_idx, g = atom_idx / APG_ and the
+    // `atom_idx % APG_ == 0` guard all became runtime work even though K_ATOM_PER_COPY, APG_ and k_block are
+    // constants: the profile showed s.cmp 0.54 + s.csel 0.41 + s.cbr 0.56 + s.shra 0.09 + s.mull 0.16 per mma,
+    // about 1.8 of 34. With for_each the index is Int<i>, the guard folds to if constexpr and disappears, and the
+    // division and modulo fold away. Same reason the main loop uses for_each -- see its comment about needing
+    // k_block to be Int<x>. Numerics are unchanged; this is constant folding only.
+        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+          constexpr int I = decltype(i_)::value;
+          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
+          constexpr int g = atom_idx / APG_;
+          if constexpr (atom_idx % APG_ == 0) {                          // reload only at a group's first atom
             const int sk = read_stage * int(Scale_TileK) + g;
             copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
             copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
           }
-          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<1>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, atom_idx), cute::multiplies{});
-          cute::transform(tCrB_mma(_, _, atom_idx), cute::get<3>(partitioned_extra_info)(_, _, 0),
-                          tCrB_mma(_, _, atom_idx), cute::plus{});
-        }
+          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_, _, 0),
+                          tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
+        });
       }
     }
     else {
