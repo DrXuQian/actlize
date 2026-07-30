@@ -13,6 +13,15 @@
 
 #define ENABLE_AIU 1
 
+// ONE definition of the packed cube pitch, used by BOTH sides. The read's pitch is baked into A's atom by the
+// builder and the write's is computed in the collective; as two separate literals they diverged -- 16 against 64 --
+// and the kernel wrote at one spacing, read at another, and faulted with an invalid VA. 64 halfs = 128 B keeps every
+// cube base and the whole span 128-B aligned, which smem_b's AIU descriptor needs (its alignment used to hold only
+// because A's byte count happened to be a multiple of 32).
+#ifndef PPU_A_PACK_PITCH
+#define PPU_A_PACK_PITCH 64
+#endif
+
 namespace cutlass::gemm::collective {
 
 namespace ppu_detail {
@@ -140,7 +149,10 @@ template <
   // accumulator rows the epilogue masks. l85 verifies an 8-word (16-half) pitch is collision-free. Geometry, and so
   // the swizzle and the write/read pairing, are untouched -- only the distance between bases changes.
 #if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
-  static constexpr int kCubePitchA = 16;   // halfs; 8 words, the run width, so packing tiles exactly
+  // MUST EQUAL the collective's kAPackPitch -- the read's pitch comes from here and the write's from there, and a
+  // mismatch writes at one spacing and reads at another. That is exactly how the packed path faulted: this stayed
+  // at 16 when the collective moved to 64. The collective static_asserts the two against each other now.
+  static constexpr int kCubePitchA = PPU_A_PACK_PITCH;
 #else
   static constexpr int kCubePitchA = 0;    // 0 = natural CUBE_H * CUBE_W
 #endif

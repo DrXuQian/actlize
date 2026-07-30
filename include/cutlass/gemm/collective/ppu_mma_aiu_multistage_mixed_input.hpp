@@ -47,6 +47,15 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// ONE definition of the packed cube pitch, used by BOTH sides. The read's pitch is baked into A's atom by the
+// builder and the write's is computed in the collective; as two separate literals they diverged -- 16 against 64 --
+// and the kernel wrote at one spacing, read at another, and faulted with an invalid VA. 64 halfs = 128 B keeps every
+// cube base and the whole span 128-B aligned, which smem_b's AIU descriptor needs (its alignment used to hold only
+// because A's byte count happened to be a multiple of 32).
+#ifndef PPU_A_PACK_PITCH
+#define PPU_A_PACK_PITCH 64
+#endif
+
 namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -200,7 +209,7 @@ public:
   // PPU0010's AIU needs 32 -- the old alignment held only because A's byte count happened to be a multiple of 32.
   // At 64 halfs every cube base and the whole span are 128-B multiples, so the alignment is structural instead of
   // arithmetic. Costs 2944 B against 2272 at pitch 16, still 5.6x under the unpacked 16,384.
-  static constexpr int kAPackPitch  = 64;                                    // halfs = 128 B
+  static constexpr int kAPackPitch  = PPU_A_PACK_PITCH;                      // halfs; see PPU_A_PACK_PITCH
   static constexpr int kACubes      = shape<2>(TileShape{}) / kACubeW;       // cubes per stage = InstNum
   // Rounded up to 64 halfs so smem_b starts 128-B aligned whatever the cube geometry is.
   static constexpr int kAPackSpanRaw = kAPackPitch * (kACubes * DispatchPolicy::Stages - 1) + kACubeH * kACubeW;
@@ -581,6 +590,8 @@ public:
     // "no type named 'SharedStorage'", which is how the local gate passed and the box build failed.
     static_assert(aPackDisjoint(), "PPU_A_PACK: packed row-0 runs collide -- raise kAPackPitch");
     static_assert(kACubeW == 64, "PPU_A_PACK: run offsets assume AiuContElemSize == 64 halfs");
+    // The read's pitch and the write's now come from the same macro (PPU_A_PACK_PITCH), so they cannot diverge
+    // the way they did when each side carried its own literal.
     static_assert(int(cute::size<0>(TileShape{})) == kACubeH, "PPU_A_PACK: CUBE_H must be TileM");
 #endif
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
