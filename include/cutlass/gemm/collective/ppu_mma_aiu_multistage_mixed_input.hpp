@@ -425,7 +425,15 @@ public:
     // make_mix_tensor_like wraps (ptr, COORDINATE) for the AIU descriptor and carries no addressable strides
     // (fold_derivation/l74) -- partitioning that for a register load would be the same class of error as the
     // stride-0 smem attempt: allocation right, addressing wrong.
-    Tensor gA = local_tile(mA_mkl(_,_,0), TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});            // (BLK_M,BLK_K,k)
+    // THE M-STRIDE IS STATICALLY ZERO HERE, not merely zero at runtime. launch() already requires
+    // a_row_broadcast for this path, so the value is 0 either way -- but as a runtime int the compiler cannot see
+    // that the fragment's m mode aliases, and it emitted one load per logical slot: 16 vmem.ld per mma where the
+    // addresses need 2. Baking _0 in lets the mode be identified and sliced under a static assert below.
+    Tensor mA_bcast = make_tensor(make_gmem_ptr(mainloop_params.ptr_A + a_row_off * K),
+                                  make_shape(M, K, cute::Int<1>{}),
+                                  make_stride(cute::_0{}, cute::get<1>(mainloop_params.dA),
+                                              cute::get<2>(mainloop_params.dA)));
+    Tensor gA = local_tile(mA_bcast(_,_,0), TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});           // (BLK_M,BLK_K,k)
 #else
     Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,0));                                                         // (m,k)
     Tensor gA = local_tile(mA_mk, TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});                    // (BLK_M,BLK_K,k)
@@ -572,6 +580,29 @@ public:
     CUTE_STATIC_ASSERT_V(size<0>(tCgA_all) == size<0>(tCrA));
     CUTE_STATIC_ASSERT_V(size<1>(tCgA_all) == size<1>(tCrA));
     CUTE_STATIC_ASSERT_V(size<2>(tCgA_all) == size<2>(tCrA));
+
+    // MOST OF THESE LOADS ARE PROVABLY THE SAME ADDRESS. One mma atom's slice, read off the layout with the
+    // caller's A m-stride at 0 (fold_derivation/l80_a_frag_redundancy.cu):
+    //
+    //     gmem  tCgA(_,_,atom) : ((2,2,2),1) : ((1,8,0),0)
+    //     reg   tCrA(_,_,atom) : ((2,2,2),1) : ((1,2,4),0)
+    //
+    // The gmem stride's third component is ZERO -- that mode is m, which stride 0 collapses -- so the eight
+    // logical slots cover only FOUR addresses, {0,1,8,9}, as two contiguous pairs. Copying the slice whole issued
+    // 16 vmem.ld per mma on hardware (2,097,152 against 131,072 mma), eight times the two 32-bit loads the
+    // addresses actually need, because cute walks logical slots and cannot know two of them alias.
+    //
+    // So load the m == 0 half and move the other half in REGISTERS. Two loads and four register writes per atom,
+    // against the smem path's ~2.3 tsm reads per mma, and none of it on the AIU or shared-memory pipe.
+    // These three are what make the slice below legitimate rather than a guess: the mode being dropped must be
+    // the one whose gmem stride is STATICALLY zero (so its slots alias), it must be the m mode of extent 2, and
+    // the register fragment must NOT share that stride -- tCrA comes from sA, whose strides are real, so all
+    // eight of its slots are distinct registers and the mma still sees a normal fragment.
+    static constexpr int kAZeroMode = 2;
+    CUTE_STATIC_ASSERT_V(cute::get<kAZeroMode>(cute::stride<0>(tCgA_all)) == cute::_0{});
+    CUTE_STATIC_ASSERT_V(cute::get<kAZeroMode>(cute::shape<0>(tCgA_all)) == cute::_2{});
+    static_assert(cute::get<kAZeroMode>(decltype(cute::stride<0>(tCrA)){}) != 0,
+                  "A's register fragment must not inherit the broadcast stride, or the mma would read one m twice");
 #endif
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
 
@@ -720,10 +751,11 @@ public:
         for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
           auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
 #if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
-          // A for this atom, gmem -> fragment. Not pipelined: unlike B there is no second buffer to prefetch into.
-          // The bet is that it does not need one -- with the caller's A m-stride at 0 every slot reads the SAME
-          // TileK-long row, so after the first touch the whole tile is L1-resident.
-          cute::copy(tCgA_all(_,_,atom_idx,*a_tile_iter), tCrA(_,_,atom_idx));
+          // Unique addresses only (m == 0), then the aliased half from registers. See the layout note above.
+          cute::copy(tCgA_all(make_coord(_,_,Int<0>{}),_,atom_idx,*a_tile_iter),
+                     tCrA    (make_coord(_,_,Int<0>{}),_,atom_idx));
+          cute::copy(tCrA    (make_coord(_,_,Int<0>{}),_,atom_idx),
+                     tCrA    (make_coord(_,_,Int<1>{}),_,atom_idx));
 #endif
           // Transform before compute
           cute::transform(tCrA(_,_,atom_idx), TransformA{});
