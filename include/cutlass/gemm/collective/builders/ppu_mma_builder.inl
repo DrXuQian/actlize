@@ -105,28 +105,37 @@ template <
   // and the kernel returned NaN. That was a one-sided edit, not a hardware limit -- printed side by side in
   // fold_derivation/l81_aiu_pair.cu.
   //
-  // PPU_A_CUBE_MN moves all three together. Its purpose is decode, where TileM >= 16 is forced by the mma atom
-  // while an expert owns one row, so 15/16 of A's shared tile is padding.
-#if defined(PPU_A_CUBE_MN) && (PPU_A_CUBE_MN > 0)
-  using Cube_MN = Int<PPU_A_CUBE_MN>;
-  static_assert(Block_MN{} % PPU_A_CUBE_MN == 0, "PPU_A_CUBE_MN must divide Block_MN");
-#else
-  using Cube_MN = Block_MN;
-#endif
-  static constexpr int bits_per_aiu = Cube_MN{} * AiuContElemSize{} * sizeof_bits<Element>::value;
+  // AND MOVING ALL THREE TOGETHER IS STILL NOT ENOUGH -- tried, measured, removed. With all three at 1 the NaN
+  // went away (the write and read agreed again) but every value was wrong: max_rel 868, |max| 10.4 against 21.72,
+  // finite and self-consistent, i.e. a permutation rather than missing data.
+  //
+  // The reason is in Copy_Traits<PPU0010_TSM_LD_SWZL>. SrcLayout is (32 lanes, 128 bits) with no CUBE_H in it, and
+  // LogicalTV resolves the row index to
+  //
+  //     row = lane/4 + 8*(v/2),   lane/4 in [0,8), v/2 in [0,2)   ->   row in [0,16)
+  //
+  // so ONE instruction's (thread, vreg) structure spans SIXTEEN ROWS by construction. That is the instruction's
+  // shape, not a parameter: CUBE_H reframes the hardware cube, it does not shrink that register footprint. And the
+  // .swzl cancellation that makes write-then-read a byte identity requires the WRITE to frame the same 16-row cube,
+  // which is why cube_h = 1 corrupted row 0 as well as the padding rows.
+  //
+  // The traits comment states the boundary exactly: stock cute covers any cube WIDTH. Height is fixed at 16 by the
+  // TV structure. It is also why A's read costs only 4 instructions per k-tile -- one instruction already covers
+  // the whole 16-row tile, so that is the floor, and A's entire chain is 0.6% of the instruction stream.
+  static constexpr int bits_per_aiu = Block_MN{} * AiuContElemSize{} * sizeof_bits<Element>::value;
   using CopyInst = PPU0010_AIU_LOAD<cute::C<bits_per_aiu>, Element, false>;
 
   using GmemTiledCopy = decltype(
     make_tiled_copy(Copy_Atom<CopyInst, Element>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Cube_MN, AiuContElemSize>>{}));
+                    Layout<Shape <Block_MN, AiuContElemSize>>{}));
 
   // The read leg of the triple above. THIS is the struct that builds A's atom on the mixed-input path -- printing
   // InternalSmemCopyAtomA gives PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>, whose (Block_MN,
   // AiuContElemSize, InstNum) match here and not DefaultGemm_AIU_Operand's, which is why an override placed there
   // was inert.
-  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Cube_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
+  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Block_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
   using SmemCopyAtom = Copy_Atom<SmemCopyOp, Element>;
   using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
 };
