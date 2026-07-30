@@ -500,20 +500,13 @@ template <
   typename Block_K,
   bool Swap,
   int StageStride = 0,
-  bool Swzl = true,
-  // CUBE_H OVERRIDE, 0 = derive from Block_MN as before.
-  //
-  // CUBE_H is the number of MN rows ONE cube covers, and for PPU0010 it is assigned Block_MN outright -- so a
-  // cube spans the whole tile in M and the M extent lives inside the hardware. That is what makes A's shared
-  // memory unshrinkable at decode: with one row per expert against TileM >= 16, 15/16 of A's tile is padding,
-  // but partition_S has no M mode to pin (CPY_M == 1) and no LAYOUT can help either -- the swzl read is handed a
-  // COORDINATE, not a linear offset, so strides never reach the addressing
-  // (fold_derivation/l74_swzl_coord_not_stride.cu measures this).
-  //
-  // Overriding CUBE_H is the only level at which it IS changeable: CUBE_H=1 makes one cube a single row, the
-  // tile becomes 16 cubes, partition_S gains an M mode, and both the AIU gmem->smem write and the swzl
-  // smem->reg read follow automatically because they take their CUBE parameters from this same struct.
-  int CubeH = 0
+  bool Swzl = true
+  // CUBE_H is the number of MN rows ONE cube covers, and for PPU0010 it is assigned Block_MN outright, so a cube
+  // spans the whole tile in M and that extent lives inside the hardware. An override parameter lived here and was
+  // removed: it is inert for the mixed-input A path (that atom is built in MixGemm_AIU_Operand) and, where it did
+  // apply, shrinking CUBE_H changed the swzl permutation rather than just the footprint, so the delivered bits
+  // landed in the wrong registers. Nor can a LAYOUT reach it -- the swzl read is handed a COORDINATE, not a linear
+  // offset, so strides never touch the addressing (fold_derivation/l74_swzl_coord_not_stride.cu measures that).
 > struct DefaultGemm_AIU_Operand;
 
 template <
@@ -523,8 +516,7 @@ template <
   typename Block_K,
   bool Swap,
   int StageStride,
-  bool Swzl,
-  int CubeH
+  bool Swzl
 > struct DefaultGemm_AIU_Operand<
   Arch,
   Element,
@@ -533,8 +525,7 @@ template <
   Block_K,
   Swap,
   StageStride,
-  Swzl,
-  CubeH
+  Swzl
 > {
   static constexpr int BlockContSize = Block_K{} * sizeof_bits<Element>::value / 8;
   static_assert(BlockContSize > 128 ? (BlockContSize % 128 == 0) : (BlockContSize % 32 == 0), "aiu_trans: block contiguous size should be multiple of 128B or 32B");
@@ -554,8 +545,7 @@ template <
                                   (split_on_k_10500 ? (Block_K{} / AiuContElemSize) : 1) : Block_K{} / AiuContElemSize;
   static constexpr int CUBE_H_default = cute::is_same_v<Arch, cutlass::arch::PPU0015> ?
                                   (split_on_k_10500 ? Block_MN{} : (Block_MN{} / inst_num)) : Block_MN{};
-  static constexpr int CUBE_H = CubeH > 0 ? CubeH : CUBE_H_default;
-  static_assert(CubeH == 0 || Block_MN{} % CubeH == 0, "CubeH override must divide Block_MN");
+  static constexpr int CUBE_H = CUBE_H_default;
   static constexpr int CUBE_W = AiuContElemSize;
   static constexpr int bits_per_aiu = CUBE_H * CUBE_W * sizeof_bits<Element>::value;
   using CopyInst = cute::conditional_t<

@@ -103,24 +103,16 @@ template <
                            Stride<_1,_1>>{},
                     Layout<Shape <Block_MN, AiuContElemSize>>{}));
 
-  // CUBE_H IS Block_MN AND THIS IS THE ONE THAT MATTERS FOR A. Verified by printing the atom the collective
-  // actually uses on sA (InternalSmemCopyAtomA), which came back as
-  //     PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>
-  // -- half_t, so SwapAB is false and the A slot really is the activations; and 16/64/4 matches THIS struct's
-  // (Block_MN, AiuContElemSize, InstNum) exactly, not DefaultGemm_AIU_Operand's. An earlier CubeH override went
-  // into that other struct and was therefore inert, which is why the box faulted a second time with the
-  // disassembly's M step unchanged at 512 B.
+  // CUBE_H is Block_MN, and THIS is the struct that builds A's atom on the mixed-input path -- printing
+  // InternalSmemCopyAtomA gives PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>, whose (Block_MN,
+  // AiuContElemSize, InstNum) match here and not DefaultGemm_AIU_Operand's.
   //
-  // PPU_A_CUBE_H shrinks the rows one cube covers, so a decode tile whose TileM-1 rows are padding (one row per
-  // expert against TileM >= 16) can have its shared memory collapse. bits_per_aiu follows, so the AIU
-  // gmem->smem write stays paired with the swzl smem->reg read.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H > 0)
-  static constexpr int CubeH = PPU_A_CUBE_H;
-  static_assert(Block_MN{} % CubeH == 0, "PPU_A_CUBE_H must divide Block_MN");
-#else
-  static constexpr int CubeH = Block_MN{};
-#endif
-  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, CubeH, AiuContElemSize{}, Swap, false, InstNum>;
+  // CUBE_H IS NOT A FOOTPRINT KNOB. Shrinking it to 1 dropped cosize_v<SmemLayoutA> 16x while the copy op's
+  // SrcLayout/DstLayout stayed at 4096 bits and size(tCrA) stayed at 128, so the same bits landed in different
+  // registers under a different swzl permutation and the results were wrong on hardware. Keeping the allocation
+  // small with CUBE_H=16 faults instead. Both directions are dead; the reachable route was taking A out of shared
+  // memory altogether (PPU_A_IN_REG in ppu_mma_aiu_multistage_mixed_input.hpp), which touches no atom at all.
+  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Block_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
   using SmemCopyAtom = Copy_Atom<SmemCopyOp, Element>;
   using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
 };
@@ -337,15 +329,7 @@ struct CollectiveBuilder<
   static constexpr bool TransB = platform::is_same<GmemLayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
 
 
-  // PPU_A_CUBE_H: shrink the CUBE_H of A's operand so one cube covers fewer M rows. Only A -- B keeps its
-  // default, so the delivery bound WN*TK*bits is untouched. See DefaultGemm_AIU_Operand's CubeH comment for why
-  // this is the ONLY level at which A's shared-memory padding is reachable.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H > 0)
-  using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>,
-                                                          false, 0, true, PPU_A_CUBE_H>;
-#else
   using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>, false>;
-#endif
   using DefaultOperandB = config::DefaultGemm_AIU_Operand<Arch, ElementB, TransB, Int<blockN>, Int<blockK>, true>;
 #else
   using DispatchPolicy = MainloopPPUCpAsync<3>;
@@ -470,15 +454,7 @@ struct CollectiveBuilder<
   static constexpr bool TransSFA = is_static<decltype(stride<1>(GmemLayoutSFATag{}))>::value ? false : true;
   static constexpr bool TransSFB = is_static<decltype(stride<1>(GmemLayoutSFBTag{}))>::value ? false : true;
 
-  // PPU_A_CUBE_H: shrink the CUBE_H of A's operand so one cube covers fewer M rows. Only A -- B keeps its
-  // default, so the delivery bound WN*TK*bits is untouched. See DefaultGemm_AIU_Operand's CubeH comment for why
-  // this is the ONLY level at which A's shared-memory padding is reachable.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H > 0)
-  using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>,
-                                                          false, 0, true, PPU_A_CUBE_H>;
-#else
   using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>, false>;
-#endif
   using DefaultOperandB = config::DefaultGemm_AIU_Operand<Arch, ElementB, TransB, Int<blockN>, Int<blockK>, true>;
 
   static constexpr int SFBTileN = TransSFB ? cute::max(ScaleNsPerTile, MinAiuContElemSize) : ScaleNsPerTile;
@@ -802,15 +778,7 @@ struct CollectiveBuilder<
   using DispatchPolicy = MainloopPPUAiuBatchArray<PipelineStages>;
   static constexpr bool TransA = platform::is_same<typename TagToStrideA<GmemLayoutA>::tag, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = platform::is_same<typename TagToStrideB<GmemLayoutB>::tag, cutlass::layout::ColumnMajor>::value ? false : true;
-  // PPU_A_CUBE_H: shrink the CUBE_H of A's operand so one cube covers fewer M rows. Only A -- B keeps its
-  // default, so the delivery bound WN*TK*bits is untouched. See DefaultGemm_AIU_Operand's CubeH comment for why
-  // this is the ONLY level at which A's shared-memory padding is reachable.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H > 0)
-  using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>,
-                                                          false, 0, true, PPU_A_CUBE_H>;
-#else
   using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>, false>;
-#endif
   using DefaultOperandB = config::DefaultGemm_AIU_Operand<Arch, ElementB, TransB, Int<blockN>, Int<blockK>, true>;
 #else
   using DispatchPolicy = MainloopPPUCpAsync<PipelineStages>;
@@ -916,15 +884,7 @@ struct CollectiveBuilder<
   using DispatchPolicy = MainloopPPUAiu<PipelineStages, KernelAiuMultistageStreamK>;
   static constexpr bool TransA = platform::is_same<GmemLayoutA, cutlass::layout::RowMajor>::value ? false : true;
   static constexpr bool TransB = platform::is_same<GmemLayoutB, cutlass::layout::ColumnMajor>::value ? false : true;
-  // PPU_A_CUBE_H: shrink the CUBE_H of A's operand so one cube covers fewer M rows. Only A -- B keeps its
-  // default, so the delivery bound WN*TK*bits is untouched. See DefaultGemm_AIU_Operand's CubeH comment for why
-  // this is the ONLY level at which A's shared-memory padding is reachable.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H > 0)
-  using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>,
-                                                          false, 0, true, PPU_A_CUBE_H>;
-#else
   using DefaultOperandA = config::DefaultGemm_AIU_Operand<Arch, ElementA, TransA, Int<blockM>, Int<blockK>, false>;
-#endif
   using DefaultOperandB = config::DefaultGemm_AIU_Operand<Arch, ElementB, TransB, Int<blockN>, Int<blockK>, true>;
 #else
   using DispatchPolicy = MainloopPPUCpAsync<PipelineStages>;

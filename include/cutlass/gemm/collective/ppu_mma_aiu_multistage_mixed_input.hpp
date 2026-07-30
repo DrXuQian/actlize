@@ -235,39 +235,16 @@ public:
   // warps/block 2 -> 8 at fixed total work and bought 1.066x within a single run (22.68 -> 21.28 us), so
   // occupancy is a weak lever for this kernel. 2.6x of theoretical occupancy would not be expected to behave
   // differently from 1.78x of it.
-  // PPU_A_CUBE_H: A's smem tile keeps its TileM x TileK SHAPE but only one row of FOOTPRINT.
-  //
-  // At decode every expert has ONE row against TileM >= 16 (every MMA atom is Shape<_16,...>), so 15/16 of this
-  // tile is padding whose results the epilogue's residue mask discards -- and A is 62% of the block's 26,624 B.
-  // 26,624 -> 11,264 takes 9 blocks/CU to 23 and 18 warps/CU to 46.
-  //
-  // THREE THINGS MUST MOVE TOGETHER, and two earlier attempts faulted on the box because only some of them did:
-  //   (1) A's copy atom CUBE_H, so one cube covers one row instead of TileM. That lives in the builder's
-  //       MixGemm_AIU_Operand -- NOT DefaultGemm_AIU_Operand, which is what the second attempt patched and why it
-  //       was inert. Verified by printing InternalSmemCopyAtomA, the atom the collective actually uses on sA:
-  //           default          PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>
-  //           PPU_A_CUBE_H=1   PPU0010_TSM_LD_SWZL<half_t,  1, 64, true, false, 4>
-  //       (half_t there also settles that SwapAB is false and the A slot is the activations -- an earlier reading
-  //       mistook an unresolved conditional_t branch, integer_subbyte<4>, for the selected type.)
-  //   (2) stride 0 in the M mode here, so cosize_v<SmemLayoutA> drops TileM*TileK*Stages -> TileK*Stages
-  //       (8192 -> 512 halfs at 16x32:256 s2, measured in fold_derivation/l77) and the gmem->smem partition_D --
-  //       a plain tensor, so it DOES follow the layout -- writes every row to the same place.
-  //   (3) the gmem m-stride at 0, which moe_grouped_ppu::launch forces whenever this macro is on, so the sources
-  //       those aliased writes carry are all the SAME row rather than racing with different values.
-  //
-  // What is NOT needed: pinning an M coordinate in the copy. CPY_M = size<1>(tCsA) is 1 either way, because the
-  // copy's M coverage never lived on that mode -- the atom's cube geometry carries it.
-  //
-  // Sound only at Mmax == 1; launch() refuses above that.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H == 1)
-  using SmemLayoutA = decltype(make_layout(
-      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
-      make_stride(_0{}, _1{}, shape<2>(TileShape{}))));
-#else
+  // A's shared-memory tile. Its footprint is TileM x TileK x Stages and TileM >= 16 is forced by the MMA atom
+  // shape, so at one row per expert 15/16 of it is padding -- but it cannot be shrunk HERE. Two box faults and one
+  // silent-NaN round established why: the allocation is sized by cosize_v<SmemLayoutA>, so a stride-0 M mode does
+  // collapse it, but the swzl read is addressed by COORDINATE (fold_derivation/l74) and by its cube geometry, not
+  // by these strides, so the instruction keeps sourcing TileM rows and reads out of bounds. Shrinking the cube to
+  // match changes the permutation rather than the footprint and delivers the right bits to the wrong registers.
+  // The route that does work is not to stage A at all -- see PPU_A_IN_REG in mma().
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
-#endif
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
@@ -331,7 +308,13 @@ public:
   {
     static constexpr int scale_elements = elements_per_smem_scale();
     static constexpr int zero_elements = elements_per_smem_zero();
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+    // A never reaches shared memory here. One element keeps SharedStorage's shape and sA's pointer valid; sA is
+    // used only for its LAYOUT (the static shape checks and partition_fragment_A) and is never dereferenced.
+    cute::ArrayEngine<RealInternalElementA, 1> smem_a;
+#else
     cute::ArrayEngine<RealInternalElementA, cute::cosize_v<SmemLayoutA>> smem_a;
+#endif
     cute::ArrayEngine<RealInternalElementB, cute::cosize_v<SmemLayoutB>> smem_b;
     cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
     cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
@@ -435,8 +418,16 @@ public:
                                                           : int64_t(l_coord) * int64_t(M);
     Tensor mA_mkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_A + a_row_off * K),
                                 make_shape(M,K,cute::Int<1>{}), mainloop_params.dA);                            // (m,k,1)
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+    // PPU_A_IN_REG: A is read straight into the mma fragment, so it must be a PLAIN tensor with real strides.
+    // make_mix_tensor_like wraps (ptr, COORDINATE) for the AIU descriptor and carries no addressable strides
+    // (fold_derivation/l74) -- partitioning that for a register load would be the same class of error as the
+    // stride-0 smem attempt: allocation right, addressing wrong.
+    Tensor gA = local_tile(mA_mkl(_,_,0), TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});            // (BLK_M,BLK_K,k)
+#else
     Tensor mA_mk = make_mix_tensor_like(mA_mkl(_,_,0));                                                         // (m,k)
     Tensor gA = local_tile(mA_mk, TileShape{}, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});                    // (BLK_M,BLK_K,k)
+#endif
 
     // B init (include init aiu desc)
     auto mB_nk = load_init_B(mainloop_params, N, K, L, l_coord);                                                // (n,k)
@@ -524,8 +515,16 @@ public:
     auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
 
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+    // No gmem->smem stage for A, so no AIU partitions for it either. a_tile_iter names the tile being CONSUMED,
+    // which the prefetch iterator no longer does once it runs Stages-1 tiles ahead. The main loop executes exactly
+    // K_TILES iterations -- (K_TILES-(Stages-1)) live plus (Stages-1) drain -- so this advances K_TILES-1 times and
+    // is never dereferenced past the last tile.
+    KTileIterator a_tile_iter = k_tile_iter;
+#else
     Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
+#endif
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
@@ -533,11 +532,15 @@ public:
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+      copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe), warp_idx);
+#else
       copy_aiu(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
         gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe),
         warp_idx
       );
+#endif
       copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, k_pipe);
       cp_async_fence();
       --k_tile_count;
@@ -552,6 +555,16 @@ public:
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor tCrA     = thr_mma.partition_fragment_A(sA(_,_,0));                // (MMA,MMA_M,MMA_K)
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+    // partition_A on the GLOBAL tile yields the same (MMA,MMA_M,MMA_K) partitioning that partition_fragment_A just
+    // allocated, so an elementwise copy puts every value in the slot the mma reads. What makes that equivalence
+    // true here is that the AIU write composed with the swzl read is a byte-level identity for fp16 -- the same
+    // fact that lets fp16 A ship with no offline relayout. Sub-byte B could not be sourced this way.
+    Tensor tCgA_all = thr_mma.partition_A(gA);                                // (MMA,MMA_M,MMA_K,k)
+    CUTE_STATIC_ASSERT_V(size<0>(tCgA_all) == size<0>(tCrA));
+    CUTE_STATIC_ASSERT_V(size<1>(tCgA_all) == size<1>(tCrA));
+    CUTE_STATIC_ASSERT_V(size<2>(tCgA_all) == size<2>(tCrA));
+#endif
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
@@ -579,6 +592,7 @@ public:
     TiledMma_S8 tiled_mma_s8;
     auto thr_mma_s8 = tiled_mma_s8.get_thread_slice(thread_idx);
 
+#if !defined(PPU_A_IN_REG) || (PPU_A_IN_REG == 0)
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
     auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(aiu_warp_group_thread_idx);
     Tensor tCsA            = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA));                // (CPY,CPY_M,CPY_K,PIPE)
@@ -586,6 +600,7 @@ public:
 
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
+#endif
 
     auto sB_s8 = recast<int8_t>(sB);
     Tensor tCrB_load =thr_mma_s8.partition_fragment_B(sB_s8(_,_,0));
@@ -610,7 +625,9 @@ public:
     // Current pipe index in smem to write to
     int smem_pipe_write = DispatchPolicy::Stages-1;
 
+#if !defined(PPU_A_IN_REG) || (PPU_A_IN_REG == 0)
     Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
+#endif
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
 
     // Size of the register pipeline
@@ -629,7 +646,9 @@ public:
     // PPU_A_CUBE_H (fold_derivation/l77), so M does not live on mode 1 and a loop over it is a no-op. With
     // CUBE_H=1 cute instead moves mode 2 from basis 2 to basis 0 with stride 64 and halves the A register
     // fragment (ArrayEngine 128 -> 64, with a stride-0 component), i.e. it re-derives the geometry itself.
-    copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
+#if !defined(PPU_A_IN_REG) || (PPU_A_IN_REG == 0)
+      copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
+#endif
       transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
     }
@@ -645,7 +664,9 @@ public:
         if (k_block == K_BLOCK_MAX - 1)
         {
           // Slice the smem_pipe_read smem
+#if !defined(PPU_A_IN_REG) || (PPU_A_IN_REG == 0)
           tCsA_p = tCsA(_,_,_,smem_pipe_read);
+#endif
           tCsB_p = tCsB(_,_,_,smem_pipe_read);
 
           // Commit the smem for smem_pipe_read
@@ -657,7 +678,9 @@ public:
         auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
         copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
+#if !defined(PPU_A_IN_REG) || (PPU_A_IN_REG == 0)
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+#endif
         transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
 
@@ -665,11 +688,15 @@ public:
         if (k_block == 0)
         {
           auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+          copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write), warp_idx);
+#else
           copy_aiu(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
             gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write),
             warp_idx
           );
+#endif
           copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, smem_pipe_write);
           cp_async_fence();
           if (k_tile_count > 1) { ++k_tile_iter; }
@@ -684,12 +711,22 @@ public:
         CUTLASS_PRAGMA_UNROLL
         for (int k_loop = 0; k_loop < K_ATOM_PER_COPY; k_loop++) {
           auto atom_idx = k_block * K_ATOM_PER_COPY + k_loop;
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+          // A for this atom, gmem -> fragment. Not pipelined: unlike B there is no second buffer to prefetch into.
+          // The bet is that it does not need one -- with the caller's A m-stride at 0 every slot reads the SAME
+          // TileK-long row, so after the first touch the whole tile is L1-resident.
+          cute::copy(tCgA_all(_,_,atom_idx,*a_tile_iter), tCrA(_,_,atom_idx));
+#endif
           // Transform before compute
           cute::transform(tCrA(_,_,atom_idx), TransformA{});
           cute::transform(tCrB_mma(_,_,atom_idx), TransformB{});
           // gemm for one tiled_mma atom on K
           cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
         }
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+        // One k-tile consumed. Advanced AFTER the gemms so this iteration's loads used the tile just computed.
+        if (k_block == K_BLOCK_MAX - 1) { ++a_tile_iter; }
+#endif
       });
 
     }
