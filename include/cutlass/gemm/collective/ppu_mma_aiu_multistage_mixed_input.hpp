@@ -235,9 +235,33 @@ public:
   // warps/block 2 -> 8 at fixed total work and bought 1.066x within a single run (22.68 -> 21.28 us), so
   // occupancy is a weak lever for this kernel. 2.6x of theoretical occupancy would not be expected to behave
   // differently from 1.78x of it.
+  // WITH PPU_A_CUBE_H THE ALLOCATION COLLAPSES TOO, and all three parts are needed together:
+  //   (1) CUBE_H=1 on A's operand -> one cube is one row, so partition_S gains an M mode (CPY_M = TileM)
+  //   (2) stride 0 here           -> cosize_v drops from TileM*TileK*Stages to TileK*Stages, and the gmem->smem
+  //                                  partition_D (a plain tensor, so it DOES follow the layout) writes every row
+  //                                  to the same place
+  //   (3) NOTHING in the copy loop. A pinned M coordinate was the plan and it is not needed: CPY_M = size<1>(tCsA)
+  //       is 1 with and without the macro, which is EXPECTED -- the copy's M coverage never lived on that mode,
+  //       the atom's inst_num and its internal cube geometry carry it. cute adapts on its own, and l77 shows it
+  //       doing so coherently: tCsA's mode 2 moves from basis 2 to basis 0 with stride 64, and the A register
+  //       fragment halves (ArrayEngine 128 -> 64, gaining a stride-0 component) to match the smaller cube.
+  //
+  // STATUS: the local evidence is POSITIVE but not conclusive, so this stays off by default. cosize drops
+  // 8192 -> 512 and all three derived quantities move consistently, which is what a correct re-derivation looks
+  // like. What is still unestablished is that every address the copy touches lands inside the smaller
+  // allocation: the basis-0 extents give 7*1 + 3*16 + 3*64 = 247 < 512, which is suggestive and not proof --
+  // tCsA's strides are symbolic ScaledBasis and the asm resolves the address, which is exactly the trap that let
+  // the previous attempt pass the front end and fault. test_moe_grouped_verify decides.
+  // Sound only at Mmax == 1, which moe_grouped_ppu::launch enforces by also forcing the gmem m-stride to 0.
+#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H == 1)
+  using SmemLayoutA = decltype(make_layout(
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
+      make_stride(_0{}, _1{}, shape<2>(TileShape{}))));
+#else
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
+#endif
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
@@ -595,7 +619,11 @@ public:
       // Prefetch the first rmem from the first k-tile
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
           partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
-      copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
+      // NO M-PINNING LOOP HERE, and that is a measured decision. CPY_M = size<1>(tCsA) is 1 both with and without
+    // PPU_A_CUBE_H (fold_derivation/l77), so M does not live on mode 1 and a loop over it is a no-op. With
+    // CUBE_H=1 cute instead moves mode 2 from basis 2 to basis 0 with stride 64 and halves the A register
+    // fragment (ArrayEngine 128 -> 64, with a stride-0 component), i.e. it re-derives the geometry itself.
+    copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
           copy_partitions_extra_info, smem_pipe_read);
     }
