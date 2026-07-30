@@ -211,16 +211,25 @@ public:
   // 1,024 B at (16,32,256) with 2 stages, block total 26,624 -> 11,264, 9 blocks/CU -> 23, 18 warps/CU -> 46,
   // theoretical occupancy 28% -> 72%.
   //
-  // WHY IT FAILS. InternalSmemCopyAtomA is a tsm.ld.swzl atom that computes its own byte addresses assuming the
-  // SWIZZLED COMPACT layout tile_to_shape produces. Given a plain stride-0 layout it addresses past the (now 16x
-  // smaller) allocation: on ppu001 the kernel takes an illegal memory access, faulting at
-  //     tsm.ld.swzl.b32x4.s0.t1.trans0  vreg[64:67], [sreg63] @sreg27
-  // nvcc's front end accepts it -- with PPU_FORCE_INSTANTIATE the whole collective instantiates and every
-  // static_assert passes -- so the front end is not evidence here, only the box is.
+  // WHY IT FAILS, measured rather than inferred (fold_derivation/l74_swzl_coord_not_stride.cu). The mma-side read
+  // is partition_S(make_mix_tensor_like(sA)), and a mix tensor carries (ptr, COORDINATE) rather than a resolved
+  // pointer -- copy_unpack forwards src.data().coord_ to the asm, as the traits' own comment in
+  // copy_traits_ppu0010_aiu.hpp states. Printing that coordinate for both layouts:
   //
-  // What would be needed is to separate the two roles this layout plays: a real 1 x TileK swizzled tile for the
-  // ALLOCATION and the gmem->smem copy, plus a stride-0 VIEW of it for the mma's read. The collective uses one
-  // SmemLayoutA for both, so that is a change to the copy atom's contract, not to a layout.
+  //     compact (16,256,2):(256,1,4096)   coord at (m,0,0) = (0,m,_0,0)   linear offsets 0 256 512 768
+  //     bcast   (16,256,2):(  0,1, 256)   coord at (m,0,0) = (0,m,_0,0)   linear offsets 0   0   0   0
+  //
+  // The coordinates are IDENTICAL: m enters raw, unscaled by any stride. So the stride-0 layout altered exactly
+  // the quantity this path does not use and left untouched the one it does, and the hardware still turned
+  // coordinate m into base + m*(cube row pitch). On ppu001 that reads 16x past the 16x smaller allocation:
+  //     tsm.ld.swzl.b32x4.s0.t1.trans0  vreg[64:67], [sreg63] @sreg27      (bases 512 B apart: 0xc00, 0xe00)
+  // nvcc's front end accepted it with PPU_FORCE_INSTANTIATE and every static_assert passing, so the front end was
+  // no evidence at all here.
+  //
+  // NO LAYOUT CHANGE CAN DO THIS. The fix has to pin the M COORDINATE, which is partition_S's output, not a
+  // stride: copy(smem_tiled_copy_A, tCsA_p(_,0,k_block), tCrA_copy_view(_,i,k_block)) for each destination i.
+  // Whether that is a saving at all depends on CPY_M = size<1>(tCrA_copy_view) exceeding 1 -- the box's three
+  // tsm.ld.swzl at 512-byte-apart bases say it does, but that is an inference from three instructions.
   //
   // WHETHER IT IS WORTH DOING is now answerable, and the answer is probably not: the TileN ladder raised
   // warps/block 2 -> 8 at fixed total work and bought 1.066x within a single run (22.68 -> 21.28 us), so
