@@ -207,9 +207,8 @@ public:
     int const ssv = (((s & 1) << 1) + ((s & 2) >> 1)) * 2;                    // 0, 4, 2, 6
     return 2 * (kACubeH * 8 * s + ssv * 4);                                  // halfs
   }
-#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
-  // l85's collision check, moved into the compiler: with the cubes packed kAPackPitch apart, no two (cube, stage)
-  // row-0 runs may overlap, or one sub-tile's data would land on another's. Runs are 16 halfs wide.
+  // l85's collision check. Defined here, ASSERTED in mma(): a static_assert in the class body calls a member of an
+  // incomplete class, which EDG accepts and hgcc rejects with "no type named 'SharedStorage'".
   CUTLASS_HOST_DEVICE static constexpr bool aPackDisjoint() {
     int const n = kACubes * DispatchPolicy::Stages;
     for (int i = 0; i < n; ++i)
@@ -222,10 +221,6 @@ public:
           }
     return true;
   }
-  static_assert(aPackDisjoint(), "PPU_A_PACK: packed row-0 runs collide -- raise kAPackPitch");
-  static_assert(kACubeW == 64, "PPU_A_PACK: run offsets assume AiuContElemSize == 64 halfs");
-  static_assert(int(cute::size<0>(TileShape{})) == kACubeH, "PPU_A_PACK: CUBE_H must be TileM");
-#endif
   static constexpr int kACpElemsPerThr = 8;                                  // 128-bit, as the scale copy uses
   static constexpr int kACpThreads     = shape<2>(TileShape{}) / kACpElemsPerThr;
   using GmemTiledCopyACp = decltype(
@@ -573,6 +568,14 @@ public:
     auto k_iter_shape = cute::shape<2>(gB);
 
     // Construct shared memory tiles
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+    // l85's collision check, as a body-level assert. It CANNOT sit in the class body: it calls a member of the
+    // same class, which is still incomplete there -- nvcc's EDG front end accepts that and hgcc rejects it with
+    // "no type named 'SharedStorage'", which is how the local gate passed and the box build failed.
+    static_assert(aPackDisjoint(), "PPU_A_PACK: packed row-0 runs collide -- raise kAPackPitch");
+    static_assert(kACubeW == 64, "PPU_A_PACK: run offsets assume AiuContElemSize == 64 halfs");
+    static_assert(int(cute::size<0>(TileShape{})) == kACubeH, "PPU_A_PACK: CUBE_H must be TileM");
+#endif
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.begin()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.begin()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
