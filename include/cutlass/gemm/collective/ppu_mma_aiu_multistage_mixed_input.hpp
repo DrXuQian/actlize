@@ -730,6 +730,35 @@ public:
     // extra inputs partition and retile
     auto partitioned_extra_info = partition_extra_mma_info(tiled_mma, storage, thread_idx);
     auto copy_partitions_extra_info = retile_extra_mma_info(tiled_mma, partitioned_extra_info, thread_idx);
+#if defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
+    // GROUP-AHEAD SCALE PREFETCH. On the FINE path the scale and zero are reloaded from smem at each group's first
+    // mma atom and used one or two instructions later -- 8 times per k-tile at gs=32 with TileK=256. With 14.2 warps
+    // per CU and no spare (this shape is work-bound), every one of those is a Memory Dependency stall that costs
+    // time directly, and Memory Dependency is the top warp state at 0.98.
+    //
+    // Priced by removing the channel entirely (SK_QUANT on the bench): per-group reload = 7.3% of the kernel, which
+    // is this change's ceiling. Dropping the zero as well is another 11.5%, but that is a format question (#20), not
+    // a scheduling one.
+    //
+    // A second register set lets a copy step issue BOTH its groups' loads up front. Built here, not in
+    // partition_extra_mma_info, because that helper is shared with the fold and 2plane collectives; retile_D is only
+    // a call, so a local pair costs nothing but registers. Passed as ONE named tuple parameter -- appending to
+    // transform_B_kblock's cute::tuple<Ts...> does not deduce.
+    // Only the WithZero tuple has a get<3>; on the ScaleOnly path that index is out of range, so the pack is built
+    // inside an if constexpr and the other modes get an empty tuple.
+    auto scale_pf = [&] {
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        auto thr_pf = make_tiled_copy_B(SmemCopyAtomScale{}, tiled_mma).get_thread_slice(thread_idx);
+        auto s_pf = cute::make_fragment_like(cute::get<1>(partitioned_extra_info));
+        auto z_pf = cute::make_fragment_like(cute::get<3>(partitioned_extra_info));
+        return cute::make_tuple(s_pf, z_pf, thr_pf.retile_D(s_pf), thr_pf.retile_D(z_pf));
+      } else {
+        return cute::tuple<>{};
+      }
+    }();
+#else
+    auto scale_pf = cute::tuple<>{};
+#endif
 
     //
     // PIPELINED MAIN LOOP
@@ -761,7 +790,7 @@ public:
     // fragment (ArrayEngine 128 -> 64, with a stride-0 component), i.e. it re-derives the geometry itself.
       copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
       transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, Int<0>{}, K_ATOM_PER_COPY,
-          copy_partitions_extra_info, smem_pipe_read);
+          copy_partitions_extra_info, smem_pipe_read, scale_pf);
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -789,7 +818,7 @@ public:
           partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
         copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
         transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
-          copy_partitions_extra_info, smem_pipe_read);
+          copy_partitions_extra_info, smem_pipe_read, scale_pf);
 
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
@@ -1175,7 +1204,8 @@ private:
             int K_ATOM_PER_COPY,
             class... Ts,
             class CopyViews,
-            class KBlockT>
+            class KBlockT,
+            class PfPack>
   CUTLASS_DEVICE
   void transform_B_kblock(
     TCrB_load const& tCrB_load,
@@ -1189,7 +1219,10 @@ private:
     KBlockT const& k_block,
     cute::Int<K_ATOM_PER_COPY> k_atom,
     CopyViews const& tiled_copy_and_views,
-    int const read_stage) {
+    int const read_stage,
+    // The second scale/zero register set, or an empty tuple. A separate template parameter and NOT an extension of
+    // the Ts... pack above: appending to cute::tuple<Ts...> fails deduction.
+    PfPack const& pf) {
 
     static constexpr int K_BLOCK_STATIC = int(KBlockT{});
     Tensor cvt_in  = recast<RealInternalElementB>(tCrB_load(_, _, k_block));
@@ -1258,6 +1291,36 @@ private:
     // about 1.8 of 34. With for_each the index is Int<i>, the guard folds to if constexpr and disappears, and the
     // division and modulo fold away. Same reason the main loop uses for_each -- see its comment about needing
     // k_block to be Int<x>. Numerics are unchanged; this is constant folding only.
+#if defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
+        // BOTH of this copy step's groups load BEFORE any transform, group gi into register set gi % 2, so the
+        // second group's data has a whole group of atoms to arrive in instead of being used one instruction after
+        // its load. pf carries the second set: fragments 0,1 and their copy views 2,3.
+        constexpr int GRP = K_ATOM_PER_COPY / APG_;
+        static_assert(GRP <= 2, "PPU_SCALE_PREFETCH: only two scale register sets exist");
+        constexpr int g0 = (K_BLOCK_STATIC * K_ATOM_PER_COPY) / APG_;
+        cute::for_each(cute::make_int_sequence<GRP>{}, [&] (auto gi_) {
+          constexpr int GI = decltype(gi_)::value;
+          const int sk = read_stage * int(Scale_TileK) + g0 + GI;
+          if constexpr (GI % 2 == 0) {
+            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+          } else {
+            copy(smem_tiled_copy_S, tCsS(_,_,0,sk), cute::get<2>(pf)(_,_,0));
+            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), cute::get<3>(pf)(_,_,0));
+          }
+        });
+        cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
+          constexpr int I        = decltype(i_)::value;
+          constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
+          constexpr int GI       = I / APG_;
+          if constexpr (GI % 2 != 0) {
+            cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<0>(pf)(_,_,0),
+                            tCrB_mma(_,_,Int<atom_idx>{}), cute::multiplies{});
+            cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(pf)(_,_,0),
+                            tCrB_mma(_,_,Int<atom_idx>{}), cute::plus{});
+            return;
+          }
+#else
         cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
           constexpr int I = decltype(i_)::value;
           constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
@@ -1267,6 +1330,7 @@ private:
             copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
             copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
           }
+#endif
           cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
           cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_, _, 0),
