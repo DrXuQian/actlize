@@ -229,9 +229,17 @@ struct ChunkPlace {
   static constexpr int at_h2(int e) { return int(AtL{}(e)) / 2; }
 };
 
+// Bias: the integer subtracted from every code, folded into the converter's additive constant instead of costing a
+// separate pass. int4's -8 (add_bias_and_interleave_int4s pre-adds 8 offline) has always used this; it is now a
+// PARAMETER so a symmetric format can name its own centre and become ScaleOnly. Default reproduces the old value
+// exactly, so nothing changes unless a caller asks.
+//
+// Q3_K's int2 plane is the case that motivates it: its dequant is dl*(low2 - 4) + 4*dl*high1, so with Bias=4 the
+// int2 plane's zero becomes 0 and the plane needs no zero channel at all. Plan #20 phase 1.
 template <int Bits, int Chunk = -1, int NChunk = 1, bool Rebase = true,
           class FragLayout = cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
-                                          cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>>
+                                          cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>,
+          int Bias = (Bits == 4) ? 8 : 0>
 struct MixGemmChunkEmit {
   static constexpr int kCodesPerVreg = 32 / Bits;
   static constexpr int kOut          = 4 * kCodesPerVreg;      // 128 for int1, 64 for int2
@@ -246,7 +254,7 @@ struct MixGemmChunkEmit {
   // and 2^(10-bpos) + 8 = 2^(10-bpos) * (1 + 2^(bpos-7)), i.e. exponent field 25-bpos with mantissa 2^(bpos+3). The
   // two int4 constants that falls out of -- 0xE408 (-1032) at bpos 0 and 0xD480 (-72) at bpos 4 -- are exactly the
   // FP16_TOP_MAGIC_NUM/NEG_72 pair the shipped int4 converter hardcodes. Gated in fold_derivation/l65.
-  static constexpr int kBias = (Bits == 4) ? 8 : 0;
+  static constexpr int kBias = Bias;
   static_assert(NChunk >= 1 && kOut % NChunk == 0, "MixGemmChunkEmit: NChunk must divide the output count");
   static_assert(Chunk < NChunk, "MixGemmChunkEmit: Chunk out of range");
   static_assert(Chunk < 0 || cute::size(FragLayout{}) == kOut,
@@ -270,8 +278,15 @@ struct MixGemmChunkEmit {
   template <int T> static constexpr int      bpos() { return bpos_of(T); }
   template <int T> static constexpr uint32_t mask() { return dup(uint32_t(((1u << Bits) - 1u) << bpos<T>())); }
   template <int T> static constexpr uint32_t mul()  { return dup(uint32_t((15 - bpos<T>()) << 10)); }
+  // add = -(2^(10-bpos) + kBias), as an fp16 bit pattern: sign, exponent field 25-bpos, mantissa field kBias<<bpos.
+  // The old form wrote the mantissa as 1<<(bpos+3), which is 8<<bpos -- the kBias=8 special case. Exactness needs
+  // the mantissa to fit its 10 bits, i.e. kBias << bpos_max < 1024, which is asserted rather than assumed.
+  //   kBias=8, Bits=4  bpos 0,4     -> 0x6408 / 0x5480          (the shipped int4 constants, unchanged)
+  //   kBias=4, Bits=2  bpos 0,2,4,6 -> 0x6404 / 0x5C10 / 0x5440 / 0x4D00
+  static_assert(kBias == 0 || (uint32_t(kBias) << (8 - Bits)) < 1024u,
+                "Bias is not exactly representable in the fp16 additive constant at the top bpos");
   template <int T> static constexpr uint32_t add()  {
-    return dup(uint32_t(0x8000u | ((25 - bpos<T>()) << 10) | (kBias ? (1u << (bpos<T>() + 3)) : 0u)));
+    return dup(uint32_t(0x8000u | ((25 - bpos<T>()) << 10) | (uint32_t(kBias) << bpos<T>())));
   }
 
   template <int T, int V>
