@@ -202,32 +202,33 @@ public:
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must equal the tile shape.");
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must evenly divide tile k shape.");
 
-  // PPU_A_BCAST: A's M mode gets STRIDE 0, so the tile is TileM x TileK in SHAPE but TileK in FOOTPRINT.
+  // A's SMEM CANNOT BE MADE STRIDE-0 IN M -- TRIED, IT FAULTS. Recorded because the arithmetic is compelling
+  // and someone (me) will otherwise try it again.
   //
-  // At decode every expert has ONE row while TileM >= 16 (every MMA atom is Shape<_16,...>), so 15/16 of this
-  // tile is padding whose results the epilogue's residue mask discards -- what those rows READ does not matter.
-  // SharedStorage sizes smem_a by cosize_v<SmemLayoutA>, so collapsing the M stride shrinks the allocation with
-  // no change there: cosize goes from TileM*TileK*Stages to TileK*Stages, i.e. 16,384 B -> 1,024 B at
-  // (16,32,256) with 2 stages, and the block's total from 26,624 to 11,264 -- 9 blocks/CU to 23, 18 warps/CU to
-  // 46, theoretical occupancy 28% to 72%.
+  // The motivation: at decode every expert has ONE row while TileM >= 16 (every MMA atom is Shape<_16,...>), so
+  // 15/16 of this tile is padding whose results the epilogue's residue mask discards. SharedStorage sizes smem_a
+  // by cosize_v<SmemLayoutA>, so a stride-0 M mode shrinks the allocation with no change there: 16,384 B ->
+  // 1,024 B at (16,32,256) with 2 stages, block total 26,624 -> 11,264, 9 blocks/CU -> 23, 18 warps/CU -> 46,
+  // theoretical occupancy 28% -> 72%.
   //
-  // THIS IS ONLY SOUND TOGETHER WITH A STRIDE-0 GMEM m-STRIDE, which moe_grouped_ppu::launch forces whenever
-  // this macro is on. partition_D(sA) then has all TileM rows of the destination aliasing one another, and the
-  // writes are value-identical because every source row is the same row. Without the gmem half they would race
-  // with DIFFERENT values.
+  // WHY IT FAILS. InternalSmemCopyAtomA is a tsm.ld.swzl atom that computes its own byte addresses assuming the
+  // SWIZZLED COMPACT layout tile_to_shape produces. Given a plain stride-0 layout it addresses past the (now 16x
+  // smaller) allocation: on ppu001 the kernel takes an illegal memory access, faulting at
+  //     tsm.ld.swzl.b32x4.s0.t1.trans0  vreg[64:67], [sreg63] @sreg27
+  // nvcc's front end accepts it -- with PPU_FORCE_INSTANTIATE the whole collective instantiates and every
+  // static_assert passes -- so the front end is not evidence here, only the box is.
   //
-  // Necessarily reduces smem and cannot change the result at Mmax == 1, so it is not a tradeoff to measure --
-  // but it is a BUILD-TIME switch because smem size is a compile-time property, and a runtime flag (the
-  // a_row_broadcast parameter) can only reach the gmem stride. Same shape as PPU_B_CHUNK.
-#if defined(PPU_A_BCAST) && (PPU_A_BCAST != 0)
-  using SmemLayoutA = decltype(make_layout(
-      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
-      make_stride(_0{}, _1{}, shape<2>(TileShape{}))));
-#else
+  // What would be needed is to separate the two roles this layout plays: a real 1 x TileK swizzled tile for the
+  // ALLOCATION and the gmem->smem copy, plus a stride-0 VIEW of it for the mma's read. The collective uses one
+  // SmemLayoutA for both, so that is a change to the copy atom's contract, not to a layout.
+  //
+  // WHETHER IT IS WORTH DOING is now answerable, and the answer is probably not: the TileN ladder raised
+  // warps/block 2 -> 8 at fixed total work and bought 1.066x within a single run (22.68 -> 21.28 us), so
+  // occupancy is a weak lever for this kernel. 2.6x of theoretical occupancy would not be expected to behave
+  // differently from 1.78x of it.
   using SmemLayoutA = decltype(tile_to_shape(
       InternalSmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
-#endif
   using SmemLayoutB = decltype(tile_to_shape(
       InternalSmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
