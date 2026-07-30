@@ -135,7 +135,16 @@ template <
   // InternalSmemCopyAtomA gives PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>, whose (Block_MN,
   // AiuContElemSize, InstNum) match here and not DefaultGemm_AIU_Operand's, which is why an override placed there
   // was inert.
-  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Block_MN{}, AiuContElemSize{}, Swap, false, InstNum>;
+  // PPU_A_PACK: pack the cube BASES together. Row 0 owns only 32 of a cube's 512 words, in 4 runs of 8
+  // (fold_derivation/l84, l86), and when only row 0 carries data the bytes between the runs are read as garbage into
+  // accumulator rows the epilogue masks. l85 verifies an 8-word (16-half) pitch is collision-free. Geometry, and so
+  // the swizzle and the write/read pairing, are untouched -- only the distance between bases changes.
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+  static constexpr int kCubePitchA = 16;   // halfs; 8 words, the run width, so packing tiles exactly
+#else
+  static constexpr int kCubePitchA = 0;    // 0 = natural CUBE_H * CUBE_W
+#endif
+  using SmemCopyOp = PPU0010_TSM_LD_SWZL<Element, Block_MN{}, AiuContElemSize{}, Swap, false, InstNum, kCubePitchA>;
   using SmemCopyAtom = Copy_Atom<SmemCopyOp, Element>;
   using SmemLayoutAtom = Layout<Shape<_8, AiuContElemSize>, Stride<AiuContElemSize, _1>>;
 };

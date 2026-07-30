@@ -103,8 +103,8 @@ struct Copy_Traits<PPU0010_AIU_LOAD<NumBitsPerAIU, Element, Trans, Swzl>>
 
 };
 
-template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans, int InstNum>
-struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, InstNum>>
+template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans, int InstNum, int CubePitch>
+struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch>>
 {
   // Logical thread id to thread idx (warp)
   using ThrID = Layout<_32>;
@@ -162,7 +162,7 @@ struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, Ins
   copy_unpack_(void *dst_ptr, void* src_ptr,
                Coord const& src_coord, seq<Is...>) const
   {
-    PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, InstNum>::copy(dst_ptr, src_ptr, get<Is>(src_coord)...);
+    PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch>::copy(dst_ptr, src_ptr, get<Is>(src_coord)...);
   }
 
   template <class TS, class SLayout,

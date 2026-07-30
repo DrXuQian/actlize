@@ -491,11 +491,14 @@ asm volatile(
 };
 
 
-template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans, int InstNum = 1>
+// CubePitch: elements between consecutive CUBE BASES, 0 = the natural CUBE_H * CUBE_W. A template parameter and
+// not a macro, because B reads through this same atom (<signed char,128,128,...>) and must keep its natural pitch.
+template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans, int InstNum = 1, int CubePitch = 0>
 struct PPU0010_TSM_LD_SWZL;
 
-template <typename Element, int CUBE_H, int CUBE_W, bool Swap, int InstNum>
-struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, false, InstNum> {
+template <typename Element, int CUBE_H, int CUBE_W, bool Swap, int InstNum, int CubePitch>
+struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, false, InstNum, CubePitch> {
+  static constexpr int kCubePitch = CubePitch > 0 ? CubePitch : CUBE_H * CUBE_W;
 
   CUTE_HOST_DEVICE static void
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h, int cube_in_stage = 0, int stage = 0)
@@ -503,7 +506,7 @@ struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, false, InstNum> {
 
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
   Element *stage_base = reinterpret_cast<Element*>(smem_base);
-  stage_base += CUBE_H * CUBE_W * (cube_in_stage + stage * InstNum);
+  stage_base += kCubePitch * (cube_in_stage + stage * InstNum);
   int *vreg = reinterpret_cast<int *>(frag_ptr);
   int channel_bytes_offset = coord_w * sizeof(Element);
   PPU0010_TSM_LD_SWZL_IMPL<Element, false>()(vreg, stage_base, coord_h, CUBE_H, channel_bytes_offset);
@@ -514,8 +517,19 @@ struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, false, InstNum> {
   }
 };
 
-template <typename Element, int CUBE_H, int CUBE_W, bool Swap, int InstNum>
-struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, true, InstNum> {
+template <typename Element, int CUBE_H, int CUBE_W, bool Swap, int InstNum, int CubePitch>
+struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, true, InstNum, CubePitch> {
+
+  // CUBE BASE PITCH. Consecutive cubes normally sit CUBE_H * CUBE_W elements apart, one full cube span. When only
+  // ROW 0 of each cube carries data -- decode, where TileM >= 16 is forced by the mma while an expert owns one row
+  // -- row 0 occupies just 32 of the cube's 512 words, in 4 runs of 8 (fold_derivation/l84, l86), so the cubes can
+  // be packed much closer and the bytes in between are read as garbage into accumulator rows the epilogue masks.
+  // l85 checks the packing is collision-free down to an 8-word pitch.
+  //
+  // This changes only the DISTANCE between cube bases. The cube's geometry, and therefore the swizzle and the
+  // write/read pairing, are untouched -- unlike an earlier attempt that shrank CUBE_H itself and corrupted
+  // everything because the read's 16-row lane/vreg structure does not follow that parameter.
+  static constexpr int kCubePitch = CubePitch > 0 ? CubePitch : CUBE_H * CUBE_W;
 
   CUTE_HOST_DEVICE static void
   // similar to aiu_load with trans, first coord is coord on K, which is coord_h when trans
@@ -528,7 +542,7 @@ struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, true, InstNum> {
 
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
   Element *stage_base = reinterpret_cast<Element*>(smem_base);
-  stage_base += CUBE_H * CUBE_W * (cube_in_stage + stage * InstNum);
+  stage_base += kCubePitch * (cube_in_stage + stage * InstNum);
   int *vreg = reinterpret_cast<int *>(frag_ptr);
   int channel_bytes_offset = coord_w * sizeof(Element);
   PPU0010_TSM_LD_SWZL_IMPL<Element, true>()(vreg, stage_base, coord_h, CUBE_H, channel_bytes_offset);

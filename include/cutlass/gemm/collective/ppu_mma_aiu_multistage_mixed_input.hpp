@@ -188,6 +188,44 @@ public:
   // A plain cp.async has none of that: cute computes the address from the layout, so a stride-0 M mode genuinely
   // aliases and one row is enough. Atom and the thread_idx % n slicing are copied from GmemTiledCopyScale, which
   // already moves a small operand this way in this same collective and rides the same cp_async_fence.
+  // PPU_A_PACK geometry, all read off fold_derivation/l84-l86 rather than derived here:
+  //   row 0 of a 16x64 fp16 cube occupies 4 runs of 16 halfs at half-offsets {0, 288, 528, 816}
+  //   consecutive cube bases can sit 16 halfs apart with no collision (l85), the runs being 16 wide and aligned
+  //   the last cube is still READ to its full 1024-half span, so that is the tail of the allocation
+  static constexpr int kACubeH      = shape<0>(TileShape{});                  // CUBE_H = Block_MN = TileM for A
+  static constexpr int kACubeW      = 64;                                    // AiuContElemSize for fp16
+  static constexpr int kASlices     = kACubeW / 16;                          // 8 words per slice
+  static constexpr int kAPackPitch  = 16;                                    // halfs; the run width, so packing tiles
+  static constexpr int kACubes      = shape<2>(TileShape{}) / kACubeW;       // cubes per stage = InstNum
+  static constexpr int kAPackSpan   = kAPackPitch * (kACubes * DispatchPolicy::Stages - 1) + kACubeH * kACubeW;
+  static constexpr int kAWrThreads  = kACubes * kASlices * 2;                // cube x run x (16 halfs / 8 per thread)
+  // Row 0's run offsets, derived from ppu_tsm_ld_swzl_sim rather than tabulated: row 0 means lane/4 == 0 and
+  // v/2 == 0, which leaves vreg_line_idx = 0 and vreg_vec_idx = v%2, so the run starts at the slice base plus
+  // swz2(v=0)*4 words and covers 8 words. A constexpr function, not a static array -- a static constexpr array
+  // member has no device definition.
+  CUTLASS_HOST_DEVICE static constexpr int aPackRunOff(int s) {
+    int const ssv = (((s & 1) << 1) + ((s & 2) >> 1)) * 2;                    // 0, 4, 2, 6
+    return 2 * (kACubeH * 8 * s + ssv * 4);                                  // halfs
+  }
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+  // l85's collision check, moved into the compiler: with the cubes packed kAPackPitch apart, no two (cube, stage)
+  // row-0 runs may overlap, or one sub-tile's data would land on another's. Runs are 16 halfs wide.
+  CUTLASS_HOST_DEVICE static constexpr bool aPackDisjoint() {
+    int const n = kACubes * DispatchPolicy::Stages;
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j)
+        for (int a = 0; a < kASlices; ++a)
+          for (int b = 0; b < kASlices; ++b) {
+            int const x = kAPackPitch * i + aPackRunOff(a);
+            int const y = kAPackPitch * j + aPackRunOff(b);
+            if (x < y + 16 && y < x + 16) return false;
+          }
+    return true;
+  }
+  static_assert(aPackDisjoint(), "PPU_A_PACK: packed row-0 runs collide -- raise kAPackPitch");
+  static_assert(kACubeW == 64, "PPU_A_PACK: run offsets assume AiuContElemSize == 64 halfs");
+  static_assert(int(cute::size<0>(TileShape{})) == kACubeH, "PPU_A_PACK: CUBE_H must be TileM");
+#endif
   static constexpr int kACpElemsPerThr = 8;                                  // 128-bit, as the scale copy uses
   static constexpr int kACpThreads     = shape<2>(TileShape{}) / kACpElemsPerThr;
   using GmemTiledCopyACp = decltype(
@@ -346,7 +384,12 @@ public:
   {
     static constexpr int scale_elements = elements_per_smem_scale();
     static constexpr int zero_elements = elements_per_smem_zero();
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+    // Packed: the cubes overlap, so the allocation is the packed span, not cosize of the logical tile.
+    cute::ArrayEngine<RealInternalElementA, kAPackSpan> smem_a;
+#else
     cute::ArrayEngine<RealInternalElementA, cute::cosize_v<SmemLayoutA>> smem_a;
+#endif
     // If this member is ever resized or removed, note that smem_b follows it directly and array_aligned defaults
     // to 16-B alignment: at the full size (cosize*2 B, a multiple of 32) smem_b happens to land 32-B aligned,
     // which PPU0010's AIU load requires (align_bytes = 32 in gemm_operands.hpp). Shrinking smem_a to one element
@@ -568,7 +611,10 @@ public:
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
-#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+      copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe), warp_idx);
+      copy_A_packed_row0(gA, storage.smem_a.begin(), *k_tile_iter, k_pipe, thread_idx);
+#elif defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
       copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe), warp_idx);
       if (thread_idx < kACpThreads) copy(GmemTiledCopyACp{}, tAgA(_,_,*k_tile_iter), tAsA(_,_,k_pipe));
 #else
@@ -726,7 +772,10 @@ public:
         if (k_block == 0)
         {
           auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
-#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+          copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write), warp_idx);
+          copy_A_packed_row0(gA, storage.smem_a.begin(), *k_tile_iter, smem_pipe_write, thread_idx);
+#elif defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
           copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write), warp_idx);
           if (thread_idx < kACpThreads)
             copy(GmemTiledCopyACp{}, tAgA(_,_,*k_tile_iter), tAsA(_,_,smem_pipe_write));
@@ -1068,6 +1117,29 @@ private:
      }  // if (k_block % GroupK == 0)
     }   // if constexpr (Scale_TileK <= K_BLOCK_MAX)  [COARSE]
   }
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+  /// A's row 0 into the PACKED cube layout. Four contiguous 16-half runs per cube at the offsets l86 exported, and
+  /// inside a run the logical k advances with the physical word, so each run is a plain copy with no shuffle.
+  /// cp.async and not the AIU: the AIU write is .padz and would write each cube's 15 zero rows over its packed
+  /// neighbour's row 0. One 128-bit transfer per thread, kAWrThreads threads, so one instruction on one warp.
+  template <class GA, class EA>
+  CUTLASS_DEVICE
+  void copy_A_packed_row0(GA const& gA, EA* smem_a, int k_tile, int pipe, int thread_idx) {
+    if (thread_idx >= kAWrThreads) return;
+    int const per = kASlices * 2;
+    int const c   = thread_idx / per;            // which cube in this stage
+    int const run = (thread_idx % per) / 2;      // which of row 0's runs
+    int const h   = thread_idx % 2;              // which 8-half half of the run
+    // The raw op, not a Copy_Atom: the atom's SrcLayout only matches when it is reached through a TiledCopy, and
+    // the thread -> (cube, run, half) map here is not a tiler. One 128-bit ppu.cp.async.cg per thread.
+    auto const& gsrc = *reinterpret_cast<cute::uint128_t const*>(
+        &gA(Int<0>{}, c * kACubeW + run * 16 + h * 8, k_tile));
+    auto&       sdst = *reinterpret_cast<cute::uint128_t*>(
+        smem_a + kAPackPitch * (c + kACubes * pipe) + aPackRunOff(run) + h * 8);
+    PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>::copy(gsrc, sdst);
+  }
+#endif
+
   /// Utilities to transform B.
   // FINE-grained scale (gs < B-copy-step K, i.e. Scale_TileK > K_BLOCK_MAX): a single copy step's K_ATOM_PER_COPY
   // mma atoms straddle MORE than one scale group, so one pre-loaded scale reg can't cover the step (and the coarse
