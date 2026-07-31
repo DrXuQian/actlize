@@ -1302,10 +1302,39 @@ private:
       //
       // To get the wide store back, the COPY must be paired too (thread layout Scale_TileN/2 over a 32 B value layout)
       // so the two maps coincide again; the alternative, a __syncthreads before the decode, costs more than the store
-      // saves (8 barriers per CTA against 0.6%). Not attempted here because the packed g2s is issued by all
-      // size(TiledMma) threads through get_slice against a Scale_TileN-sized thread layout, and that mismatch needs to
-      // be understood before another assumption is layered on it.
-      for (int n = thread_idx; n < kTN; n += kThreads) {
+      // saves (8 barriers per CTA against 0.6%).
+      //
+      // SPLIT THE GROUPS, NOT THE COLUMNS -- PPU_PACKED_SPLIT_GROUPS. Half the CTA is idle here: only threads
+      // [0, Scale_TileN) enter the loop, so four warps decode while four wait at the __syncthreads below, and the
+      // slowest decoding warp sets the publication latency for all eight.
+      //
+      // The fix falls out of a fact that was sitting in the call path unnoticed. mma() wraps the index before
+      // partitioning -- `thread_idx % (Scale_GmemCopyThrLayoutH * Scale_GmemCopyThrLayoutW)` at the
+      // partition_extra_inputs call -- so threads n and n + Scale_TileN are DUPLICATE OWNERS of the same column:
+      // both issue its cp.async, to the same destination, and each waits on a copy it issued itself. The ownership
+      // invariant above therefore permits BOTH of them to read that unit, which the paired-column attempt did not.
+      //
+      // So thread t decodes column `t % Scale_TileN`, taking the low half of the groups if t < Scale_TileN and the
+      // high half otherwise. Eight warps decode four groups each instead of four warps decoding eight. Identical
+      // decode count, identical stores, identical bank conflicts, identical ownership; the only new cost is that the
+      // 16 B unit is read twice per column instead of once.
+      //
+      // It is also the cleanest available test of placement-versus-volume: if halving the critical path helps, the
+      // barrier placement is what costs; if it does not, aggregate issue demand is, and no amount of rebalancing will
+      // reach it. Off by default so the configuration everything has been measured against does not move silently.
+      constexpr int kWrapTh = int(Scale_GmemCopyThrLayoutH{} * Scale_GmemCopyThrLayoutW{});
+      constexpr int kOwnTh  = int(cute::size(GmemTiledCopyScalePacked{}));
+      // Every premise checked, because a split that is wrong about ownership is a race, not a slowdown: the CTA must
+      // be exactly two owner-sets wide, both wrap moduli must agree with the tile width, and the groups must halve.
+      constexpr bool kSplitGroups =
+#if defined(PPU_PACKED_SPLIT_GROUPS) && (PPU_PACKED_SPLIT_GROUPS != 0)
+          (kThreads == 2 * kTN) && (kWrapTh == kTN) && (kOwnTh == kTN) && (kGrp % 2 == 0);
+#else
+          false;
+#endif
+      constexpr int kHalfG = kGrp / 2;
+
+      for (int n = kSplitGroups ? (thread_idx % kTN) : thread_idx; n < kTN; n += kSplitGroups ? kTN : kThreads) {
         if (n >= residue_n) continue;                        // the same N bound the fp16 path predicates on
         uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n, cute::Int<0>{}, stage));
         uint32_t u[kPackedUnitWords];
@@ -1316,7 +1345,9 @@ private:
         uint32_t const m2 = cutlass::gguf_packed::mul2_of_words(u);
         auto const h = cutlass::gguf_packed::head_of_words(u);
         (void)m2; (void)h;
-        cute::for_each(cute::make_int_sequence<kGrp>{}, [&] (auto g_) {
+        // ONE body, called from both halves with a compile-time G. The group index has to be a template argument --
+        // every bit position in the unit is derived from it -- so the two halves cannot share a runtime offset.
+        auto decode_group = [&] (auto g_) {
           constexpr int G = decltype(g_)::value;
           // TIMING-ONLY ABLATION. PPU_PACKED_SCALE_NOP=1 keeps the native transport and the shared STORES but drops
           // the decode ARITHMETIC, so three builds decompose the +12.9% instead of attributing all of it at once:
@@ -1353,7 +1384,18 @@ private:
           // "TSM out of range" once already.
           sS(n, cute::Int<G>{}, stage) = sz.scale;
           if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, stage) = sz.zero;
-        });
+        };
+        if constexpr (kSplitGroups) {
+          if (thread_idx < kTN)
+            cute::for_each(cute::make_int_sequence<kHalfG>{},
+                           [&] (auto i_) { decode_group(cute::Int<decltype(i_)::value>{}); });
+          else
+            cute::for_each(cute::make_int_sequence<kHalfG>{},
+                           [&] (auto i_) { decode_group(cute::Int<kHalfG + decltype(i_)::value>{}); });
+        } else {
+          cute::for_each(cute::make_int_sequence<kGrp>{},
+                         [&] (auto i_) { decode_group(cute::Int<decltype(i_)::value>{}); });
+        }
       }
     }
   }
