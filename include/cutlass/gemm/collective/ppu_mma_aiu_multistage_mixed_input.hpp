@@ -1534,6 +1534,28 @@ private:
   }
 #endif
 
+  // PPU_B_DEQUANT_NOP -- TIMING ONLY, RESULTS ARE DELIBERATELY WRONG. It answers the one question the packed-scale
+  // NOP cannot: how much of the 20.11 us baseline is the int4->fp16 dequant pipeline itself? That chain is 1,898,496
+  // instructions against 131,072 mma, i.e. 43% of dynamic instruction count -- but an instruction share is not a
+  // cycle share, and those instructions can issue while memory operations are outstanding. Only removing them says.
+  //
+  // WHAT IT KEEPS, because an ablation that changes memory traffic answers a different question: the B s2r loads
+  // (cvt_in stays live), the scale/zero smem reads (one element of each fragment is still consumed, so the copies
+  // cannot be dead-code eliminated), the mma count, the tile shapes and every barrier. What it drops: the conversion
+  // for all but one word, and N-1 of the N elementwise scale/zero applications per atom.
+  //
+  // The one-element form is deliberate. Skipping the transforms entirely would let the compiler delete the scale
+  // copies with them, and the run would then measure a kernel that also stopped reading shared memory -- the same
+  // trap PPU_PACKED_SCALE_NOP avoids by keeping its unit load consumed.
+  template <class TA, class TB, class TC, class Op>
+  CUTLASS_DEVICE static void bdq_transform(TA&& a, TB&& b, TC&& c, Op op) {
+#if defined(PPU_B_DEQUANT_NOP) && (PPU_B_DEQUANT_NOP != 0)
+    c(0) = op(a(0), b(0));
+#else
+    cute::transform(a, b, c, op);
+#endif
+  }
+
   /// Utilities to transform B.
   // FINE-grained scale (gs < B-copy-step K, i.e. Scale_TileK > K_BLOCK_MAX): a single copy step's K_ATOM_PER_COPY
   // mma atoms straddle MORE than one scale group, so one pre-loaded scale reg can't cover the step (and the coarse
@@ -1571,7 +1593,13 @@ private:
     Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
 
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
+#if defined(PPU_B_DEQUANT_NOP) && (PPU_B_DEQUANT_NOP != 0)
+    // one 32-bit word, so the B s2r load that feeds cvt_in cannot be eliminated; the rest of cvt_out keeps the
+    // previous k-tile's already-converted halfs, which are finite, so the mma sees no NaN storm
+    recast<uint32_t>(cvt_out)(0) = recast<uint32_t>(cvt_in)(0);
+#else
     convert_tensor(cvt_in, cvt_out, CPY_VEC{});
+#endif
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
     constexpr int KBM_    = MMA_KA_ / K_ATOM_PER_COPY;                  // K_BLOCK_MAX (copy steps)
@@ -1586,7 +1614,7 @@ private:
       if constexpr (!FINE) {
         cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
           constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + decltype(i_)::value;
-          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrS(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+          bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrS(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
         });
       } else {
         // FINE: write via tCrS_copy_view (a retile VIEW of the ORIGINAL fragment) then read the ORIGINAL back --
@@ -1606,7 +1634,7 @@ private:
           constexpr int g = atom_idx / APG_;                            // this atom's scale group within the tile
           if constexpr (atom_idx % APG_ == 0)                             // reload only at a group's first atom
             copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
-          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
+          bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
         });
       }
@@ -1617,8 +1645,8 @@ private:
       if constexpr (!FINE) {
         cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
           constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + decltype(i_)::value;
-          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrS(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
-          cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrZ(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
+          bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrS(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
+          bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), tCrZ(_, _, 0), tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
         });
       } else {
         // FINE: see ConvertAndScale note -- write via the copy VIEWs, read the ORIGINAL fragments back.
@@ -1667,14 +1695,14 @@ private:
             constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
             constexpr int GI       = I / APG_;
             if constexpr (GI % 2 == 0) {
-              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_,_,0),
+              bdq_transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_,_,0),
                               tCrB_mma(_,_,Int<atom_idx>{}), cute::multiplies{});
-              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_,_,0),
+              bdq_transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_,_,0),
                               tCrB_mma(_,_,Int<atom_idx>{}), cute::plus{});
             } else {
-              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<0>(pf)(_,_,0),
+              bdq_transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<0>(pf)(_,_,0),
                               tCrB_mma(_,_,Int<atom_idx>{}), cute::multiplies{});
-              cute::transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(pf)(_,_,0),
+              bdq_transform(tCrB_mma(_,_,Int<atom_idx>{}), cute::get<1>(pf)(_,_,0),
                               tCrB_mma(_,_,Int<atom_idx>{}), cute::plus{});
             }
           });
@@ -1688,9 +1716,9 @@ private:
               copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
               copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
             }
-            cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
+            bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                             tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
-            cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_, _, 0),
+            bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<3>(partitioned_extra_info)(_, _, 0),
                             tCrB_mma(_, _, Int<atom_idx>{}), cute::plus{});
           });
         }
