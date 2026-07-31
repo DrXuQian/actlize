@@ -106,6 +106,29 @@ CUTLASS_HOST_DEVICE GroupScale group_of(uint8_t const* unit, int g) {
   return out;
 }
 
+// d AND dmin, EXTRACTED ONCE PER K-TILE. They are the unit's first four bytes and constant for every group in the
+// superblock, so re-deriving them inside a per-group decode is pure waste: acu put it at roughly 0.5M extra instructions
+// on the decode band (8 groups x 2 slots repeating the same two bitcasts).
+struct UnitHead {
+  half_t d;
+  half_t dmin;
+};
+template <int NWords>
+CUTLASS_HOST_DEVICE UnitHead head_of_words(uint32_t const (&u)[NWords]) {
+  return UnitHead{half_t::bitcast(uint16_t(u[0] & 0xFFFFu)), half_t::bitcast(uint16_t(u[0] >> 16))};
+}
+
+// The per-group part only: the two codes and the two products, with d/dmin handed in.
+template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, int NWords>
+CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords], UnitHead const h) {
+  GroupScale out;
+  out.scale = h.d * int_to_half_small(code_from_words<bit_of(G, 0)>(u) - ScaleBias);
+  if constexpr (HasMin) out.zero = -(h.dmin * int_to_half_small(code_from_words<bit_of(G, 1)>(u)));
+  else                  out.zero = half_t(0.f);
+  if constexpr (ZMul != 0) out.zero = out.zero + half_t(float(ZMul)) * out.scale;
+  return out;
+}
+
 // The same dequant as group_of, from REGISTERS. G is a template parameter because that is what makes every bit position
 // a constant; d and dmin are the unit's first four bytes, i.e. the low and high halves of word 0 (little endian).
 template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, int NWords>
