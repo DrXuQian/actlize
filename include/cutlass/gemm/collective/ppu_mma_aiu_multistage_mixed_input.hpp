@@ -1211,12 +1211,6 @@ private:
   static constexpr int  kPackedZMul      = 8;
   static constexpr int kPackedUnitWords = kPackedScaleUnit / 4;
 
-  // COLUMNS PER THREAD IN THE DECODE. 2, so the store is one 4 B word instead of two 2 B halfs -- see
-  // packed_decode_stage for the measured reason (32 lanes x 2 B is 16 of 32 banks; x 4 B is all 32). Not a tuning
-  // axis: the 16 B unit is per COLUMN, so a third column would cost another unit load, which is what the wider store
-  // saves. l96 (B) checks that two adjacent columns are adjacent halfs in SmemLayoutScale, which is what makes the
-  // single store legal.
-  static constexpr int kPackedPairN = 2;
   // THE PACKED (f16x2) PER-GROUP DECODE, which needs both fields to pack against each other and the 6-bit unsigned
   // extraction code_pair_from_words performs. Q4_K is the only format with a min, so this is exactly Q4_K today; the
   // scalar group_of_words stays for everything else and is what the `else` arm below still calls. The bias/mask/OR
@@ -1266,61 +1260,53 @@ private:
       Tensor sRaw = make_tensor(make_smem_ptr(storage.smem_scale_raw.begin()), SmemLayoutScaleRawStaged{});
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()),     SmemLayoutScale{});
       Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()),      SmemLayoutScale{});
-      // TWO COLUMNS PER THREAD, so the store is 4 bytes instead of 2. Both halves of that sentence were measured:
-      // acu put the one-column form at +71,680 tsm.st with +73,728 bank conflicts and 1.83 transactions per
-      // instruction, because 32 lanes x 2 B covers 64 B, which is 16 of 32 banks. At 4 B a warp covers 128 B and all
-      // 32. l96 (B) checked the thing that makes it legal at all -- (n+1,g,s) == (n,g,s)+1 in SmemLayoutScale, so two
-      // adjacent columns really are adjacent halfs -- rather than assuming it from the layout's printed strides.
+      // ONE THREAD PER COLUMN, AND THAT IS A CORRECTNESS CONSTRAINT, NOT A CHOICE. cp_async_wait is PER THREAD and the
+      // __syncthreads that publishes this stage comes AFTER this function, so between the wait and the sync a thread
+      // may only read bytes IT ITSELF copied. GmemTiledCopyScalePacked's thread layout is
+      // Layout<Shape<Int<Scale_TileN>,_1>> with a 16 B value layout -- thread t copies column t -- so thread t reading
+      // column t is exactly the guarantee the wait gives, and reading any other column is a race.
       //
-      // kPackedPairN is a constant, not a tuning knob: it is 2 because that is the widest store two columns can make,
-      // and going wider costs one 16 B unit LOAD per extra column (the unit is per-column) which eats the saving.
-      constexpr int kPairs = kTN / kPackedPairN;
-      static_assert(kTN % kPackedPairN == 0, "Scale_TileN must be even for the paired store");
-      for (int p = thread_idx; p < kPairs; p += kThreads) {
-        int const n0 = p * kPackedPairN;
-        if (n0 >= residue_n) continue;                        // the same N bound the fp16 path predicates on
-        // The pair's two units. A column past residue_n decodes garbage into a column whose output is discarded --
-        // exactly what the fp16 path's predicated copy leaves there, and never out of the tile since kTN is even.
-        uint32_t u[kPackedPairN][kPackedUnitWords];
-        uint32_t m2[kPackedPairN];
+      // MEASURED, NOT ARGUED: a version of this loop paired two adjacent columns per thread to turn the 2 B store into
+      // a 4 B one (worth ~0.6%: acu put the scalar form at +71,680 tsm.st with +73,728 bank conflicts and 1.83
+      // transactions per instruction, since 32 lanes x 2 B covers 16 of 32 banks). It read column 2p+1, which thread
+      // 2p+1 copied, and test_q4k_packed_gemm's rowC -- the ONLY row where kPackedScaleOn is true -- went to
+      // bad=128/4096 with the failures concentrated in odd columns. rowA and rowB kept passing because at TK=128 they
+      // are on the fp16 path, which is exactly why the gate has a row per Scale_TileK.
+      //
+      // To get the wide store back, the COPY must be paired too (thread layout Scale_TileN/2 over a 32 B value layout)
+      // so the two maps coincide again; the alternative, a __syncthreads before the decode, costs more than the store
+      // saves (8 barriers per CTA against 0.6%). Not attempted here because the packed g2s is issued by all
+      // size(TiledMma) threads through get_slice against a Scale_TileN-sized thread layout, and that mismatch needs to
+      // be understood before another assumption is layered on it.
+      for (int n = thread_idx; n < kTN; n += kThreads) {
+        if (n >= residue_n) continue;                        // the same N bound the fp16 path predicates on
+        uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n, cute::Int<0>{}, stage));
+        uint32_t u[kPackedUnitWords];
         CUTLASS_PRAGMA_UNROLL
-        for (int c = 0; c < kPackedPairN; ++c) {
-          uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n0 + c, cute::Int<0>{}, stage));
-          CUTLASS_PRAGMA_UNROLL
-          for (int w = 0; w < kPackedUnitWords; ++w) u[c][w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
-          m2[c] = cutlass::gguf_packed::mul2_of_words(u[c]);
-        }
+        for (int w = 0; w < kPackedUnitWords; ++w) u[w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
+        // half2(d, -dmin) for the whole column: one xor, hoisted out of the group loop. Replaces head_of_words'
+        // two bitcasts AND the per-group negate of the min term.
+        uint32_t const m2 = cutlass::gguf_packed::mul2_of_words(u);
+        auto const h = cutlass::gguf_packed::head_of_words(u);
+        (void)m2; (void)h;
         cute::for_each(cute::make_int_sequence<kGrp>{}, [&] (auto g_) {
           constexpr int G = decltype(g_)::value;
-          // The 4 B store reinterprets two ElementScale as one uint32, so the element really must be 16 bits. Stated
-          // as an assert rather than left to the reinterpret_cast, which would silently write the wrong width.
-          static_assert(sizeof(NonVoidElementScale) == 2, "the paired store assumes a 16-bit scale element");
-          cutlass::half_t s[kPackedPairN], z[kPackedPairN];
-          CUTLASS_PRAGMA_UNROLL
-          for (int c = 0; c < kPackedPairN; ++c) {
-            if constexpr (kPackedPairFast) {
-              // Both fields of the group in one 32-bit lane pair: one integer add for the bias/mask/magic-OR of BOTH,
-              // one ppu.sub.f16x2, one ppu.fma.rtte.f16x2. Bit-identical to the scalar form -- l96 (A) checks that
-              // over 32768 real Q4_K groups, and (A0) checks each of the four identities it rests on separately.
-              auto const sz = cutlass::gguf_packed::group_pair_of_words<G, kPackedZMul>(u[c], m2[c]);
-              s[c] = sz.scale; z[c] = sz.zero;
-            } else {
-              auto const h  = cutlass::gguf_packed::head_of_words(u[c]);
-              auto const sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(u[c], h);
-              s[c] = sz.scale; z[c] = sz.zero;
-            }
+          cutlass::gguf_packed::GroupScale sz;
+          if constexpr (kPackedPairFast) {
+            // BOTH FIELDS OF THE GROUP IN ONE 32-BIT LANE PAIR: one integer add carries the bias, the mask and the
+            // magic OR for scale AND min together, then one ppu.sub.f16x2 and one ppu.fma.rtte.f16x2. 15 opcodes per
+            // group down to ~11, and bit-identical rather than close -- l96 (A) checks that over 32768 real Q4_K
+            // groups and (A0) checks each of the four identities it rests on separately. This touches only the
+            // thread's OWN column, so it is independent of the constraint above.
+            sz = cutlass::gguf_packed::group_pair_of_words<G, kPackedZMul>(u, m2);
+          } else {
+            sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(u, h);
           }
           // (n, group, stage): SmemLayoutScale's own modes. NOT the read side's flattened (n, 1, stage*SK+g) -- two
           // functions build a tensor called sS with DIFFERENT layouts, and using the wrong one faulted as
           // "TSM out of range" once already.
-          //
-          // ONE STORE PER PAIR, through a uint32 view. Writing sS(n0,..) and sS(n0+1,..) separately and hoping the
-          // compiler merges them is the version that is not worth writing: the merge is exactly what is being bought.
-          *reinterpret_cast<uint32_t*>(&sS(n0, cute::Int<G>{}, stage)) =
-              cutlass::gguf_packed::pack_h2(s[0], s[1]);
-          if constexpr (kPackedHasMin)
-            *reinterpret_cast<uint32_t*>(&sZ(n0, cute::Int<G>{}, stage)) =
-                cutlass::gguf_packed::pack_h2(z[0], z[1]);
+          sS(n, cute::Int<G>{}, stage) = sz.scale;
+          if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, stage) = sz.zero;
         });
       }
     }
