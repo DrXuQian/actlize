@@ -1041,10 +1041,16 @@ private:
         }
         if (scale_valid && (scale_load_k * Scale_TileK < scale_residue_k)) {
           if constexpr (kPackedScaleOn)
-            // scale_load_k counts GROUPS in the fp16 layout; one k-tile is one superblock here, hence the divide.
+            // scale_load_k IS ALREADY A TILE INDEX, not a group index: partition_S leaves the last mode selecting which
+            // block of Scale_TileK groups a call loads, so tSgS(_,_,_,i) is tile i. One k-tile is one superblock, so it
+            // indexes superblocks directly and must NOT be divided. Dividing by Scale_TileK mapped all 19 superblocks
+            // onto 0..2 -- most outputs wrong with a few coincidentally right, which is what rowC showed. The k bound a
+            // few lines up already assumed this reading (scale_residue_k = nsb * Scale_TileK makes the existing
+            // `scale_load_k * Scale_TileK < scale_residue_k` mean `scale_load_k < nsb`), so the bound was right while the
+            // index was wrong -- the two disagreed and only one of them was checked.
             packed_decode_to_smem<kPackedScaleOn>(get<kPkG>(extra_input_partitions), get<kPkG+1>(extra_input_partitions),
                                                   get<kPkG+2>(extra_input_partitions),
-                                                  scale_load_k / int(Scale_TileK), write_stage,
+                                                  scale_load_k, write_stage,
                                                   get<kPkG+3>(extra_input_partitions), scale_residue_n);
           else
             copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
