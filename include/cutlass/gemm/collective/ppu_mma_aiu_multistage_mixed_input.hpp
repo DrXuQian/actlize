@@ -164,6 +164,34 @@ public:
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
                     Layout<Shape < _8,_1>>{}));
 
+  // ---------------------------------------------------------------------------------------------------------------
+  // THE NATIVE (PACKED) SCALE CHANNEL -- plan #20 option E. TYPES ONLY in this commit; nothing below consumes them yet,
+  // and PPU_PACKED_SCALE off leaves every existing type byte-identical.
+  //
+  // The channel carries the gguf's own scale bytes instead of two pre-multiplied fp16 planes: for Q4_K one 16 B unit per
+  // (superblock, column) holding d, dmin and the 8+8 six-bit codes, reordered offline into two self-contained 6-byte
+  // halves so a k-tile covering half a superblock reads half the unit (`fold_derivation/l94`, PackBits layout).
+  //
+  // Every number here was measured locally, not assumed:
+  //   * the tile is TN x 16 B = 2048 B at TN=128, i.e. THE SAME BYTES as today's scale tile alone -- the zero tile
+  //     disappears, so the channel halves from 4.0 to 2.0 B per (group, column).
+  //   * one thread per COLUMN, 16 B each: 16 B aligned, and consecutive threads on consecutive chunks, i.e. one fully
+  //     coalesced burst, where today's (TN/8, SK) x (_8,_1) map is strided. l94 (6): contiguity/alignment/coalescing/
+  //     coverage all 0 bad.
+  //   * smem banks: 1-way on all 32, against 4-way on 4 today (l94 (2), counting DISTINCT addresses -- lanes sharing an
+  //     address broadcast, and the scale fragment is deliberately k-broadcast). Config dependent: it holds because warp 0
+  //     touches 8 CONSECUTIVE columns, so re-run l94 when the warp shape changes.
+  //   * TileK=64 must stay on the fp16 path: 2 groups per tile would read 10 B, i.e. 5.0 B per (group, column), worse
+  //     than fp16's 4.0. TileK >= 128 wins (2.5 B) and TileK == 256 is the best case (2.0 B).
+  static constexpr int kPackedScaleUnit = 16;                       // bytes per (superblock, column) for Q4_K
+  using SmemLayoutScalePacked = Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>>,
+                                       Stride<Int<kPackedScaleUnit>, _1>>;
+  using GmemTiledCopyScalePacked = decltype(
+    make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
+                    Layout<Shape <Int<Scale_TileN>, _1>>{},          // one thread per column
+                    Layout<Shape <_1, Int<kPackedScaleUnit>>>{}));   // its whole 16 B unit
+  static_assert(kPackedScaleUnit * 8 == 128, "the packed unit must be exactly one uint128 cp.async per column");
+
   using SmemLayoutAtomA = SmemLayoutAtomA_;
   using SmemLayoutAtomB = SmemLayoutAtomB_;
 
