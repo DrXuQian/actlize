@@ -1126,39 +1126,71 @@ private:
   static constexpr bool kPackedHasMin    = true;
   static constexpr int kPackedUnitWords = kPackedScaleUnit / 4;
 
-  // Load this lane's units for `stage`. cS is the coordinate tensor of the SAME partitioning the fragment uses, so the
-  // column each slot refers to is read off the object instead of recomputed.
+  // Load this lane's units for `stage`, and report WHICH COLUMN each slot is, so the fill below needs no assumption
+  // about the fragment's linear ordering. cS is the coordinate tensor of the same partitioning the fragment uses.
   template <class SPacked, class CoordT>
   CUTLASS_DEVICE static void
-  load_packed_units(SPacked const& sSp, CoordT const& tCcS, int stage, uint32_t (&u)[kPackedSlots][kPackedUnitWords]) {
-    int const per = size(tCcS);
-    int const run = per / kPackedSlots;                       // values per slot; l94 measured the pattern as runs
+  load_packed_units(SPacked const& sSp, CoordT const& tCcS, int stage,
+                    uint32_t (&u)[kPackedSlots][kPackedUnitWords], int (&cols)[kPackedSlots]) {
+    int found = 0;
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int i = 0; i < int(cute::size<0>(tCcS)) * int(cute::size<1>(tCcS)) && found < kPackedSlots; ++i) {
+      int const n = int(cute::get<0>(tCcS(i % int(cute::size<0>(tCcS)), i / int(cute::size<0>(tCcS)), 0, 0)));
+      bool seen = false;
+      for (int k = 0; k < found; ++k) if (cols[k] == n) seen = true;
+      if (!seen) cols[found++] = n;
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int slot = 0; slot < kPackedSlots; ++slot) {
-      int const n = int(get<0>(tCcS(slot * run)));            // this slot's column, from the coordinate tensor
-      uint8_t const* unit = &sSp(n, Int<0>{}, stage);
+      uint8_t const* unit = &sSp(cols[slot], cute::Int<0>{}, stage);
       CUTLASS_PRAGMA_UNROLL
       for (int w = 0; w < kPackedUnitWords; ++w)
         u[slot][w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
     }
   }
 
-  // Fill the half fragments for ONE group from the units. Only kPackedSlots decodes happen; the rest is a broadcast, so
-  // the transform arms below stay exactly as they are -- they still see two half fragments.
-  template <class FragS, class FragZ>
+  // Fill the half fragment(s) for ONE group. Only kPackedSlots decodes happen -- every fragment element sharing a column
+  // shares its scale -- and each element's column is LOOKED UP in the coordinate tensor rather than derived from a
+  // run-length, so nothing here depends on the fragment's linear order (l94 (7) measured the run pattern; relying on it
+  // would be a written-down relation instead of one read off the object).
+  template <bool WithZero, class CoordT, class FragS, class FragZ>
   CUTLASS_DEVICE static void
-  decode_packed_group(uint32_t const (&u)[kPackedSlots][kPackedUnitWords], int g, FragS&& frag_s, FragZ&& frag_z) {
+  decode_packed_group(uint32_t const (&u)[kPackedSlots][kPackedUnitWords], int const (&cols)[kPackedSlots],
+                      int g, CoordT const& tCcS, FragS&& frag_s, FragZ&& frag_z) {
     cutlass::gguf_packed::GroupScale sz[kPackedSlots];
     CUTLASS_PRAGMA_UNROLL
     for (int slot = 0; slot < kPackedSlots; ++slot)
       sz[slot] = cutlass::gguf_packed::group_of<kPackedScaleBias, kPackedHasMin>(
                      reinterpret_cast<uint8_t const*>(u[slot]), g);
-    int const per = size(frag_s), run = per / kPackedSlots;
+    // The fragment arrives ALREADY SLICED as (_,_,0), i.e. rank 2 over (CPY, CPY_N) -- the same two modes the coordinate
+    // tensor's column depends on, since the scale is k-broadcast. Indexing it (i0,i1) is therefore exact and needs no
+    // assumption about linear ordering. (First version used size<2>, which does not exist on a rank-2 fragment.)
+    int const n0 = int(cute::size<0>(frag_s)), n1 = int(cute::size<1>(frag_s));
     CUTLASS_PRAGMA_UNROLL
-    for (int v = 0; v < per; ++v) {
-      frag_s(v) = sz[v / run].scale;
-      frag_z(v) = sz[v / run].zero;
-    }
+    for (int i1 = 0; i1 < n1; ++i1)
+      CUTLASS_PRAGMA_UNROLL
+      for (int i0 = 0; i0 < n0; ++i0) {
+        int const n = int(cute::get<0>(tCcS(i0, i1, 0, 0)));
+        int slot = 0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 1; k < kPackedSlots; ++k) if (cols[k] == n) slot = k;
+        frag_s(i0, i1) = sz[slot].scale;
+        if constexpr (WithZero) frag_z(i0, i1) = sz[slot].zero;
+      }
+  }
+
+  // The tuple slots partition_extra_mma_info appends, which differ by mode because ScaleZero carries two more entries.
+  static constexpr int kPackedTupleS = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 2;
+  static constexpr int kPackedTupleC = kPackedTupleS + 1;
+
+  // ONE call site shape for all three places that used to issue a per-group `copy`.
+  template <bool WithZero, class ExtraInfo, class FragS, class FragZ>
+  CUTLASS_DEVICE static void
+  packed_fill(ExtraInfo const& info, int stage, int g, FragS&& frag_s, FragZ&& frag_z) {
+    uint32_t u[kPackedSlots][kPackedUnitWords];
+    int      cols[kPackedSlots] = {};
+    load_packed_units(cute::get<kPackedTupleS>(info), cute::get<kPackedTupleC>(info), stage, u, cols);
+    decode_packed_group<WithZero>(u, cols, g, cute::get<kPackedTupleC>(info), frag_s, frag_z);
   }
 #endif
 
@@ -1292,6 +1324,19 @@ private:
         auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
         auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
         auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+        // PACKED: one 16 B unit per column carries d, dmin and every group's codes, so this reads the unit and decodes
+        // group (scale_k_idx % Scale_TileK) instead of copying one or two fp16 planes. scale_k_idx is FLATTENED over
+        // (stage, group), so it has to be split -- the packed tensor indexes the stage as a real mode.
+        (void)smem_tiled_copy_S; (void)tCsS;
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          packed_fill<true>(partitioned_mma_extra_info, scale_k_idx / int(Scale_TileK), scale_k_idx % int(Scale_TileK),
+                            tCrS_copy_view(_,_,0), cute::get<2>(tiled_copy_and_views)(_,_,0));
+        } else {
+          packed_fill<false>(partitioned_mma_extra_info, scale_k_idx / int(Scale_TileK), scale_k_idx % int(Scale_TileK),
+                             tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
+        }
+#else
         copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           // Nothing extra to do
@@ -1299,7 +1344,9 @@ private:
           auto tCsZ              = cute::get<2>(partitioned_mma_extra_info);
           auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
           copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
-        } else {
+        }
+#endif
+        if constexpr (false) {} else {
           // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
           assert(false);
         }
@@ -1404,8 +1451,16 @@ private:
           constexpr int I = decltype(i_)::value;
           constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
           constexpr int g = atom_idx / APG_;                            // this atom's scale group within the tile
-          if constexpr (atom_idx % APG_ == 0)                            // reload only at a group's first atom
+          if constexpr (atom_idx % APG_ == 0) {                           // decode only at a group's first atom
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+            // PACKED: no smem read per group at all -- the lane's 16 B unit already holds every group's codes, so this
+            // is kPackedSlots decodes and a broadcast. The `copy` this replaces was HALF of the FINE path's 16 s2r
+            // reads per k-tile (the other half was the zero, whose tile no longer exists).
+            packed_fill<false>(partitioned_extra_info, read_stage, g, tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
+#else
             copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
+#endif
+          }
           cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
         });
@@ -1439,7 +1494,12 @@ private:
         // boundary check that only guards one end.
         constexpr int GRP = (K_ATOM_PER_COPY % APG_ == 0) ? (K_ATOM_PER_COPY / APG_) : 0;
         constexpr bool kPfOk =
-#if defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+            // Prefetching a smem read that no longer happens: on the packed path a group costs kPackedSlots decodes from
+            // registers, so there is no load latency to hide. Applicability, not a static_assert -- writing this as a
+            // requirement once made three units fail to compile instead of falling back.
+            false;
+#elif defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
             (GRP == 2) && (cute::tuple_size<PfPack>::value == 4);
 #else
             false;
@@ -1483,8 +1543,15 @@ private:
             constexpr int g = atom_idx / APG_;
             if constexpr (atom_idx % APG_ == 0) {                        // reload only at a group's first atom
               const int sk = read_stage * int(Scale_TileK) + g;
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+              // Both channels at once: mn rides in the same 16 B unit as sc, so this is where the zero's per-group read
+              // disappears outright rather than being halved. Two reads per group become zero.
+              (void)sk;
+              packed_fill<true>(partitioned_extra_info, read_stage, g, tCrS_copy_view(_,_,0), tCrZ_copy_view(_,_,0));
+#else
               copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
               copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+#endif
             }
             cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                             tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
