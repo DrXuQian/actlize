@@ -506,6 +506,9 @@ public:
   // Device side kernel params
   struct Params {
     GmemTiledCopyScale gmem_tiled_copy_scale;
+    // The packed g2s lives beside the fp16 one rather than replacing it: one binary holds units of several shapes and
+    // only those with Scale_TileK == 8 use this. Stateless, so carrying both costs nothing.
+    GmemTiledCopyScalePacked gmem_tiled_copy_scale_packed;
     GmemTiledCopyZero gmem_tiled_copy_zero;
 
     RealInternalElementA const* ptr_A = nullptr;
@@ -555,6 +558,9 @@ public:
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
                     Layout<Shape < _8,_1>>{});
       p.ptr_S = reinterpret_cast<NonVoidElementScale const*>(args.ptr_S);
+      p.gmem_tiled_copy_scale_packed = make_tiled_copy(
+          Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
+          Layout<Shape <Int<Scale_TileN>, _1>>{}, Layout<Shape <_1, Int<kPackedScaleUnit>>>{});
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         p.gmem_tiled_copy_zero = make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, NonVoidElementZero>{},
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
@@ -616,14 +622,26 @@ public:
       // init scale_residue_n
       scale_residue_n = N - size<0>(gB) * n_coord;
 
+      // THE PACKED PLANE: [nsb][N][16] bytes, i.e. one 16 B unit per (superblock, column) holding d, dmin and the codes.
+      // nsb is DERIVED, not a new parameter: at Scale_TileK groups per k-tile, scale_k / Scale_TileK is the superblock
+      // count. Built unconditionally and appended, because `auto` return-type deduction sees BOTH branches of an
+      // `if constexpr` whose condition is a class constant, so a macro-dependent tuple type would not compile.
+      int const nsb_ = scale_k / int(Scale_TileK);
+      Tensor mSp = make_tensor(make_gmem_ptr(reinterpret_cast<uint8_t const*>(mainloop_params.ptr_S)),
+                               make_shape (N, Int<kPackedScaleUnit>{}, nsb_, L),
+                               make_stride(Int<kPackedScaleUnit>{}, _1{},
+                                           Int<kPackedScaleUnit>{} * N, Int<kPackedScaleUnit>{} * N * nsb_));
+      Tensor gSp = local_tile(mSp(_,_,_,l_coord), Shape<Int<Scale_TileN>, Int<kPackedScaleUnit>>{},
+                              make_coord(n_coord, 0, _));                                    // (BLK_N, 16, nsb)
+
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(gA, gB, gS);
+        return cute::make_tuple(gA, gB, gS, gSp);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor mZ_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_Z), make_shape(N,scale_k,L));    // (n,scale_k,l)
         Tensor mZ_nk = mZ_nkl(_,_,l_coord);
         Tensor gZ = local_tile(mZ_nk, ScaleTileShape{}, make_coord(n_coord, _));
-        return cute::make_tuple(gA, gB, gS, gZ);
+        return cute::make_tuple(gA, gB, gS, gZ, gSp);
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
@@ -990,9 +1008,19 @@ private:
       auto tSgS = get<0>(extra_input_partitions);
       auto tSsS = get<1>(extra_input_partitions);
       auto tScS = get<2>(extra_input_partitions);
+      // The packed pair sits AFTER whatever the mode already appended -- 3,4 for ScaleOnly and 5,6 for ScaleZero. Named
+      // once here so the two copy sites below cannot disagree about the index, which is the shape of bug that has cost
+      // this work the most time.
+      static constexpr int kPkG = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 5 : 3;
+      auto tSgSp = get<kPkG>(extra_input_partitions);
+      auto tSsSp = get<kPkG + 1>(extra_input_partitions);
       // per-column path
       if constexpr(DispatchPolicy::StaticGroupSize == -1) {
-        copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,0), tSsS(_,_,_,write_stage));
+        // Packed: one uint128 cp.async per column of the tile's single superblock; fp16: the group-strided copy.
+        if constexpr (kPackedScaleOn)
+          copy(mainloop_params.gmem_tiled_copy_scale_packed, tSgSp(_,_,_,0), tSsSp(_,_,_,write_stage));
+        else
+          copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,0), tSsS(_,_,_,write_stage));
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
           auto tZgZ = get<3>(extra_input_partitions);
           auto tZsZ = get<4>(extra_input_partitions);
@@ -1011,7 +1039,10 @@ private:
           scale_load_k = k_idx / mainloop_params.reload_factor; // This will always be 0 when group_size == K.
         }
         if (scale_valid && (scale_load_k * Scale_TileK < scale_residue_k)) {
-          copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
+          if constexpr (kPackedScaleOn)
+            copy(mainloop_params.gmem_tiled_copy_scale_packed, tSgSp(_,_,_,scale_load_k), tSsSp(_,_,_,write_stage));
+          else
+            copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
             auto tZgZ = get<3>(extra_input_partitions);
             auto tZsZ = get<4>(extra_input_partitions);
@@ -1043,13 +1074,32 @@ private:
       Tensor tSgS = gmem_thr_copy_scale.partition_S(gS);
       Tensor tSsS = gmem_thr_copy_scale.partition_D(sS);
       Tensor tScS = gmem_thr_copy_scale.partition_S(cS);
-      clear(tSsS);
-      // init scale_residue_k
-      scale_residue_k = mainloop_params.scale_k - get<1>(tScS(0,0,0));
+
+      // THE PACKED g2s, partitioned beside the fp16 one and appended to the tuple for the same return-type reason as
+      // gSp. One thread per column, its whole 16 B unit: l94 (6) measured this as a fully coalesced 2048 B burst.
+      static constexpr int kPackedLoadIdx =
+          (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 3;
+      Tensor sSp2 = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t*>(shared_tensors.smem_scale.begin())),
+                                SmemLayoutScalePackedStaged{});
+      auto gmem_thr_copy_sp = mainloop_params.gmem_tiled_copy_scale_packed.get_slice(thread_idx);
+      Tensor tSgSp = gmem_thr_copy_sp.partition_S(cute::get<kPackedLoadIdx>(load_inputs));
+      Tensor tSsSp = gmem_thr_copy_sp.partition_D(sSp2);
+
+      if constexpr (kPackedScaleOn) clear(tSsSp); else clear(tSsS);
+
+      // THE K BOUND. The fp16 path counts GROUPS: scale_k - <this thread's first group>. The packed path consumes one
+      // UNIT per k-tile, so the bound is the superblock count -- and it is written as nsb * Scale_TileK precisely so the
+      // use site (`scale_load_k * Scale_TileK < scale_residue_k`) needs no change: dividing both sides by Scale_TileK
+      // leaves `scale_load_k < nsb`. The N bound is unchanged; mode 0 is still the column in both layouts, while mode 1
+      // is BYTES here and groups there, which is why only this line moves.
+      if constexpr (kPackedScaleOn)
+        scale_residue_k = int64_t(mainloop_params.scale_k / int(Scale_TileK)) * int64_t(Scale_TileK);
+      else
+        scale_residue_k = mainloop_params.scale_k - get<1>(tScS(0,0,0));
       scale_valid = get<0>(tScS(0,0,0)) < scale_residue_n;
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(tSgS, tSsS, tScS);
+        return cute::make_tuple(tSgS, tSsS, tScS, tSgSp, tSsSp);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ  = make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});
@@ -1061,7 +1111,7 @@ private:
         Tensor tZsZ = gmem_thr_copy_zero.partition_D(sZ);
         clear(tZsZ);
 
-        return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ);
+        return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ, tSgSp, tSsSp);
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
