@@ -187,6 +187,22 @@ public:
   static constexpr int kPackedScaleUnit = 16;                       // bytes per (superblock, column) for Q4_K
   using SmemLayoutScalePacked = Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>>,
                                        Stride<Int<kPackedScaleUnit>, _1>>;
+  // APPLICABILITY, NOT A REQUIREMENT. smem delta = TN*Stages*(16 - 4*Scale_TileK): strictly negative only for
+  // Scale_TileK > 4, a wash at 4, and POSITIVE below it -- the unit always carries eight groups' codes while a k-tile
+  // with small Scale_TileK needs fewer. Measured on ppu001 across the splitk bench's 11 units: three configs shrank by
+  // exactly one zero tile (-8176, -6128, -4080 = -(8192, 6144, 4096) + 16 B of alignment) and at least one GREW (+1040).
+  //
+  // At gs=32, Scale_TileK == 8 is the same condition as TileK == 256, i.e. one superblock per k-tile -- so one test
+  // covers both the smem win and the load cadence. A static_assert would be wrong here: the splitk bench generates 11
+  // differently-shaped units into ONE binary, so a requirement fails the whole build instead of letting the other shapes
+  // keep the fp16 path. Same mistake the PPU_SCALE_PREFETCH assert made earlier in this work.
+  static constexpr bool kPackedScaleOn =
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+      (int(Scale_TileK) == 8);
+#else
+      false;
+#endif
+
   using GmemTiledCopyScalePacked = decltype(
     make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
                     Layout<Shape <Int<Scale_TileN>, _1>>{},          // one thread per column
@@ -460,28 +476,19 @@ public:
     // once put smem_b at offset 2 and produced 'AIU_ld TSM size out of range'. The alignment holds by arithmetic,
     // not by declaration.
     cute::ArrayEngine<RealInternalElementB, cute::cosize_v<SmemLayoutB>> smem_b;
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
-    // PACKED SCALE CHANNEL (plan #20 option E). The tile holds the gguf's own bytes -- one 16 B unit per (superblock,
-    // column) carrying d, dmin and the codes -- so the ZERO TILE IS GONE, not shrunk: `mn` lives in the same unit and
-    // `packed_group()` reads d/dmin from its first four bytes.
+    // PACKED SCALE CHANNEL (plan #20 option E). When on, the tile holds the gguf's own bytes -- one 16 B unit per
+    // (superblock, column) carrying d, dmin and the codes -- so the ZERO TILE GOES TO ZERO ELEMENTS, not shrinks: `mn`
+    // lives in the same unit. Chosen by TYPE rather than by #if, because one binary holds units of several shapes and
+    // only those with Scale_TileK == 8 take this path (see kPackedScaleOn).
     //
-    // The byte count is not a saving to be argued, it is arithmetic: at TN=128 this is 128*16*Stages bytes, exactly what
-    // ONE of today's two half_t tiles costs (128*8*2*Stages), so SharedStorageSize must fall by precisely the zero
-    // tile's size. MOEG_SMEM=1 prints it, and a run where it does NOT fall means the macro never reached this unit --
-    // the failure mode that made two macros silently inert earlier in this work.
-    //
-    // smem_zero stays declared at zero elements rather than being deleted: it is the LAST member, so a zero-length
-    // ArrayEngine cannot move anything (unlike smem_a, whose comment above records what shrinking a leading member did),
-    // and keeping the name means the ScaleZero code paths still compile while they are being migrated arm by arm.
-    static constexpr int kPackedScaleBytes = int(cute::cosize(SmemLayoutScalePacked{})) * int(DispatchPolicy::Stages);
-    cute::ArrayEngine<uint8_t, kPackedScaleBytes> smem_scale;
-    cute::ArrayEngine<NonVoidElementZero, 0> smem_zero;
-    static_assert(kPackedScaleBytes == int(Scale_TileN) * kPackedScaleUnit * int(DispatchPolicy::Stages),
-                  "the packed scale tile must be TN x 16 B per stage");
-#else
-    cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
-    cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
-#endif
+    // smem_zero stays declared, at zero elements, rather than being deleted: it is the LAST member, so a zero-length
+    // ArrayEngine cannot move anything (unlike smem_a, whose comment above records what shrinking a leading member did
+    // to smem_b's 32 B alignment), and keeping the name lets the ScaleZero paths compile unchanged.
+    static constexpr int kPackedScaleUnits = int(cute::cosize(SmemLayoutScalePacked{})) * int(DispatchPolicy::Stages);
+    cute::conditional_t<kPackedScaleOn,
+                        cute::ArrayEngine<uint8_t, kPackedScaleOn ? kPackedScaleUnits : 1>,
+                        cute::ArrayEngine<NonVoidElementScale, kPackedScaleOn ? 1 : scale_elements>> smem_scale;
+    cute::ArrayEngine<NonVoidElementZero, kPackedScaleOn ? 0 : zero_elements> smem_zero;
   };
   // Host side kernel arguments
   struct Arguments {
@@ -1108,8 +1115,9 @@ private:
     }
   }
 
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
   // ---------------------------------------------------------------------------------------------------------------
+  // THE PACKED SCALE CHANNEL'S DEVICE STEPS. Defined unconditionally: they are templates, so an off unit never
+  // instantiates them, and the call sites select with `if constexpr (kPackedScaleOn)` per UNIT rather than per binary.
   // THE PACKED SCALE CHANNEL'S TWO DEVICE STEPS. Derived facts, all from fold_derivation/l94 on the collective's own
   // objects (l95 proves the probe's mma IS this one):
   //   * a lane's scale fragment touches exactly kPackedSlots DISTINCT columns -- 2 at TN=128/w16x16, the same for all
@@ -1180,7 +1188,7 @@ private:
   }
 
   // The tuple slots partition_extra_mma_info appends, which differ by mode because ScaleZero carries two more entries.
-  static constexpr int kPackedTupleS = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 2;
+  static constexpr int kPackedTupleS = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 2;  // always present now
   static constexpr int kPackedTupleC = kPackedTupleS + 1;
 
   // ONE call site shape for all three places that used to issue a per-group `copy`.
@@ -1192,7 +1200,6 @@ private:
     load_packed_units(cute::get<kPackedTupleS>(info), cute::get<kPackedTupleC>(info), stage, u, cols);
     decode_packed_group<WithZero>(u, cols, g, cute::get<kPackedTupleC>(info), frag_s, frag_z);
   }
-#endif
 
   /// Utilities for partitioning extra inputs for loading from smem in the mainloop.
   template <class TiledMma>
@@ -1218,29 +1225,23 @@ private:
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
       Tensor tCrS = make_scale_fragment(thr_mma, sS);
 
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
       // APPENDED, never inserted: every existing site reads this tuple positionally (get<0>..get<3>), so the packed
-      // extras go after them and no index moves. tCsS/tCsZ stay in place and simply go unused on this path -- deleting
-      // them would touch the ScaleZero arms before they are migrated.
-      Tensor sSp  = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemLayoutScalePackedStaged{});
+      // extras go after them and no index moves. Appended UNCONDITIONALLY so the arity never depends on a macro -- with
+      // `if constexpr` selecting the fill, a discarded branch still has to name get<4>, and a macro-dependent arity
+      // would make that ill-formed on the other configuration.
+      // reinterpret, because with kPackedScaleOn false this engine is half_t; the tensor is only USED on the
+      // packed path, but it must still COMPILE on the other one.
+      Tensor sSp  = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t*>(storage.smem_scale.begin())),
+                                SmemLayoutScalePackedStaged{});
       Tensor tCcS = smem_thr_copy_S.partition_S(make_identity_tensor(shape(sS)));
-#endif
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
         return cute::make_tuple(tCsS, tCrS, sSp, tCcS);
-#else
-        return cute::make_tuple(tCsS, tCrS);
-#endif
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemCopyLayoutScale{});
         Tensor tCsZ = smem_thr_copy_S.partition_S(sZ);
         Tensor tCrZ = make_scale_fragment(thr_mma, sZ);
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ, sSp, tCcS);
-#else
-        return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
-#endif
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
@@ -1324,28 +1325,26 @@ private:
         auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
         auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
         auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
         // PACKED: one 16 B unit per column carries d, dmin and every group's codes, so this reads the unit and decodes
         // group (scale_k_idx % Scale_TileK) instead of copying one or two fp16 planes. scale_k_idx is FLATTENED over
-        // (stage, group), so it has to be split -- the packed tensor indexes the stage as a real mode.
-        (void)smem_tiled_copy_S; (void)tCsS;
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          packed_fill<true>(partitioned_mma_extra_info, scale_k_idx / int(Scale_TileK), scale_k_idx % int(Scale_TileK),
-                            tCrS_copy_view(_,_,0), cute::get<2>(tiled_copy_and_views)(_,_,0));
+        // (stage, group), so it has to be split -- the packed tensor indexes the stage as a real mode. `if constexpr`
+        // rather than #if, because only the units with Scale_TileK == 8 take this path (kPackedScaleOn).
+        if constexpr (kPackedScaleOn) {
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            packed_fill<true>(partitioned_mma_extra_info, scale_k_idx / int(Scale_TileK), scale_k_idx % int(Scale_TileK),
+                              tCrS_copy_view(_,_,0), cute::get<2>(tiled_copy_and_views)(_,_,0));
+          } else {
+            packed_fill<false>(partitioned_mma_extra_info, scale_k_idx / int(Scale_TileK), scale_k_idx % int(Scale_TileK),
+                               tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
+          }
         } else {
-          packed_fill<false>(partitioned_mma_extra_info, scale_k_idx / int(Scale_TileK), scale_k_idx % int(Scale_TileK),
-                             tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
+          copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto tCsZ           = cute::get<2>(partitioned_mma_extra_info);
+            auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
+            copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
+          }
         }
-#else
-        copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-          // Nothing extra to do
-        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          auto tCsZ              = cute::get<2>(partitioned_mma_extra_info);
-          auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
-          copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
-        }
-#endif
         if constexpr (false) {} else {
           // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
           assert(false);
@@ -1452,14 +1451,13 @@ private:
           constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
           constexpr int g = atom_idx / APG_;                            // this atom's scale group within the tile
           if constexpr (atom_idx % APG_ == 0) {                           // decode only at a group's first atom
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
             // PACKED: no smem read per group at all -- the lane's 16 B unit already holds every group's codes, so this
-            // is kPackedSlots decodes and a broadcast. The `copy` this replaces was HALF of the FINE path's 16 s2r
-            // reads per k-tile (the other half was the zero, whose tile no longer exists).
-            packed_fill<false>(partitioned_extra_info, read_stage, g, tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
-#else
-            copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
-#endif
+            // is kPackedSlots decodes and a broadcast. The `copy` it replaces was HALF of the FINE path's 16 s2r reads
+            // per k-tile (the other half was the zero, whose tile no longer exists).
+            if constexpr (kPackedScaleOn)
+              packed_fill<false>(partitioned_extra_info, read_stage, g, tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
+            else
+              copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
           }
           cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
@@ -1493,13 +1491,10 @@ private:
         // static_assert made three units fail to compile instead of falling back -- the same shape of mistake as a
         // boundary check that only guards one end.
         constexpr int GRP = (K_ATOM_PER_COPY % APG_ == 0) ? (K_ATOM_PER_COPY / APG_) : 0;
-        constexpr bool kPfOk =
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
-            // Prefetching a smem read that no longer happens: on the packed path a group costs kPackedSlots decodes from
-            // registers, so there is no load latency to hide. Applicability, not a static_assert -- writing this as a
-            // requirement once made three units fail to compile instead of falling back.
-            false;
-#elif defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
+        // Prefetching a smem read that no longer happens: where the packed path is on, a group costs kPackedSlots
+        // decodes from registers and there is no load latency to hide. Per UNIT, not per binary.
+        constexpr bool kPfOk = !kPackedScaleOn &&
+#if defined(PPU_SCALE_PREFETCH) && (PPU_SCALE_PREFETCH != 0)
             (GRP == 2) && (cute::tuple_size<PfPack>::value == 4);
 #else
             false;
@@ -1543,15 +1538,15 @@ private:
             constexpr int g = atom_idx / APG_;
             if constexpr (atom_idx % APG_ == 0) {                        // reload only at a group's first atom
               const int sk = read_stage * int(Scale_TileK) + g;
-#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
               // Both channels at once: mn rides in the same 16 B unit as sc, so this is where the zero's per-group read
               // disappears outright rather than being halved. Two reads per group become zero.
-              (void)sk;
-              packed_fill<true>(partitioned_extra_info, read_stage, g, tCrS_copy_view(_,_,0), tCrZ_copy_view(_,_,0));
-#else
-              copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
-              copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
-#endif
+              if constexpr (kPackedScaleOn) {
+                (void)sk;
+                packed_fill<true>(partitioned_extra_info, read_stage, g, tCrS_copy_view(_,_,0), tCrZ_copy_view(_,_,0));
+              } else {
+                copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+                copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+              }
             }
             cute::transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                             tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
