@@ -1216,7 +1216,18 @@ private:
   // scalar group_of_words stays for everything else and is what the `else` arm below still calls. The bias/mask/OR
   // identity it rests on is NOT restricted to unsigned codes -- l96 (A0) pinned its true bound at [-128, 895] -- so a
   // future signed format only needs its own extraction, not its own arithmetic.
+  //
+  // PPU_PACKED_PAIR=0 FORCES THE SCALAR DECODE BACK, and it exists to BISECT rather than to tune. rowC of
+  // test_q4k_packed_gemm -- the only row where kPackedScaleOn is true -- regressed when the packed pair landed, and
+  // the two candidate causes cannot be separated by reading: (i) the f16x2 asm, which has zero local coverage because
+  // the local gate compiles under nvcc where the scalar fallback is selected, and (ii) anything else the same commits
+  // touched. One build each answers it: PAIR=0 restoring MATCH indicts the packed arithmetic/asm, PAIR=0 still failing
+  // exonerates it and points at the rest of the change.
+#if defined(PPU_PACKED_PAIR) && (PPU_PACKED_PAIR == 0)
+  static constexpr bool kPackedPairFast = false;
+#else
   static constexpr bool kPackedPairFast = kPackedHasMin && (kPackedScaleBias == 0);
+#endif
 
 
   // ON IS A TEMPLATE PARAMETER, and that is the whole point: `if constexpr` only skips INSTANTIATING a discarded branch
