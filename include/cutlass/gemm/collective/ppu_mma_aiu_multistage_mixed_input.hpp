@@ -1234,8 +1234,12 @@ private:
         cute::for_each(cute::make_int_sequence<kGrp>{}, [&] (auto g_) {
           constexpr int G = decltype(g_)::value;
           auto const sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(u, h);
-          sS(n, cute::Int<0>{}, write_stage * kGrp + G) = sz.scale;
-          if constexpr (kPackedHasMin) sZ(n, cute::Int<0>{}, write_stage * kGrp + G) = sz.zero;
+          // (n, group, stage) -- SmemLayoutScale's own modes. NOT (n, 0, stage*kGrp + g): that is
+          // SmemCopyLayoutScale's flattened convention, used by partition_extra_mma_info on the READ side, and the two
+          // functions build a tensor called `sS` with DIFFERENT layouts. Writing the read side's index here put mode 2 at
+          // up to stage*8+7 against an extent of Stages, which the hardware reported as "TSM out of range".
+          sS(n, cute::Int<G>{}, write_stage) = sz.scale;
+          if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, write_stage) = sz.zero;
         });
       }
     }
