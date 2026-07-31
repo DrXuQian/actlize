@@ -118,6 +118,112 @@ CUTLASS_HOST_DEVICE UnitHead head_of_words(uint32_t const (&u)[NWords]) {
   return UnitHead{half_t::bitcast(uint16_t(u[0] & 0xFFFFu)), half_t::bitcast(uint16_t(u[0] >> 16))};
 }
 
+// ===================================================================================================================
+// PACKED FORM -- both of a group's fields in the two halves of one 32-bit register. Same arithmetic, four fewer
+// instructions per group (15 -> 11 measured as opcodes), and BIT-IDENTICAL to group_of_words rather than merely close.
+// Each of the four savings is an identity, not an approximation:
+//
+//  (1) `+128`, `& 0x3FF` and `| 0x6400` collapse into ONE integer add:
+//        0x6400 | ((v + 128) & 0x3FF)  ==  0x6480 + v      for every v in [-128, 895]
+//      0x6400's low ten bits are zero so the OR is an add; (v+128) lands in [0, 1023] so the mask is a no-op; and
+//      0x6480 + 895 = 0x67FF with 0x6480 - 128 = 0x6400, so the value never leaves its own 16-bit lane and one
+//      `+ 0x64806480` serves BOTH fields at once.
+//      THE PRECONDITION IS THE RANGE, NOT THE SIGN. I first wrote this as "unsigned codes only" and l96's boundary
+//      probe refuted it: the bound is exactly int_to_half_small's own [-128, 895], so signed codes are fine and a
+//      format's kScaleBias folds into the constant (Q3_K would use 0x6480 - 32 in the scale lane). What actually
+//      restricts group_pair_of_words to the Q4_K shape is narrower and lives elsewhere: code_pair_from_words masks
+//      6-bit fields, and only a format WITH a min has a second field to pack against in the first place.
+//
+//  (2) half(1152) IS 0x6480, so the constant that biases up and the constant that subtracts down are the same word.
+//      The subtraction is exact in both lanes -- 1024+m and 1152 are integers in fp16 and their difference is an
+//      integer of magnitude <= 895 -- which is the same reason int_to_half_small is exact.
+//
+//  (3) the multiplier half2(d, -dmin) is `u[0] ^ 0x80000000`. u[0] already holds half2(d, dmin) in the right lanes
+//      (the unit's first four bytes, little endian), and flipping the top bit negates the high lane. So hoisting the
+//      min's negation onto the multiplier -- exact, since negation is exact -- costs one xor per COLUMN, and the
+//      per-group negate disappears.
+//
+//  (4) the two products become one ppu.fma.rtte.f16x2 with addend half2(-0, -0). THE ISA HAS NO ppu.mul.f16x2 (all
+//      four f16x2 mnemonics in this tree are cvt, fma, sub and tanh), and fma(x, m, -0) is not an approximation of
+//      the multiply -- it IS the multiply, for every input including signed zeros: p + (-0) = p for p != 0,
+//      (+0) + (-0) = +0, and (-0) + (-0) = -0.
+//
+// The asm is gated on the PPU compiler AND on not-nvcc: fold_derivation's local gates compile these headers with
+// nvcc (l95 even with -D__HGGCCC__), where a ppu mnemonic reaching ptxas is a hard error. The scalar fallback is
+// what the host-side bit-identity gate in l96 actually checks, and it performs the same two half_t operations in the
+// same order, so agreeing with it is agreeing with group_of_words.
+#if defined(__HGGCCC__) && !defined(__NVCC__)
+#  define CUTLASS_GGUF_PACKED_F16X2_ASM 1
+#else
+#  define CUTLASS_GGUF_PACKED_F16X2_ASM 0
+#endif
+
+CUTLASS_HOST_DEVICE uint32_t pack_h2(half_t lo, half_t hi) {
+  return uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
+}
+CUTLASS_HOST_DEVICE half_t lo_h2(uint32_t a) { return half_t::bitcast(uint16_t(a & 0xFFFFu)); }
+CUTLASS_HOST_DEVICE half_t hi_h2(uint32_t a) { return half_t::bitcast(uint16_t(a >> 16)); }
+
+CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
+#if CUTLASS_GGUF_PACKED_F16X2_ASM
+  uint32_t d;
+  asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+#else
+  return pack_h2(lo_h2(a) - lo_h2(b), hi_h2(a) - hi_h2(b));
+#endif
+}
+
+CUTLASS_HOST_DEVICE uint32_t fma_f16x2(uint32_t a, uint32_t b, uint32_t c) {
+#if CUTLASS_GGUF_PACKED_F16X2_ASM
+  uint32_t d;
+  asm volatile("ppu.fma.rtte.f16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+#else
+  return pack_h2(lo_h2(a) * lo_h2(b) + lo_h2(c), hi_h2(a) * hi_h2(b) + hi_h2(c));
+#endif
+}
+
+// half2(1152, 1152) -- and, by (1) above, also the bias/mask/magic-OR constant. One word, two jobs.
+static constexpr uint32_t kMagic1152x2 = 0x64806480u;
+// half2(-0, -0) -- the fma addend that turns the fma into an exact multiply.
+static constexpr uint32_t kNegZeroX2   = 0x80008000u;
+
+// The two 6-bit fields of one group, landed at bits 0 and 16 of one word. The shift direction for the high field is
+// a compile-time choice, so this is shift, mask, shift, mask, or.
+template <int BitLo, int BitHi, int NWords>
+CUTLASS_HOST_DEVICE uint32_t code_pair_from_words(uint32_t const (&u)[NWords]) {
+  constexpr int wl = BitLo >> 5, ol = BitLo & 31;
+  constexpr int wh = BitHi >> 5, oh = BitHi & 31;
+  static_assert(wl < NWords && wh < NWords, "a field lies outside the unit");
+  uint32_t lo = u[wl] >> ol;
+  if constexpr (ol > 26 && wl + 1 < NWords) lo |= u[wl + 1] << (32 - ol);
+  uint32_t hi = u[wh] >> oh;
+  if constexpr (oh > 26 && wh + 1 < NWords) hi |= u[wh + 1] << (32 - oh);
+  // Written as a 6-bit insert at position 16 because that is one v.bfi.i, the opcode this converter already issues
+  // 270k times. Whether the compiler takes it is a code-generation question, not a correctness one.
+  return (lo & 0x3Fu) | ((hi & 0x3Fu) << 16);
+}
+
+// half2(d, -dmin) for the whole column: one xor. See (3).
+template <int NWords>
+CUTLASS_HOST_DEVICE uint32_t mul2_of_words(uint32_t const (&u)[NWords]) { return u[0] ^ 0x80000000u; }
+
+// One group, both fields, from registers. `m2` is mul2_of_words' result, hoisted out of the group loop.
+// Restricted to the Q4_K shape (unsigned codes, no centre, has a min) because that is where identity (1) holds;
+// every other format keeps group_of_words, which is unchanged.
+template <int G, int ZMul = 0, int NWords>
+CUTLASS_HOST_DEVICE GroupScale group_pair_of_words(uint32_t const (&u)[NWords], uint32_t const m2) {
+  uint32_t const c2 = code_pair_from_words<bit_of(G, 0), bit_of(G, 1)>(u);
+  uint32_t const x2 = sub_f16x2(c2 + kMagic1152x2, kMagic1152x2);   // half2(sc, mn), exactly
+  uint32_t const y2 = fma_f16x2(x2, m2, kNegZeroX2);                // half2(d*sc, -dmin*mn)
+  GroupScale out;
+  out.scale = lo_h2(y2);
+  out.zero  = hi_h2(y2);
+  if constexpr (ZMul != 0) out.zero = out.zero + half_t(float(ZMul)) * out.scale;
+  return out;
+}
+
 // The per-group part only: the two codes and the two products, with d/dmin handed in.
 template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, int NWords>
 CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords], UnitHead const h) {
