@@ -1104,7 +1104,23 @@ private:
       static constexpr int kPackedLoadIdx =
           (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 3;
       Tensor sSraw = make_tensor(make_smem_ptr(shared_tensors.smem_scale_raw.begin()), SmemLayoutScaleRawStaged{});
-      auto gmem_thr_copy_raw = mainloop_params.gmem_tiled_copy_scale_packed.get_slice(thread_idx);
+      // THE MODULO IS NOT COSMETIC. cute does NOT wrap an out-of-range thread index, and this copy's thread layout is
+      // Scale_TileN wide (128) while get_slice is called by all size(TiledMma) = 256 threads. fold_derivation/l97
+      // measured where the extras land on the real layout: thread 128 partitions at byte 2048 of a 4096-byte staging
+      // tile whose stage stride is Scale_TileN*16 = 2048 -- i.e. EXACTLY stage 1's first byte -- and thread 255 at
+      // 4080. So while stage 0 is being copied, half the CTA writes over stage 1; while stage 1 is being copied, the
+      // same half writes PAST the whole allocation, and smem_scale_raw is the last member of SharedStorage.
+      //
+      // That is an unconditional out-of-bounds write, and its damage depends on whether the clobbered stage is read
+      // before the real copy overwrites it -- which is what an intermittent, partial, build-sensitive failure looks
+      // like. rowC went bad=128, bad=724, then MATCH with no semantic source change, and restoring "=r" did not bring
+      // it back, so the constraint was never the cause.
+      //
+      // `% n` rather than a guard, because it is the idiom this file already uses for exactly this
+      // (GmemTiledCopyACp at the A cp.async path): the extra threads then redundantly copy the same bytes from the
+      // same source to the same destination, which is benign, instead of partitioning outside the tile.
+      auto gmem_thr_copy_raw = mainloop_params.gmem_tiled_copy_scale_packed.get_slice(
+          thread_idx % int(cute::size(GmemTiledCopyScalePacked{})));
       Tensor tSgSp = gmem_thr_copy_raw.partition_S(cute::get<kPackedLoadIdx>(load_inputs));
       Tensor tSsSp = gmem_thr_copy_raw.partition_D(sSraw);
 
