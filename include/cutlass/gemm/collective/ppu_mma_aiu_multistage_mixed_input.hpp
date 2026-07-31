@@ -1021,7 +1021,10 @@ private:
           copy(mainloop_params.gmem_tiled_copy_scale_packed, tSgSp(_,_,_,0), tSsSp(_,_,_,write_stage));
         else
           copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,0), tSsS(_,_,_,write_stage));
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        // NOT under kPackedScaleOn: `mn` rides in the scale unit, and smem_zero is zero elements there, so issuing
+        // this copy would write past the end of the allocation. Found by asking what the ScaleZero fixture would do,
+        // not by a compiler -- a 0-length ArrayEngine is a valid pointer and cp.async would happily scribble past it.
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && !kPackedScaleOn) {
           auto tZgZ = get<3>(extra_input_partitions);
           auto tZsZ = get<4>(extra_input_partitions);
           copy(mainloop_params.gmem_tiled_copy_zero, tZgZ(_,_,_,0), tZsZ(_,_,_,write_stage));
@@ -1043,7 +1046,7 @@ private:
             copy(mainloop_params.gmem_tiled_copy_scale_packed, tSgSp(_,_,_,scale_load_k), tSsSp(_,_,_,write_stage));
           else
             copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
-          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && !kPackedScaleOn) {
             auto tZgZ = get<3>(extra_input_partitions);
             auto tZsZ = get<4>(extra_input_partitions);
             copy(mainloop_params.gmem_tiled_copy_zero, tZgZ(_,_,_,scale_load_k), tZsZ(_,_,_,write_stage));
@@ -1109,7 +1112,8 @@ private:
 
         Tensor tZgZ = gmem_thr_copy_zero.partition_S(gZ);
         Tensor tZsZ = gmem_thr_copy_zero.partition_D(sZ);
-        clear(tZsZ);
+        // Same reason as the copies: with the packed path on, smem_zero holds zero elements.
+        if constexpr (!kPackedScaleOn) clear(tZsZ);
 
         return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ, tSgSp, tSsSp);
       }
@@ -1182,6 +1186,9 @@ private:
   // <0, false>; they are template parameters of group_of precisely so no second decode is written.
   static constexpr int  kPackedScaleBias = 0;
   static constexpr bool kPackedHasMin    = true;
+  // 8 cancels the int4 converter's own -8, which this path leaves in place: see group_of's comment for why that is the
+  // better of the two ways to reconcile them.
+  static constexpr int  kPackedZMul      = 8;
   static constexpr int kPackedUnitWords = kPackedScaleUnit / 4;
 
   // Load this lane's units for `stage`, and report WHICH COLUMN each slot is, so the fill below needs no assumption
@@ -1218,7 +1225,7 @@ private:
     cutlass::gguf_packed::GroupScale sz[kPackedSlots];
     CUTLASS_PRAGMA_UNROLL
     for (int slot = 0; slot < kPackedSlots; ++slot)
-      sz[slot] = cutlass::gguf_packed::group_of<kPackedScaleBias, kPackedHasMin>(
+      sz[slot] = cutlass::gguf_packed::group_of<kPackedScaleBias, kPackedHasMin, kPackedZMul>(
                      reinterpret_cast<uint8_t const*>(u[slot]), g);
     // The fragment arrives ALREADY SLICED as (_,_,0), i.e. rank 2 over (CPY, CPY_N) -- the same two modes the coordinate
     // tensor's column depends on, since the scale is k-broadcast. Indexing it (i0,i1) is therefore exact and needs no

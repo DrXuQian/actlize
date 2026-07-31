@@ -66,7 +66,15 @@ CUTLASS_HOST_DEVICE half_t int_to_half_small(int v) {
 
 // Q4_K: codes are unsigned with no centre of their own, and the affine term is -dmin*mn. `ScaleBias` and `HasMin` are
 // template parameters rather than hardcoded so Q3_K (bias 32, no min) and Q6_K (signed, no min) need no second function.
-template <int ScaleBias = 0, bool HasMin = true>
+// ZMul CANCELS THE CONVERTER'S OWN BIAS, and it is not optional. The mainloop computes scale*emitted + zero, and the
+// int4 converter emits nib - 8, so a zero of -dmin*mn would leave the product short by 8*scale. With ZMul = 8 the zero is
+// 8*scale - dmin*mn and the product is scale*nib - dmin*mn, which is Q4_K's dequant.
+//
+// The alternative -- setting the converter's Bias to 0 so the codes pass through as nib and the zero stays -dmin*mn --
+// was measured against fp64 truth in real_weight/dump_packed_scale.py gate (c): 0.0148 step of error versus 0.0128 for
+// this cancelling form, i.e. the two are equivalent and this one is if anything slightly better. It also leaves the
+// shipped int4 converter untouched, which the other route would not.
+template <int ScaleBias = 0, bool HasMin = true, int ZMul = 0>
 CUTLASS_HOST_DEVICE GroupScale group_of(uint8_t const* unit, int g) {
   half_t const d    = half_t::bitcast(uint16_t(unit[0]) | uint16_t(uint16_t(unit[1]) << 8));
   GroupScale out;
@@ -77,6 +85,7 @@ CUTLASS_HOST_DEVICE GroupScale group_of(uint8_t const* unit, int g) {
   } else {
     out.zero = half_t(0.f);
   }
+  if constexpr (ZMul != 0) out.zero = out.zero + half_t(float(ZMul)) * out.scale;
   return out;
 }
 
