@@ -212,8 +212,17 @@ CUTLASS_HOST_DEVICE uint32_t mul2_of_words(uint32_t const (&u)[NWords]) { return
 // One group, both fields, from registers. `m2` is mul2_of_words' result, hoisted out of the group loop.
 // Restricted to the Q4_K shape (unsigned codes, no centre, has a min) because that is where identity (1) holds;
 // every other format keeps group_of_words, which is unchanged.
-template <int G, int ZMul = 0, int NWords>
+// ScaleBias IS A PARAMETER HERE ONLY SO IT CANNOT BE FORGOTTEN. This function has no per-lane place to subtract a
+// centre from just the scale field -- the whole point is that ONE add serves both fields -- so a non-zero centre must
+// come in through the constant, which is a change to the identity in (1) and not a change to this call. Rather than
+// leave that as a comment, the assert makes a format that needs a centre fail to compile instead of silently losing
+// it. The caller's kPackedPairFast gate happens to exclude that case today; nothing tied the two together, which is
+// exactly the shape of defect this file keeps recording.
+template <int G, int ZMul = 0, int ScaleBias = 0, int NWords>
 CUTLASS_HOST_DEVICE GroupScale group_pair_of_words(uint32_t const (&u)[NWords], uint32_t const m2) {
+  static_assert(ScaleBias == 0,
+                "group_pair_of_words folds the bias into kMagic1152x2; a non-zero centre needs its own constant "
+                "(0x6480 - ScaleBias in the scale lane), not this path");
   uint32_t const c2 = code_pair_from_words<bit_of(G, 0), bit_of(G, 1)>(u);
   uint32_t const x2 = sub_f16x2(c2 + kMagic1152x2, kMagic1152x2);   // half2(sc, mn), exactly
   uint32_t const y2 = fma_f16x2(x2, m2, kNegZeroX2);                // half2(d*sc, -dmin*mn)

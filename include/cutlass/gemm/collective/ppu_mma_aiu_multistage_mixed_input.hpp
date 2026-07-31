@@ -1298,7 +1298,7 @@ private:
             // group down to ~11, and bit-identical rather than close -- l96 (A) checks that over 32768 real Q4_K
             // groups and (A0) checks each of the four identities it rests on separately. This touches only the
             // thread's OWN column, so it is independent of the constraint above.
-            sz = cutlass::gguf_packed::group_pair_of_words<G, kPackedZMul>(u, m2);
+            sz = cutlass::gguf_packed::group_pair_of_words<G, kPackedZMul, kPackedScaleBias>(u, m2);
           } else {
             sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(u, h);
           }
