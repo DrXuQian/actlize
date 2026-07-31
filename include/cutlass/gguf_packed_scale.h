@@ -187,6 +187,19 @@ CUTLASS_HOST_DEVICE uint32_t pack_h2(half_t lo, half_t hi) {
 CUTLASS_HOST_DEVICE half_t lo_h2(uint32_t a) { return half_t::bitcast(uint16_t(a & 0xFFFFu)); }
 CUTLASS_HOST_DEVICE half_t hi_h2(uint32_t a) { return half_t::bitcast(uint16_t(a >> 16)); }
 
+// PPU_F16X2_EARLYCLOBBER=0 PUTS "=r" BACK, and it exists to turn a coincidence into a cause. rowC went from
+// bad=724/4096 to MATCH across four commits, of which "=&r" is only the most plausible; one build with this at 0 says
+// whether that line was the fix or whether the failure merely went away. Note what the constraint does NOT explain:
+// test_ppu_f16x2_probe section (4) forces dest == each input in turn and the hardware returns the SAME answer in 5 of
+// 5 forms, so the instruction tolerates overlap. Whatever "=r" allowed happens in register allocation under the
+// mainloop's pressure -- where m2 is live across eight unrolled groups -- and is invisible with three live values.
+// Pinning it further needs the emitted assembly, which this session did not have.
+#if defined(PPU_F16X2_EARLYCLOBBER) && (PPU_F16X2_EARLYCLOBBER == 0)
+#  define CUTLASS_PPU_F16X2_OUT "=r"
+#else
+#  define CUTLASS_PPU_F16X2_OUT "=&r"
+#endif
+
 CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
 #if CUTLASS_GGUF_PACKED_F16X2_ASM
   uint32_t d;
@@ -194,7 +207,7 @@ CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
   // input, which is legal and is what the reference uses in fast_numeric_conversion_for_mix_gemm.h -- but there the
   // output IS an input by construction. Here the operands are distinct, so aliasing would depend on register
   // allocation, which differs per unrolled group, which is exactly the shape of a PARTIAL failure.
-  asm volatile(CUTLASS_PPU_F16X2_SUB : "=&r"(d) : "r"(a), "r"(b));
+  asm volatile(CUTLASS_PPU_F16X2_SUB : CUTLASS_PPU_F16X2_OUT(d) : "r"(a), "r"(b));
   return d;
 #else
   return pack_h2(lo_h2(a) - lo_h2(b), hi_h2(a) - hi_h2(b));
@@ -204,7 +217,7 @@ CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
 CUTLASS_HOST_DEVICE uint32_t fma_f16x2(uint32_t a, uint32_t b, uint32_t c) {
 #if CUTLASS_GGUF_PACKED_F16X2_ASM
   uint32_t d;
-  asm volatile(CUTLASS_PPU_F16X2_FMA : "=&r"(d) : "r"(a), "r"(b), "r"(c));   // see sub_f16x2
+  asm volatile(CUTLASS_PPU_F16X2_FMA : CUTLASS_PPU_F16X2_OUT(d) : "r"(a), "r"(b), "r"(c));
   return d;
 #else
   return pack_h2(lo_h2(a) * lo_h2(b) + lo_h2(c), hi_h2(a) * hi_h2(b) + hi_h2(c));
