@@ -601,8 +601,10 @@ struct CollectiveBuilder<
 private:
   using ScaleA = detail::deduce_mixed_width_dtype_t<1, ElementPairA_>;
   using ScaleB = detail::deduce_mixed_width_dtype_t<1, ElementPairB_>;
-  using ZeroA = detail::deduce_mixed_width_dtype_t<2, ElementPairA_>;
-  using ZeroB = detail::deduce_mixed_width_dtype_t<2, ElementPairB_>;
+  // strip_no_zero_t: the 2-plane ScaleOnly tuple parks detail::NoZero in the zero slot to keep the second plane
+  // at index 3. The builder and the collective MUST agree on that mapping, so both call the same alias.
+  using ZeroA = detail::strip_no_zero_t<detail::deduce_mixed_width_dtype_t<2, ElementPairA_>>;
+  using ZeroB = detail::strip_no_zero_t<detail::deduce_mixed_width_dtype_t<2, ElementPairB_>>;
   static constexpr bool NeitherIsTuple = !cute::is_tuple<ElementPairA_>::value && !cute::is_tuple<ElementPairB_>::value;
 
 public:

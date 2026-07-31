@@ -168,8 +168,9 @@ private:
   };
   using ScaleA = detail::deduce_mixed_width_dtype_t<1, ElementAOptionalTuple>;
   using ScaleB = detail::deduce_mixed_width_dtype_t<1, ElementBOptionalTuple>;
-  using ZeroA = detail::deduce_mixed_width_dtype_t<2, ElementAOptionalTuple>;
-  using ZeroB = detail::deduce_mixed_width_dtype_t<2, ElementBOptionalTuple>;
+  // NoZero at index 2 means ScaleOnly with the second plane still at index 3 -- see detail::NoZero.
+  using ZeroA = detail::strip_no_zero_t<detail::deduce_mixed_width_dtype_t<2, ElementAOptionalTuple>>;
+  using ZeroB = detail::strip_no_zero_t<detail::deduce_mixed_width_dtype_t<2, ElementBOptionalTuple>>;
   using TileShape_Scale = detail::deduce_mixed_width_dtype_t<1, TileShapePair_>;
 public:
   //
