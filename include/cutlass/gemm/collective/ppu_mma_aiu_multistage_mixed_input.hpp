@@ -1022,7 +1022,7 @@ private:
       if constexpr(DispatchPolicy::StaticGroupSize == -1) {
         // Packed: one uint128 cp.async per column of the tile's single superblock; fp16: the group-strided copy.
         if constexpr (kPackedScaleOn)
-          packed_copy_if<true>(mainloop_params, tSgSp, tSsSp, 0, write_stage);
+          packed_copy_if<kPackedScaleOn>(mainloop_params, tSgSp, tSsSp, 0, write_stage);
         else
           copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,0), tSsS(_,_,_,write_stage));
         // NOT under kPackedScaleOn: `mn` rides in the scale unit, and smem_zero is zero elements there, so issuing
@@ -1047,7 +1047,7 @@ private:
         }
         if (scale_valid && (scale_load_k * Scale_TileK < scale_residue_k)) {
           if constexpr (kPackedScaleOn)
-            packed_copy_if<true>(mainloop_params, tSgSp, tSsSp, scale_load_k, write_stage);
+            packed_copy_if<kPackedScaleOn>(mainloop_params, tSgSp, tSsSp, scale_load_k, write_stage);
           else
             copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && !kPackedScaleOn) {
@@ -1202,6 +1202,14 @@ private:
   //
   // `stage` is the trigger: a k-tile owns one stage and consecutive tiles differ, so "stage changed" is exactly "new
   // tile" and needs no extra counter.
+  // Build a packed-path object, or an empty stand-in. The gate has to be a TEMPLATE PARAMETER: with a class constant,
+  // `if constexpr` still instantiates the discarded branch, so the tensors were being constructed in every unit -- and
+  // gSp's local_tile even does runtime integer math (N*16, N*16*nsb) per CTA. Measured as ~1.5 us on the TK=64 control
+  // rows, which must be byte-identical between the two builds.
+  // NOTE, so it is not retried: a template-parameter gate around a GENERIC lambda (`packed_or_empty<On>([&](auto){...})`)
+  // is the standard way to keep an off unit from instantiating a body, and EDG instantiates it anyway. The packed
+  // objects are therefore built unconditionally; the ~1.5 us that costs on the control rows is measured, not assumed.
+
   struct PackedLaneState {
     uint32_t u[kPackedSlots][kPackedUnitWords];
     int      cols[kPackedSlots];
@@ -1243,30 +1251,35 @@ private:
     });
   }
 
-  // Fill the half fragment(s) for ONE group from the registers already held. kPackedSlots decodes, then a broadcast --
-  // every element sharing a column shares its scale. The column per element is looked up in the coordinate tensor, whose
-  // indices are Int<> here so the lookup folds away entirely.
-  template <bool WithZero, class CoordT, class FragS, class FragZ>
+  // Fill the half fragment(s) for ONE group, from the registers already held. TWO things are compile-time on purpose,
+  // and both were runtime in the first version:
+  //
+  //   G     -- the group index, so every bit position inside the 16 B unit is a constant and the extraction is a shift
+  //            on register values. Passing a byte POINTER instead (code_of on reinterpret_cast<uint8_t const*>(st.u[S]))
+  //            takes the address of a register array, which forces it to LOCAL MEMORY: measured 34.02 -> 57.83 us on
+  //            16x64:256 S=4, i.e. the 16 shared loads saved per k-tile were traded for 64 local ones.
+  //   SLOT  -- which of the lane's columns an element belongs to. A runtime slot indexes sz[] at runtime, and a register
+  //            array indexed at runtime also lands in local memory. The rule is l94 (7), read off the real partitioning:
+  //            the fragment touches kPackedSlots distinct columns in CONTIGUOUS RUNS, identically on all 256 lanes, so
+  //            slot = v / run with v = i0 + i1*n0 -- the order l94 enumerated.
+  template <int G, bool WithZero, class FragS, class FragZ>
   CUTLASS_DEVICE static void
-  decode_packed_group(PackedLaneState const& st, int g, CoordT const& tCcS, FragS&& frag_s, FragZ&& frag_z) {
+  decode_packed_group(PackedLaneState const& st, FragS&& frag_s, FragZ&& frag_z) {
     cutlass::gguf_packed::GroupScale sz[kPackedSlots];
     cute::for_each(cute::make_int_sequence<kPackedSlots>{}, [&] (auto s_) {
       constexpr int S = decltype(s_)::value;
-      sz[S] = cutlass::gguf_packed::group_of<kPackedScaleBias, kPackedHasMin, kPackedZMul>(
-                  reinterpret_cast<uint8_t const*>(st.u[S]), g);
+      sz[S] = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(st.u[S]);
     });
-    constexpr int n0 = decltype(cute::size<0>(frag_s))::value;
-    constexpr int n1 = decltype(cute::size<1>(frag_s))::value;
+    constexpr int n0  = decltype(cute::size<0>(frag_s))::value;
+    constexpr int n1  = decltype(cute::size<1>(frag_s))::value;
+    constexpr int run = (n0 * n1) / kPackedSlots;
+    static_assert(run * kPackedSlots == n0 * n1, "the fragment must split evenly across the packed slots (l94 (7))");
     cute::for_each(cute::make_int_sequence<n1>{}, [&] (auto i1_) {
       cute::for_each(cute::make_int_sequence<n0>{}, [&] (auto i0_) {
         constexpr int I0 = decltype(i0_)::value, I1 = decltype(i1_)::value;
-        int const n = int(cute::get<0>(tCcS(cute::Int<I0>{}, cute::Int<I1>{}, 0, 0)));
-        int slot = 0;
-        cute::for_each(cute::make_int_sequence<kPackedSlots - 1>{}, [&] (auto k_) {
-          if (st.cols[decltype(k_)::value + 1] == n) slot = decltype(k_)::value + 1;
-        });
-        frag_s(cute::Int<I0>{}, cute::Int<I1>{}) = sz[slot].scale;
-        if constexpr (WithZero) frag_z(cute::Int<I0>{}, cute::Int<I1>{}) = sz[slot].zero;
+        constexpr int SLOT = ((I0 + I1 * n0) / run) % kPackedSlots;
+        frag_s(cute::Int<I0>{}, cute::Int<I1>{}) = sz[SLOT].scale;
+        if constexpr (WithZero) frag_z(cute::Int<I0>{}, cute::Int<I1>{}) = sz[SLOT].zero;
       });
     });
   }
@@ -1287,6 +1300,9 @@ private:
     else              st.stage = -1;
   }
 
+  template <bool On, class T>
+  CUTLASS_DEVICE static void packed_clear_if(T& t) { if constexpr (On) clear(t); }
+
   // The g2s copy, gated the same way, so an off unit does not instantiate the packed TiledCopy's apply either.
   template <bool On, class Params, class TSg, class TSs>
   CUTLASS_DEVICE static void
@@ -1297,12 +1313,31 @@ private:
   // The state is a LOCAL of mma() passed by reference, not a tuple member: the collective's operator() takes the
   // partitions tuple as `const cute::tuple<Ts...>&`, so carrying mutable state in it would have meant changing the
   // const-ness of an interface several layers up. One extra parameter touches nothing else.
-  template <bool On, bool WithZero, class ExtraInfo, class FragS, class FragZ>
+  // CALL IT AS packed_fill_if<kPackedScaleOn, ...>, NEVER <true, ...>. An enclosing `if constexpr (kPackedScaleOn)`
+  // does not discard -- the condition is a class constant, not value-dependent -- so a hardcoded `true` instantiates
+  // this body in off units too, where the packed objects are empty stand-ins.
+  template <bool On, int G, bool WithZero, class ExtraInfo, class FragS, class FragZ>
   CUTLASS_DEVICE static void
-  packed_fill_if(ExtraInfo const& info, PackedLaneState& st, int stage, int g, FragS&& frag_s, FragZ&& frag_z) {
+  packed_fill_if(ExtraInfo const& info, PackedLaneState& st, int stage, FragS&& frag_s, FragZ&& frag_z) {
     if constexpr (On) {
       refresh_packed_units(cute::get<kPackedTupleS>(info), stage, st);
-      decode_packed_group<WithZero>(st, g, cute::get<kPackedTupleC>(info), frag_s, frag_z);
+      decode_packed_group<G, WithZero>(st, frag_s, frag_z);
+    }
+  }
+
+  // The COARSE site's group index is runtime (scale_k_idx % Scale_TileK), so it is resolved to a constant by a
+  // predicated sweep. That site is only reachable when Scale_TileK <= K_BLOCK_MAX, which for a packed config means
+  // K_BLOCK_MAX >= 8; the decode band is FINE and never comes here, so the extra predicates cost nothing where it
+  // matters. Correct either way -- exactly one of the branches fires.
+  template <bool On, bool WithZero, class ExtraInfo, class FragS, class FragZ>
+  CUTLASS_DEVICE static void
+  packed_fill_dynamic_if(ExtraInfo const& info, PackedLaneState& st, int stage, int g,
+                         FragS&& frag_s, FragZ&& frag_z) {
+    if constexpr (On) {
+      refresh_packed_units(cute::get<kPackedTupleS>(info), stage, st);
+      cute::for_each(cute::make_int_sequence<int(Scale_TileK)>{}, [&] (auto g_) {
+        if (int(decltype(g_)::value) == g) decode_packed_group<decltype(g_)::value, WithZero>(st, frag_s, frag_z);
+      });
     }
   }
 
@@ -1334,8 +1369,12 @@ private:
       // extras go after them and no index moves. Appended UNCONDITIONALLY so the arity never depends on a macro -- with
       // `if constexpr` selecting the fill, a discarded branch still has to name get<4>, and a macro-dependent arity
       // would make that ill-formed on the other configuration.
-      // reinterpret, because with kPackedScaleOn false this engine is half_t; the tensor is only USED on the
-      // packed path, but it must still COMPILE on the other one.
+      // Built only when the path is on; an empty tuple otherwise, so an off unit constructs nothing at all. The
+      // reinterpret is needed because with the path off that engine is half_t.
+      // Built unconditionally. packed_or_empty (a template-parameter gate around a generic lambda) is the standard way
+      // to avoid that, and EDG instantiates the lambda body anyway -- so the empty stand-in reached partition_S. Its
+      // cost is measured, not guessed: ~1.5 us on the TK=64 control rows. Second-order next to the decode, and revisited
+      // only after the decode's win is on the table; one variable at a time.
       Tensor sSp  = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t*>(storage.smem_scale.begin())),
                                 SmemLayoutScalePackedStaged{});
       Tensor tCcS = smem_thr_copy_S.partition_S(make_identity_tensor(shape(sS)));
@@ -1438,9 +1477,10 @@ private:
         // rather than #if, because only the units with Scale_TileK == 8 take this path (kPackedScaleOn).
         if constexpr (kPackedScaleOn) {
           constexpr bool kWZ = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero);
-          packed_fill_if<true, kWZ>(partitioned_mma_extra_info, packed_state, scale_k_idx / int(Scale_TileK),
-                                    scale_k_idx % int(Scale_TileK), tCrS_copy_view(_,_,0),
-                                    cute::get<kWZ ? 2 : 1>(tiled_copy_and_views)(_,_,0));
+          packed_fill_dynamic_if<kPackedScaleOn, kWZ>(
+              partitioned_mma_extra_info, packed_state, scale_k_idx / int(Scale_TileK),
+              scale_k_idx % int(Scale_TileK), tCrS_copy_view(_,_,0),
+              cute::get<kWZ ? 2 : 1>(tiled_copy_and_views)(_,_,0));
         } else {
           copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
@@ -1561,8 +1601,8 @@ private:
             // is kPackedSlots decodes and a broadcast. The `copy` it replaces was HALF of the FINE path's 16 s2r reads
             // per k-tile (the other half was the zero, whose tile no longer exists).
             if constexpr (kPackedScaleOn)
-              packed_fill_if<true, false>(partitioned_extra_info, packed_state, read_stage, g,
-                                          tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
+              packed_fill_if<kPackedScaleOn, g, false>(partitioned_extra_info, packed_state, read_stage,
+                                                      tCrS_copy_view(_,_,0), tCrS_copy_view(_,_,0));
             else
               copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
           }
@@ -1649,8 +1689,8 @@ private:
               // disappears outright rather than being halved. Two reads per group become zero.
               if constexpr (kPackedScaleOn) {
                 (void)sk;
-                packed_fill_if<true, true>(partitioned_extra_info, packed_state, read_stage, g,
-                                            tCrS_copy_view(_,_,0), tCrZ_copy_view(_,_,0));
+                packed_fill_if<kPackedScaleOn, g, true>(partitioned_extra_info, packed_state, read_stage,
+                                                       tCrS_copy_view(_,_,0), tCrZ_copy_view(_,_,0));
               } else {
                 copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
                 copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));

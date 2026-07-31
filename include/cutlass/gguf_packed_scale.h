@@ -52,6 +52,23 @@ CUTLASS_HOST_DEVICE void put_code(uint8_t* unit, int g, int which, int v) {     
   unit[(bit >> 3) + 1] |= uint8_t((uint32_t(v) << (bit & 7)) >> 8);
 }
 
+// REGISTER-RESIDENT EXTRACTION. The field's bit position is a compile-time constant, so this is a shift and a mask on
+// values that stay in registers.
+//
+// This exists because code_of() takes a `uint8_t const*`, which is right for smem and gmem and WRONG for registers:
+// byte-addressing a register array forces it to local memory. Measured on ppu001, that one mistake made the packed path
+// 70% slower than the fp16 one it replaces (16x64:256 S=4: 34.02 -> 57.83 us) -- the 16 shared loads it saves per k-tile
+// were traded for 64 local ones.
+template <int Bit, int NWords>
+CUTLASS_HOST_DEVICE int code_from_words(uint32_t const (&u)[NWords]) {
+  constexpr int w = Bit >> 5, off = Bit & 31;
+  static_assert(w < NWords, "the field lies outside the unit");
+  uint32_t v = u[w] >> off;
+  // A 6-bit field straddles a word only when it starts within 5 bits of the top.
+  if constexpr (off > 26 && w + 1 < NWords) v |= u[w + 1] << (32 - off);
+  return int(v & 0x3Fu);
+}
+
 struct GroupScale {
   half_t scale;
   half_t zero;
@@ -82,6 +99,23 @@ CUTLASS_HOST_DEVICE GroupScale group_of(uint8_t const* unit, int g) {
   if constexpr (HasMin) {
     half_t const dmin = half_t::bitcast(uint16_t(unit[2]) | uint16_t(uint16_t(unit[3]) << 8));
     out.zero = -(dmin * int_to_half_small(code_of(unit, g, 1)));
+  } else {
+    out.zero = half_t(0.f);
+  }
+  if constexpr (ZMul != 0) out.zero = out.zero + half_t(float(ZMul)) * out.scale;
+  return out;
+}
+
+// The same dequant as group_of, from REGISTERS. G is a template parameter because that is what makes every bit position
+// a constant; d and dmin are the unit's first four bytes, i.e. the low and high halves of word 0 (little endian).
+template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, int NWords>
+CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords]) {
+  GroupScale out;
+  half_t const d = half_t::bitcast(uint16_t(u[0] & 0xFFFFu));
+  out.scale = d * int_to_half_small(code_from_words<bit_of(G, 0)>(u) - ScaleBias);
+  if constexpr (HasMin) {
+    half_t const dmin = half_t::bitcast(uint16_t(u[0] >> 16));
+    out.zero = -(dmin * int_to_half_small(code_from_words<bit_of(G, 1)>(u)));
   } else {
     out.zero = half_t(0.f);
   }
