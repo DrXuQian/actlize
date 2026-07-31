@@ -34,6 +34,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gguf_packed_scale.h"
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 
 #include "cute/algorithm/functional.hpp"
@@ -191,6 +192,10 @@ public:
                     Layout<Shape <Int<Scale_TileN>, _1>>{},          // one thread per column
                     Layout<Shape <_1, Int<kPackedScaleUnit>>>{}));   // its whole 16 B unit
   static_assert(kPackedScaleUnit * 8 == 128, "the packed unit must be exactly one uint128 cp.async per column");
+  // The staged view, which is what SharedStorage actually holds: stage s starts at s * TN * 16 bytes.
+  using SmemLayoutScalePackedStaged =
+      Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>, Int<DispatchPolicy::Stages>>,
+             Stride<Int<kPackedScaleUnit>, _1, Int<Scale_TileN * kPackedScaleUnit>>>;
 
   using SmemLayoutAtomA = SmemLayoutAtomA_;
   using SmemLayoutAtomB = SmemLayoutAtomB_;
@@ -1103,6 +1108,60 @@ private:
     }
   }
 
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+  // ---------------------------------------------------------------------------------------------------------------
+  // THE PACKED SCALE CHANNEL'S TWO DEVICE STEPS. Derived facts, all from fold_derivation/l94 on the collective's own
+  // objects (l95 proves the probe's mma IS this one):
+  //   * a lane's scale fragment touches exactly kPackedSlots DISTINCT columns -- 2 at TN=128/w16x16, the same for all
+  //     256 lanes -- so the lane holds that many 16 B units and nothing more.
+  //   * value -> slot is periodic with period 8 and is `(v >> 2) & 1` at this config; expressed here as a division by
+  //     the run length rather than a stored table, and CHECKED at runtime against the coordinate tensor below, because
+  //     the run length is the one number that changes with the warp shape.
+  //   * every value sharing a slot shares its column, hence its scale: per group a lane decodes kPackedSlots values,
+  //     not one per fragment element.
+  static constexpr int kPackedSlots = 2;
+  // Q4_K for now: unsigned codes with no centre, and a min channel. Q3_K would be <32, false> and Q6_K
+  // <0, false>; they are template parameters of group_of precisely so no second decode is written.
+  static constexpr int  kPackedScaleBias = 0;
+  static constexpr bool kPackedHasMin    = true;
+  static constexpr int kPackedUnitWords = kPackedScaleUnit / 4;
+
+  // Load this lane's units for `stage`. cS is the coordinate tensor of the SAME partitioning the fragment uses, so the
+  // column each slot refers to is read off the object instead of recomputed.
+  template <class SPacked, class CoordT>
+  CUTLASS_DEVICE static void
+  load_packed_units(SPacked const& sSp, CoordT const& tCcS, int stage, uint32_t (&u)[kPackedSlots][kPackedUnitWords]) {
+    int const per = size(tCcS);
+    int const run = per / kPackedSlots;                       // values per slot; l94 measured the pattern as runs
+    CUTLASS_PRAGMA_UNROLL
+    for (int slot = 0; slot < kPackedSlots; ++slot) {
+      int const n = int(get<0>(tCcS(slot * run)));            // this slot's column, from the coordinate tensor
+      uint8_t const* unit = &sSp(n, Int<0>{}, stage);
+      CUTLASS_PRAGMA_UNROLL
+      for (int w = 0; w < kPackedUnitWords; ++w)
+        u[slot][w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
+    }
+  }
+
+  // Fill the half fragments for ONE group from the units. Only kPackedSlots decodes happen; the rest is a broadcast, so
+  // the transform arms below stay exactly as they are -- they still see two half fragments.
+  template <class FragS, class FragZ>
+  CUTLASS_DEVICE static void
+  decode_packed_group(uint32_t const (&u)[kPackedSlots][kPackedUnitWords], int g, FragS&& frag_s, FragZ&& frag_z) {
+    cutlass::gguf_packed::GroupScale sz[kPackedSlots];
+    CUTLASS_PRAGMA_UNROLL
+    for (int slot = 0; slot < kPackedSlots; ++slot)
+      sz[slot] = cutlass::gguf_packed::group_of<kPackedScaleBias, kPackedHasMin>(
+                     reinterpret_cast<uint8_t const*>(u[slot]), g);
+    int const per = size(frag_s), run = per / kPackedSlots;
+    CUTLASS_PRAGMA_UNROLL
+    for (int v = 0; v < per; ++v) {
+      frag_s(v) = sz[v / run].scale;
+      frag_z(v) = sz[v / run].zero;
+    }
+  }
+#endif
+
   /// Utilities for partitioning extra inputs for loading from smem in the mainloop.
   template <class TiledMma>
   CUTLASS_DEVICE
@@ -1127,14 +1186,29 @@ private:
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
       Tensor tCrS = make_scale_fragment(thr_mma, sS);
 
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+      // APPENDED, never inserted: every existing site reads this tuple positionally (get<0>..get<3>), so the packed
+      // extras go after them and no index moves. tCsS/tCsZ stay in place and simply go unused on this path -- deleting
+      // them would touch the ScaleZero arms before they are migrated.
+      Tensor sSp  = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemLayoutScalePackedStaged{});
+      Tensor tCcS = smem_thr_copy_S.partition_S(make_identity_tensor(shape(sS)));
+#endif
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+        return cute::make_tuple(tCsS, tCrS, sSp, tCcS);
+#else
         return cute::make_tuple(tCsS, tCrS);
+#endif
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemCopyLayoutScale{});
         Tensor tCsZ = smem_thr_copy_S.partition_S(sZ);
         Tensor tCrZ = make_scale_fragment(thr_mma, sZ);
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+        return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ, sSp, tCcS);
+#else
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
+#endif
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
