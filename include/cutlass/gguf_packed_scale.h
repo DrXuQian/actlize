@@ -167,7 +167,11 @@ CUTLASS_HOST_DEVICE half_t hi_h2(uint32_t a) { return half_t::bitcast(uint16_t(a
 CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
 #if CUTLASS_GGUF_PACKED_F16X2_ASM
   uint32_t d;
-  asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(d) : "r"(a), "r"(b));
+  // "=&r" (EARLYCLOBBER), not "=r". With "=r" the compiler may allocate the destination to the same register as an
+  // input, which is legal and is what the reference uses in fast_numeric_conversion_for_mix_gemm.h -- but there the
+  // output IS an input by construction. Here the operands are distinct, so aliasing would depend on register
+  // allocation, which differs per unrolled group, which is exactly the shape of a PARTIAL failure.
+  asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=&r"(d) : "r"(a), "r"(b));
   return d;
 #else
   return pack_h2(lo_h2(a) - lo_h2(b), hi_h2(a) - hi_h2(b));
@@ -177,7 +181,7 @@ CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
 CUTLASS_HOST_DEVICE uint32_t fma_f16x2(uint32_t a, uint32_t b, uint32_t c) {
 #if CUTLASS_GGUF_PACKED_F16X2_ASM
   uint32_t d;
-  asm volatile("ppu.fma.rtte.f16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  asm volatile("ppu.fma.rtte.f16x2 %0, %1, %2, %3;\n" : "=&r"(d) : "r"(a), "r"(b), "r"(c));   // see sub_f16x2
   return d;
 #else
   return pack_h2(lo_h2(a) * lo_h2(b) + lo_h2(c), hi_h2(a) * hi_h2(b) + hi_h2(c));

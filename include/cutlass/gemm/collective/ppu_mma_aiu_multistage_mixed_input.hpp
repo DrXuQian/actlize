@@ -1302,7 +1302,26 @@ private:
         (void)m2; (void)h;
         cute::for_each(cute::make_int_sequence<kGrp>{}, [&] (auto g_) {
           constexpr int G = decltype(g_)::value;
+          // TIMING-ONLY ABLATION. PPU_PACKED_SCALE_NOP=1 keeps the native transport and the shared STORES but drops
+          // the decode ARITHMETIC, so three builds decompose the +12.9% instead of attributing all of it at once:
+          //     baseline B   fp16 planes, cp.async writes them, no decode
+          //     nop      N   native 16 B transport + the same stores, no arithmetic
+          //     full     P   everything
+          // giving arithmetic = P - N and transport+stores = N - B. RESULTS ARE DELIBERATELY WRONG under this flag.
+          // The store still consumes the unit's first half so the 16 B smem load cannot be dead-code eliminated --
+          // an ablation the compiler optimises away measures the compiler, not the kernel.
+          //
+          // A switch by this name was DOCUMENTED in PLAN_task20_scale.md and HANDOFF_packed_scale.md while its code
+          // no longer existed: it did not survive the F/F' rewrites and nothing noticed, because a timing flag has no
+          // gate that fails. Same defect shape as the rest of this task, one level up.
+#if defined(PPU_PACKED_SCALE_NOP) && (PPU_PACKED_SCALE_NOP != 0)
           cutlass::gguf_packed::GroupScale sz;
+          sz.scale = cutlass::half_t::bitcast(uint16_t(u[0] & 0xFFFFu));
+          sz.zero  = cutlass::half_t::bitcast(uint16_t(u[0] >> 16));
+          if (false)
+#else
+          cutlass::gguf_packed::GroupScale sz;
+#endif
           if constexpr (kPackedPairFast) {
             // BOTH FIELDS OF THE GROUP IN ONE 32-BIT LANE PAIR: one integer add carries the bias, the mask and the
             // magic OR for scale AND min together, then one ppu.sub.f16x2 and one ppu.fma.rtte.f16x2. 15 opcodes per
