@@ -297,7 +297,6 @@ public:
   // fold_derivation/l65 and emulated for all three in l66, so there is no per-format dispatch anywhere here.
   static constexpr int kLowBits = cutlass::sizeof_bits<RealInternalElementB>::value;
   static constexpr int kHiBits  = cutlass::sizeof_bits<PlaneB2>::value;
-  using Cvt2Plane = cutlass::MixGemm2Plane<kLowBits, kHiBits>;                       // unchunked, full delivery
   static_assert((kLowBits == 2 && kHiBits == 1) || (kLowBits == 4 && kHiBits == 2) || (kLowBits == 4 && kHiBits == 1),
                 "2-plane mainloop supports Q3 (int2+int1), Q6 (int4+int2) and Q5 (int4+int1)");
 
@@ -404,6 +403,28 @@ private:
   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
   static constexpr bool ModeHasScales = KernelConversionMode == ConversionMode::ConvertAndScale ||
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
+
+  // THE CONVERTER'S ADDITIVE BIAS, decided by the mode -- plan #20 phase 1.
+  //
+  // A 2-plane operand is a symmetric GGUF k-quant (Q3_K dl*(c-4), Q6_K d*sc*(c-32)) whose bias is a CONSTANT, so it can
+  // live either in the zero channel or in the converter's `add` immediate. With a zero channel present, leave it there
+  // and keep the shipped constants byte-for-byte (int4's -8, int2's 0). With ConvertAndScale there is no zero channel
+  // left to hold it, so the converter must own it: kSymBias2Plane, quoted from the converter header, not restated.
+  //
+  // Safety of making this mode-driven rather than a new template parameter, checked rather than assumed: every VERIFYING
+  // 2-plane caller today is ScaleZero (test_lowbit_grouped, test_q3_bconcat_real, test_q65_bconcat_real), and the only
+  // ScaleOnly 2-plane callers are bench rows (test_q3_bconcat_bench), where the value of an fp16 immediate cannot move
+  // the instruction count and so cannot move the time. Q5_K has a min channel and therefore never runs ScaleOnly.
+  static constexpr int kCvtBias = (KernelConversionMode == ConversionMode::ConvertAndScale)
+                                ? cutlass::kSymBias2Plane<kLowBits, kHiBits>
+                                : ((kLowBits == 4) ? 8 : 0);
+
+  // ONE alias, so BOTH conversion sites (the unchunked full delivery and the chunked transform) are biased by
+  // construction. It used to sit above, defaulted, while only the chunked site named the bias -- i.e. the same
+  // "one relation, two copies, one updated" shape that produced this session's pitch and gA faults. The default
+  // FragLayout is quoted from the converter header rather than copied.
+  using Cvt2Plane = cutlass::MixGemm2Plane<kLowBits, kHiBits, -1, 1, true,
+                                           cutlass::MixGemm2PlaneDefaultFrag<kLowBits>, kCvtBias>;
 
   static constexpr auto
   elements_per_smem_scale() {
@@ -1568,7 +1589,7 @@ private:
                            + HiSrc_::base(ii, k_block);
       uint32_t* out_ii = reinterpret_cast<uint32_t*>(
           raw_pointer_cast(tCrB_one(_, cute::Int<NAPC_ * ii>{}).data()));
-      cutlass::MixGemm2Plane<kLowBits, kHiBits, Chunk, NChunk, true, DeliveryL_>::convert(lo_p, hi_p, out_ii);
+      cutlass::MixGemm2Plane<kLowBits, kHiBits, Chunk, NChunk, true, DeliveryL_, kCvtBias>::convert(lo_p, hi_p, out_ii);
     });
 
     constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;       // copy steps per k-tile

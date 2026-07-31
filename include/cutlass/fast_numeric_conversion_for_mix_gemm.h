@@ -236,9 +236,14 @@ struct ChunkPlace {
 //
 // Q3_K's int2 plane is the case that motivates it: its dequant is dl*(low2 - 4) + 4*dl*high1, so with Bias=4 the
 // int2 plane's zero becomes 0 and the plane needs no zero channel at all. Plan #20 phase 1.
+// ONE definition of the default fragment view, so the 2-plane path can name `Bias` (parameter 6) without repeating a
+// layout literal that would then be free to drift from this one.
+using MixGemmEmitDefaultFragLayout =
+    cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
+                 cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>;
+
 template <int Bits, int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::Shape<cute::_2,cute::_2,cute::_2>, cute::_4, cute::_4>,
-                                          cute::Stride<cute::Stride<cute::_1,cute::_2,cute::_4>, cute::_32, cute::_8>>,
+          class FragLayout = MixGemmEmitDefaultFragLayout,
           int Bias = (Bits == 4) ? 8 : 0>
 struct MixGemmChunkEmit {
   static constexpr int kCodesPerVreg = 32 / Bits;
@@ -802,8 +807,17 @@ struct MixGemmNumericArrayConverter<half_t, uint1b_t, 128>
 //
 // FragLayout is the DELIVERY's view of tCrB_mma -- shape (mode0, NAPC, KAPC), strides taken from tCrB_mma -- so `Chunk`
 // indexes the k-atom and which n-atom an output belongs to is resolved by the LAYOUT, never by the caller.
+// `Bias` is the additive constant the CONVERTER owns, over the CONCATENATED code. emit_one ORs the high plane into the
+// mantissa at (bpos + LowBits) BEFORE the fma, so the fma sees c = low + 2^LowBits*high and the low plane's single
+// `add` constant biases the whole code -- exactly what a symmetric GGUF k-quant needs (Q3_K: dl*(c-4), Q6_K: d*sc*(c-32),
+// i.e. Bias = 2^(LowBits+HiBits-1)). The default reproduces the shipped behaviour bit-for-bit: int4's -8, int2's 0.
+// Named so a caller that must spell `Bias` (parameter 7) can restate the default WITHOUT copying the layout literal.
+template <int LowBits>
+using MixGemm2PlaneDefaultFrag = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::Int<4 * (16 / LowBits) / 4>>>;
+
 template <int LowBits, int HiBits, int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::Int<4 * (16 / LowBits) / 4>>>>
+          class FragLayout = MixGemm2PlaneDefaultFrag<LowBits>,
+          int Bias = (LowBits == 4) ? 8 : 0>
 struct MixGemm2Plane
 {
     static_assert(LowBits == 2 || LowBits == 4, "low plane is int2 (Q3) or int4 (Q5/Q6)");
@@ -829,7 +843,8 @@ struct MixGemm2Plane
                   "FragLayout must cover exactly one delivery's outputs");
 
     // (mask, mul, add, bpos) are the LOW plane's, unchanged. ONE rule, shared with the single-plane converter.
-    using E = MixGemmChunkEmit<LowBits, -1, 1>;
+    using E = MixGemmChunkEmit<LowBits, -1, 1, true, MixGemmEmitDefaultFragLayout, Bias>;
+    static constexpr int kBias = Bias;                       // so a harness can read back what the kernel subtracted
     // Placement is the low plane's own emission, composed with the fragment layout by the SAME ChunkPlace the
     // single-plane path uses. The emission ORDERS differ between formats; the placement rule does not.
     using Place = ChunkPlace<FragLayout>;
@@ -921,22 +936,31 @@ struct MixGemm2Plane
     }
 };
 
+// THE SYMMETRIC k-QUANT BIAS, in one place. A 2-plane operand is a GGUF k-quant by construction -- Q3/Q5/Q6 are the only
+// formats that split one code across two planes -- and the k-quants with no min channel dequant as d*sc*(c - 2^(W-1)) over
+// the concatenated code, W = LowBits+HiBits. Q3_K: W=3, bias 4. Q6_K: W=6, bias 32. (Q5_K has a min, so it keeps the zero
+// channel and never asks for this.) Naming it here means the collective and any harness quote ONE constant.
+template <int LowBits, int HiBits>
+static constexpr int kSymBias2Plane = 1 << (LowBits + HiBits - 1);
+
 // Q3's name, kept so nothing downstream changes. Q6 and Q5 are the same object at different widths.
 template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_8>>>
-using MixGemm2Plane_uint2_uint1 = MixGemm2Plane<2, 1, Chunk, NChunk, Rebase, FragLayout>;
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_8>>, int Bias = 0>
+using MixGemm2Plane_uint2_uint1 = MixGemm2Plane<2, 1, Chunk, NChunk, Rebase, FragLayout, Bias>;
 template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_4>>>
-using MixGemm2Plane_int4_uint2 = MixGemm2Plane<4, 2, Chunk, NChunk, Rebase, FragLayout>;   // Q6
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_4>>, int Bias = 8>
+using MixGemm2Plane_int4_uint2 = MixGemm2Plane<4, 2, Chunk, NChunk, Rebase, FragLayout, Bias>;   // Q6
 template <int Chunk = -1, int NChunk = 1, bool Rebase = true,
-          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_4>>>
-using MixGemm2Plane_int4_uint1 = MixGemm2Plane<4, 1, Chunk, NChunk, Rebase, FragLayout>;   // Q5
+          class FragLayout = cute::Layout<cute::Shape<cute::_8, cute::_1, cute::_4>>, int Bias = 8>
+using MixGemm2Plane_int4_uint1 = MixGemm2Plane<4, 1, Chunk, NChunk, Rebase, FragLayout, Bias>;   // Q5
 
 // The collective picks the pair from the two plane ELEMENTS, so a new format needs no dispatch table.
-template <class LowElem, class HiElem, int Chunk = -1, int NChunk = 1, bool Rebase = true, class FragLayout = void>
+template <class LowElem, class HiElem, int Chunk = -1, int NChunk = 1, bool Rebase = true,
+          class FragLayout = MixGemm2PlaneDefaultFrag<cutlass::sizeof_bits<LowElem>::value>,
+          int Bias = (cutlass::sizeof_bits<LowElem>::value == 4) ? 8 : 0>
 struct MixGemm2PlaneFor {
   using type = MixGemm2Plane<cutlass::sizeof_bits<LowElem>::value, cutlass::sizeof_bits<HiElem>::value,
-                             Chunk, NChunk, Rebase, FragLayout>;
+                             Chunk, NChunk, Rebase, FragLayout, Bias>;
 };
 
 } // namespace cutlass
