@@ -455,8 +455,28 @@ public:
     // once put smem_b at offset 2 and produced 'AIU_ld TSM size out of range'. The alignment holds by arithmetic,
     // not by declaration.
     cute::ArrayEngine<RealInternalElementB, cute::cosize_v<SmemLayoutB>> smem_b;
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+    // PACKED SCALE CHANNEL (plan #20 option E). The tile holds the gguf's own bytes -- one 16 B unit per (superblock,
+    // column) carrying d, dmin and the codes -- so the ZERO TILE IS GONE, not shrunk: `mn` lives in the same unit and
+    // `packed_group()` reads d/dmin from its first four bytes.
+    //
+    // The byte count is not a saving to be argued, it is arithmetic: at TN=128 this is 128*16*Stages bytes, exactly what
+    // ONE of today's two half_t tiles costs (128*8*2*Stages), so SharedStorageSize must fall by precisely the zero
+    // tile's size. MOEG_SMEM=1 prints it, and a run where it does NOT fall means the macro never reached this unit --
+    // the failure mode that made two macros silently inert earlier in this work.
+    //
+    // smem_zero stays declared at zero elements rather than being deleted: it is the LAST member, so a zero-length
+    // ArrayEngine cannot move anything (unlike smem_a, whose comment above records what shrinking a leading member did),
+    // and keeping the name means the ScaleZero code paths still compile while they are being migrated arm by arm.
+    static constexpr int kPackedScaleBytes = int(cute::cosize(SmemLayoutScalePacked{})) * int(DispatchPolicy::Stages);
+    cute::ArrayEngine<uint8_t, kPackedScaleBytes> smem_scale;
+    cute::ArrayEngine<NonVoidElementZero, 0> smem_zero;
+    static_assert(kPackedScaleBytes == int(Scale_TileN) * kPackedScaleUnit * int(DispatchPolicy::Stages),
+                  "the packed scale tile must be TN x 16 B per stage");
+#else
     cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
     cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
+#endif
   };
   // Host side kernel arguments
   struct Arguments {
