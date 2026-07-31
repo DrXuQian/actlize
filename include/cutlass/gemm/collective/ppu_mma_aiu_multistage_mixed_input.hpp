@@ -203,6 +203,15 @@ public:
       false;
 #endif
 
+  // THE STAGING TILE: the gguf's own bytes, cp.async'd in and decoded at the barrier. At Scale_TileK == 8 its size is
+  // exactly one scale tile (TN*16 == TN*SK*2), so the channel goes from two smem tiles to three -- the price of keeping
+  // the gmem side ASYNC. Without it the loader had load -> wait -> decode -> store serialised in one thread at the point
+  // a cp.async used to be merely ISSUED, and that measured 24.17 us against a 20.2 baseline with an inner loop already
+  // byte-identical to fp16.
+  using SmemLayoutScaleRawStaged =
+      Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>, Int<DispatchPolicy::Stages>>,
+             Stride<Int<kPackedScaleUnit>, _1, Int<Scale_TileN * kPackedScaleUnit>>>;
+
   using GmemTiledCopyScalePacked = decltype(
     make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
                     Layout<Shape <Int<Scale_TileN>, _1>>{},          // one thread per column
@@ -484,13 +493,15 @@ public:
     // smem_zero stays declared, at zero elements, rather than being deleted: it is the LAST member, so a zero-length
     // ArrayEngine cannot move anything (unlike smem_a, whose comment above records what shrinking a leading member did
     // to smem_b's 32 B alignment), and keeping the name lets the ScaleZero paths compile unchanged.
-    // F CHANGES NOTHING HERE. The decode happens on the way IN (see packed_decode_to_smem), so smem still holds the
+    // F CHANGES NOTHING HERE. The decode happens on the way IN (see packed_decode_stage), so smem still holds the
     // same two fp16 planes and the whole read side -- s2r, fragments, the four transform arms -- is untouched. That is
     // the point: llama.cpp's MMQ keeps the shared read and amortises the decode over its consumers, and the earlier
     // register-decode attempt did the opposite (measured 1.4M extra ALU to save 0.27M shared loads, with LSU only 6%
     // busy and IALU/FALU at 14%).
     cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
     cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
+    // LAST on purpose: at zero elements it cannot move anything above it, so a default build stays byte-identical.
+    cute::ArrayEngine<uint8_t, kPackedScaleOn ? int(cute::cosize(SmemLayoutScaleRawStaged{})) : 0> smem_scale_raw;
   };
   // Host side kernel arguments
   struct Arguments {
@@ -508,6 +519,8 @@ public:
   // Device side kernel params
   struct Params {
     GmemTiledCopyScale gmem_tiled_copy_scale;
+    // The raw-byte cp.async beside the fp16 one; stateless, so carrying both costs nothing.
+    GmemTiledCopyScalePacked gmem_tiled_copy_scale_packed;
     GmemTiledCopyZero gmem_tiled_copy_zero;
 
     RealInternalElementA const* ptr_A = nullptr;
@@ -557,6 +570,9 @@ public:
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
                     Layout<Shape < _8,_1>>{});
       p.ptr_S = reinterpret_cast<NonVoidElementScale const*>(args.ptr_S);
+      p.gmem_tiled_copy_scale_packed = make_tiled_copy(
+          Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
+          Layout<Shape <Int<Scale_TileN>, _1>>{}, Layout<Shape <_1, Int<kPackedScaleUnit>>>{});
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         p.gmem_tiled_copy_zero = make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, NonVoidElementZero>{},
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
@@ -874,6 +890,9 @@ public:
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
       cp_async_wait<DispatchPolicy::Stages-2>();
+      // The staged bytes for smem_pipe_read have landed and the fp16 planes are still private; the __syncthreads below
+      // publishes them. No barrier of its own.
+      packed_decode_stage<kPackedScaleOn>(storage, smem_pipe_read, thread_idx, scale_residue_n);
       __syncthreads();
       // Prefetch the first rmem from the first k-tile
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
@@ -903,6 +922,7 @@ public:
 
           // Commit the smem for smem_pipe_read
           cp_async_wait<DispatchPolicy::Stages-2>();
+          packed_decode_stage<kPackedScaleOn>(storage, smem_pipe_read, thread_idx, scale_residue_n);
           __syncthreads();
         }
 
@@ -1007,16 +1027,14 @@ private:
       // The packed pair sits AFTER whatever the mode already appended -- 3,4 for ScaleOnly and 5,6 for ScaleZero. Named
       // once here so the two copy sites below cannot disagree about the index, which is the shape of bug that has cost
       // this work the most time.
-      // gSp, sS, sZ, thread_idx: 3..6 for ScaleOnly and 5..8 for ScaleZero. Named ONCE so the two sites below cannot
-      // disagree about the index.
+      // (tSgSp, tSsSp): 3,4 for ScaleOnly and 5,6 for ScaleZero. Named ONCE so the two sites cannot disagree.
       static constexpr int kPkG = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 5 : 3;
       // per-column path
       if constexpr(DispatchPolicy::StaticGroupSize == -1) {
-        // Packed: decode the native unit into the SAME fp16 planes; fp16: the group-strided cp.async.
+        // Packed: ONE cp.async of the gguf's own bytes into staging. The decode is at the barrier, in mma().
         if constexpr (kPackedScaleOn)
-          packed_decode_to_smem<kPackedScaleOn>(get<kPkG>(extra_input_partitions), get<kPkG+1>(extra_input_partitions),
-                                                get<kPkG+2>(extra_input_partitions), 0, write_stage,
-                                                get<kPkG+3>(extra_input_partitions), scale_residue_n);
+          copy(mainloop_params.gmem_tiled_copy_scale_packed,
+               get<kPkG>(extra_input_partitions)(_,_,_,0), get<kPkG+1>(extra_input_partitions)(_,_,_,write_stage));
         else
           copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,0), tSsS(_,_,_,write_stage));
         // NOT under kPackedScaleOn: `mn` rides in the scale unit, and smem_zero is zero elements there, so issuing
@@ -1041,17 +1059,12 @@ private:
         }
         if (scale_valid && (scale_load_k * Scale_TileK < scale_residue_k)) {
           if constexpr (kPackedScaleOn)
-            // scale_load_k IS ALREADY A TILE INDEX, not a group index: partition_S leaves the last mode selecting which
-            // block of Scale_TileK groups a call loads, so tSgS(_,_,_,i) is tile i. One k-tile is one superblock, so it
-            // indexes superblocks directly and must NOT be divided. Dividing by Scale_TileK mapped all 19 superblocks
-            // onto 0..2 -- most outputs wrong with a few coincidentally right, which is what rowC showed. The k bound a
-            // few lines up already assumed this reading (scale_residue_k = nsb * Scale_TileK makes the existing
-            // `scale_load_k * Scale_TileK < scale_residue_k` mean `scale_load_k < nsb`), so the bound was right while the
-            // index was wrong -- the two disagreed and only one of them was checked.
-            packed_decode_to_smem<kPackedScaleOn>(get<kPkG>(extra_input_partitions), get<kPkG+1>(extra_input_partitions),
-                                                  get<kPkG+2>(extra_input_partitions),
-                                                  scale_load_k, write_stage,
-                                                  get<kPkG+3>(extra_input_partitions), scale_residue_n);
+            // scale_load_k IS ALREADY A TILE INDEX (partition_S leaves the last mode selecting which block of
+            // Scale_TileK groups a call loads), and one k-tile is one superblock, so it indexes superblocks directly and
+            // must NOT be divided. The k bound above already encoded that reading.
+            copy(mainloop_params.gmem_tiled_copy_scale_packed,
+                 get<kPkG>(extra_input_partitions)(_,_,_,scale_load_k),
+                 get<kPkG+1>(extra_input_partitions)(_,_,_,write_stage));
           else
             copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && !kPackedScaleOn) {
@@ -1088,10 +1101,12 @@ private:
 
       // THE PACKED g2s, partitioned beside the fp16 one and appended to the tuple for the same return-type reason as
       // gSp. One thread per column, its whole 16 B unit: l94 (6) measured this as a fully coalesced 2048 B burst.
-      // The loader needs the RAW tensors, not partitioned views: it addresses (column, byte) and (column, group)
-      // directly. Appended, so the existing positional reads are untouched.
       static constexpr int kPackedLoadIdx =
           (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 3;
+      Tensor sSraw = make_tensor(make_smem_ptr(shared_tensors.smem_scale_raw.begin()), SmemLayoutScaleRawStaged{});
+      auto gmem_thr_copy_raw = mainloop_params.gmem_tiled_copy_scale_packed.get_slice(thread_idx);
+      Tensor tSgSp = gmem_thr_copy_raw.partition_S(cute::get<kPackedLoadIdx>(load_inputs));
+      Tensor tSsSp = gmem_thr_copy_raw.partition_D(sSraw);
 
       clear(tSsS);      // both paths: the loader also relies on out-of-range columns staying zero
 
@@ -1107,7 +1122,7 @@ private:
       scale_valid = get<0>(tScS(0,0,0)) < scale_residue_n;
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(tSgS, tSsS, tScS, cute::get<kPackedLoadIdx>(load_inputs), sS, sS, thread_idx);
+        return cute::make_tuple(tSgS, tSsS, tScS, tSgSp, tSsSp);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ  = make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});
@@ -1120,8 +1135,7 @@ private:
         // Same reason as the copies: with the packed path on, smem_zero holds zero elements.
         if constexpr (!kPackedScaleOn) clear(tZsZ);
 
-        return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ,
-                                cute::get<kPackedLoadIdx>(load_inputs), sS, sZ, thread_idx);
+        return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ, tSgSp, tSsSp);
       }
       else {
         // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
@@ -1197,9 +1211,6 @@ private:
   static constexpr int  kPackedZMul      = 8;
   static constexpr int kPackedUnitWords = kPackedScaleUnit / 4;
 
-  // The tuple slots partition_extra_mma_info appends, which differ by mode because ScaleZero carries two more entries.
-  static constexpr int kPackedTupleS = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 4 : 2;
-  static constexpr int kPackedTupleC = kPackedTupleS + 1;
 
   // ON IS A TEMPLATE PARAMETER, and that is the whole point: `if constexpr` only skips INSTANTIATING a discarded branch
   // when its condition is value-dependent. With kPackedScaleOn (a class constant) both branches were instantiated, so
@@ -1223,16 +1234,28 @@ private:
   // cannot do. The load is issued where the cp.async used to be and the barrier that already guards the stage
   // (cp_async_wait + __syncthreads at the last k_block) still guards it, so no new sync is added -- but the LDG's latency
   // is now exposed rather than overlapped, and only measurement says whether the B cp.async in flight covers it.
-  template <bool On, class GSp, class SS, class SZ>
+  // DECODE ONE STAGE, smem -> smem, at the barrier the pipeline already has.
+  //
+  // llama.cpp's shape (ggml-cuda/mmq.cuh, load_tiles_q4_K): the decode runs once per (column, group) for the whole CTA
+  // and the result goes to SHARED memory, so every lane reads it instead of re-deriving it. The per-lane register version
+  // did the opposite and paid ~1.4M extra ALU to save 0.27M shared loads, with LSU at 6% busy.
+  //
+  // Called AFTER cp_async_wait (the staged bytes have landed) and BEFORE __syncthreads (the planes are still private, and
+  // the sync publishes them), so it adds no barrier of its own. mma() already holds shared_tensors and thread_idx, which
+  // is why this needs no plumbing through any tuple.
+  template <bool On, class Storage>
   CUTLASS_DEVICE static void
-  packed_decode_to_smem(GSp const& gSp, SS&& sS, SZ&& sZ, int k_sb, int write_stage, int thread_idx, int64_t residue_n) {
+  packed_decode_stage(Storage& storage, int stage, int thread_idx, int64_t residue_n) {
     if constexpr (On) {
-      constexpr int kTN  = int(Scale_TileN);
-      constexpr int kGrp = int(Scale_TileK);
+      constexpr int kTN      = int(Scale_TileN);
+      constexpr int kGrp     = int(Scale_TileK);
       constexpr int kThreads = int(cute::size(TiledMma{}));
+      Tensor sRaw = make_tensor(make_smem_ptr(storage.smem_scale_raw.begin()), SmemLayoutScaleRawStaged{});
+      Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()),     SmemLayoutScale{});
+      Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()),      SmemLayoutScale{});
       for (int n = thread_idx; n < kTN; n += kThreads) {
-        if (n >= residue_n) continue;                       // same N bound the fp16 path predicates on
-        uint8_t const* unit = reinterpret_cast<uint8_t const*>(&gSp(n, cute::Int<0>{}, k_sb));
+        if (n >= residue_n) continue;                        // the same N bound the fp16 path predicates on
+        uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n, cute::Int<0>{}, stage));
         uint32_t u[kPackedUnitWords];
         CUTLASS_PRAGMA_UNROLL
         for (int w = 0; w < kPackedUnitWords; ++w) u[w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
@@ -1240,17 +1263,39 @@ private:
         cute::for_each(cute::make_int_sequence<kGrp>{}, [&] (auto g_) {
           constexpr int G = decltype(g_)::value;
           auto const sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(u, h);
-          // (n, group, stage) -- SmemLayoutScale's own modes. NOT (n, 0, stage*kGrp + g): that is
-          // SmemCopyLayoutScale's flattened convention, used by partition_extra_mma_info on the READ side, and the two
-          // functions build a tensor called `sS` with DIFFERENT layouts. Writing the read side's index here put mode 2 at
-          // up to stage*8+7 against an extent of Stages, which the hardware reported as "TSM out of range".
-          sS(n, cute::Int<G>{}, write_stage) = sz.scale;
-          if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, write_stage) = sz.zero;
+          // (n, group, stage): SmemLayoutScale's own modes. NOT the read side's flattened (n, 1, stage*SK+g) -- two
+          // functions build a tensor called sS with DIFFERENT layouts, and using the wrong one faulted as
+          // "TSM out of range" once already.
+          sS(n, cute::Int<G>{}, stage) = sz.scale;
+          if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, stage) = sz.zero;
         });
       }
     }
   }
 
+
+  // ON IS A TEMPLATE PARAMETER, and that is the whole point: `if constexpr` only skips INSTANTIATING a discarded branch
+  // when its condition is value-dependent. With kPackedScaleOn (a class constant) both branches were instantiated, so
+  // every unit paid for the packed tensors even with the path off -- measured as ~5% on the TK=64 control rows, which are
+  // supposed to be byte-identical between the two builds. Routing the gate through a template parameter makes the
+  // discarding real.
+
+  // THE DECODING LOADER: gmem native unit -> registers -> the SAME fp16 smem planes the fp16 path uses.
+  //
+  // This is llama.cpp's shape (ggml-cuda/mmq.cuh, load_tiles_q4_K) and the reason it is right is amortisation, not
+  // instruction count in isolation: there the decode runs once per (row, group) for the whole CTA and the result goes to
+  // SHARED memory, so every lane that needs it reads it rather than re-deriving it. Doing it per lane in registers, which
+  // is what the previous attempt did, multiplies the work by the number of lanes sharing a column (four, per l94 (7))
+  // times the warps -- measured as ~1.4M extra ALU against 0.27M shared loads saved, and LSU was only 6% busy.
+  //
+  // Here: one thread per column reads its 16 B unit (d, dmin and all 8 groups' 6-bit codes), decodes with the bit
+  // positions as compile-time constants, and stores the fp16 scale and zero. 64 columns x 8 groups = 512 decodes per CTA
+  // per k-tile, against 2048 for the per-lane version.
+  //
+  // WHAT IT COSTS: this channel is no longer cp.async, because arithmetic between gmem and smem is exactly what cp.async
+  // cannot do. The load is issued where the cp.async used to be and the barrier that already guards the stage
+  // (cp_async_wait + __syncthreads at the last k_block) still guards it, so no new sync is added -- but the LDG's latency
+  // is now exposed rather than overlapped, and only measurement says whether the B cp.async in flight covers it.
   /// Utilities for partitioning extra inputs for loading from smem in the mainloop.
   template <class TiledMma>
   CUTLASS_DEVICE
