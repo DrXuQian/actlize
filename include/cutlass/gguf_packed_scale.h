@@ -158,6 +158,29 @@ CUTLASS_HOST_DEVICE UnitHead head_of_words(uint32_t const (&u)[NWords]) {
 #  define CUTLASS_GGUF_PACKED_F16X2_ASM 0
 #endif
 
+// SUBNORMAL FLUSHING IS THE HAZARD, AND Q4_K WALKS STRAIGHT INTO IT. Measured on the real fixture
+// (real_weight/q4k_packed.bin, blk.11.ffn_down.weight): d spans 1.585e-05 to 9.484e-04 while fp16's smallest normal
+// is 6.104e-05, so 3914 of 4864 superblock d values -- 80% -- are SUBNORMAL. dmin is not (1.1e-04 to 1.1e-02, zero
+// subnormal), and the PRODUCTS d*sc are not (0 of 38912). That last fact is why the fp16-plane baseline never meets
+// this: the offline forms d*sc in fp32 and stores only the normal product, so no subnormal fp16 ever reaches an
+// instruction. The packed decode is the first thing to multiply BY d on the device.
+//
+// This ISA has an explicit `.noftz` qualifier on at least one f16x2 op (cutlass/functional.h:830,
+// ppu.atom.gpu.global.add.noftz.f16x2), which only makes sense if the DEFAULT flushes. If ppu.fma.rtte.f16x2 flushes
+// its subnormal input, the scale lane becomes 0 for 80% of superblocks while the zero lane (normal dmin) survives --
+// which is exactly the observed failure: rowC wrong, errors dominated by scale, partial rather than total because each
+// output sums over 19 superblocks and only the subnormal ones are lost.
+//
+// PPU_F16X2_NOFTZ=1 emits the qualified form. It is a PROBE first and a fix second: one build says whether the
+// assembler accepts the mnemonic at all, and test_ppu_f16x2_probe says whether it changes the answer.
+#if defined(PPU_F16X2_NOFTZ) && (PPU_F16X2_NOFTZ != 0)
+#  define CUTLASS_PPU_F16X2_SUB "ppu.sub.noftz.f16x2 %0, %1, %2;\n"
+#  define CUTLASS_PPU_F16X2_FMA "ppu.fma.rtte.noftz.f16x2 %0, %1, %2, %3;\n"
+#else
+#  define CUTLASS_PPU_F16X2_SUB "ppu.sub.f16x2 %0, %1, %2;\n"
+#  define CUTLASS_PPU_F16X2_FMA "ppu.fma.rtte.f16x2 %0, %1, %2, %3;\n"
+#endif
+
 CUTLASS_HOST_DEVICE uint32_t pack_h2(half_t lo, half_t hi) {
   return uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
 }
@@ -171,7 +194,7 @@ CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
   // input, which is legal and is what the reference uses in fast_numeric_conversion_for_mix_gemm.h -- but there the
   // output IS an input by construction. Here the operands are distinct, so aliasing would depend on register
   // allocation, which differs per unrolled group, which is exactly the shape of a PARTIAL failure.
-  asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=&r"(d) : "r"(a), "r"(b));
+  asm volatile(CUTLASS_PPU_F16X2_SUB : "=&r"(d) : "r"(a), "r"(b));
   return d;
 #else
   return pack_h2(lo_h2(a) - lo_h2(b), hi_h2(a) - hi_h2(b));
@@ -181,7 +204,7 @@ CUTLASS_HOST_DEVICE uint32_t sub_f16x2(uint32_t a, uint32_t b) {
 CUTLASS_HOST_DEVICE uint32_t fma_f16x2(uint32_t a, uint32_t b, uint32_t c) {
 #if CUTLASS_GGUF_PACKED_F16X2_ASM
   uint32_t d;
-  asm volatile("ppu.fma.rtte.f16x2 %0, %1, %2, %3;\n" : "=&r"(d) : "r"(a), "r"(b), "r"(c));   // see sub_f16x2
+  asm volatile(CUTLASS_PPU_F16X2_FMA : "=&r"(d) : "r"(a), "r"(b), "r"(c));   // see sub_f16x2
   return d;
 #else
   return pack_h2(lo_h2(a) * lo_h2(b) + lo_h2(c), hi_h2(a) * hi_h2(b) + hi_h2(c));
