@@ -1240,6 +1240,9 @@ private:
   // Read this lane's units for `stage`, but only when the stage actually moved.
   template <class SPacked>
   CUTLASS_DEVICE static void refresh_packed_units(SPacked const& sSp, int stage, PackedLaneState& st) {
+#if defined(PPU_PACKED_SCALE_NOP) && (PPU_PACKED_SCALE_NOP != 0)
+    (void)sSp; (void)stage; (void)st; return;      // see decode_packed_group: timing-only ablation
+#endif
     if (st.stage == stage) return;
     st.stage = stage;
     cute::for_each(cute::make_int_sequence<kPackedSlots>{}, [&] (auto s_) {
@@ -1266,10 +1269,22 @@ private:
   CUTLASS_DEVICE static void
   decode_packed_group(PackedLaneState const& st, FragS&& frag_s, FragZ&& frag_z) {
     cutlass::gguf_packed::GroupScale sz[kPackedSlots];
+#if defined(PPU_PACKED_SCALE_NOP) && (PPU_PACKED_SCALE_NOP != 0)
+    // TIMING-ONLY ABLATION. The decode does not touch st at all, so the numbers are deliberately WRONG and the run is
+    // only good for a clock. It answers one question that reasoning has not: is the remaining cost the state and the
+    // decode, or is it elsewhere (the unconditional tensor construction, the byte-element g2s TiledCopy, the larger
+    // Params)? If this build returns to baseline, it is the former; if it stays slow, looking at the decode again is
+    // wasted effort.
+    (void)st;
+    cute::for_each(cute::make_int_sequence<kPackedSlots>{}, [&] (auto s_) {
+      sz[decltype(s_)::value] = cutlass::gguf_packed::GroupScale{half_t(1.f), half_t(0.f)};
+    });
+#else
     cute::for_each(cute::make_int_sequence<kPackedSlots>{}, [&] (auto s_) {
       constexpr int S = decltype(s_)::value;
       sz[S] = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(st.u[S]);
     });
+#endif
     constexpr int n0  = decltype(cute::size<0>(frag_s))::value;
     constexpr int n1  = decltype(cute::size<1>(frag_s))::value;
     constexpr int run = (n0 * n1) / kPackedSlots;
