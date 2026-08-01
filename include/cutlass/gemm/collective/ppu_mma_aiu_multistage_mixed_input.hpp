@@ -51,6 +51,20 @@
 namespace cutlass::gemm::collective::detail {
 // Instantiates composition() ONLY when selected: naming both branches of a conditional_t instantiates both, and the
 // unselected one fires cute's "Requires pow2 shape*stride".
+// PER Scale_TileN, because the conflict map depends on it through the mma B operand's TV layout. A member template
+// cannot be explicitly specialised inside the class, so the table lives here. A width with no entry gets the identity
+// swizzle and keeps the plain map rather than pretending to be fixed.
+// The pattern is closed-form -- Swizzle<2, 3, log2(TN) - 2> -- because the donor bits are always the group index's
+// bits 1 and 2, and the group stride is TN halfs, so they sit at bit log2(TN)+1; MBase stays 3 so the low three bits
+// are untouched and the 16 B cp.async keeps its contiguity. Written as explicit specialisations anyway, so the table
+// claims exactly the three widths l98 measured and any other width gets the identity and keeps the plain map. A
+// formula would have silently extended a result to widths nobody checked, which is how the first version of this
+// table -- one entry, applied to all three widths -- left TN=32 at 4-way while advertising 1-way.
+template <int TN> struct ScaleSwizzleFor      { using type = cute::Swizzle<0, 4, 4>; };   // identity
+template <>       struct ScaleSwizzleFor<32>  { using type = cute::Swizzle<2, 3, 3>; };   // l98: 4-way -> 1-way
+template <>       struct ScaleSwizzleFor<64>  { using type = cute::Swizzle<2, 3, 4>; };   // l98: 4-way -> 1-way
+template <>       struct ScaleSwizzleFor<128> { using type = cute::Swizzle<2, 3, 5>; };   // l98: 4-way -> 1-way
+
 template <bool On, class Swz, class L> struct MaybeScaleSwizzle { using type = L; };
 template <class Swz, class L> struct MaybeScaleSwizzle<true, Swz, L> {
   using type = decltype(cute::composition(Swz{}, L{}));
@@ -417,6 +431,12 @@ public:
   //
   // Padding by 8 halfs (16 B) shifts each group by 4 banks. The data, the gmem->smem copy and every read all go
   // through this layout, so nothing else changes.
+  // PER TileN, not one constant. The conflict map depends on Scale_TileN through the mma B operand's TV layout, and
+  // fold_derivation/l98 sweeps each width against the collective's own layout: Swizzle<2,3,5> takes TN=128 from 4-way
+  // to 1-way but leaves TN=32 at 4-way, i.e. it was overfit to the one width l98 originally hardcoded. The table below
+  // is filled from that sweep; a width with no entry keeps the plain layout rather than pretending to be fixed.
+  using ScaleSwizzleT = typename detail::ScaleSwizzleFor<int(shape<0>(ScaleTileShape{}))>::type;
+
 #if defined(PPU_SCALE_PAD) && (PPU_SCALE_PAD > 0)
   static constexpr int kScalePad = PPU_SCALE_PAD;
   using SmemLayoutScale = decltype(make_layout(
@@ -454,7 +474,7 @@ public:
   using PlainSmemLayoutScale = decltype(tile_to_shape(
     SmemLayoutAtomScale{},
     make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<DispatchPolicy::Stages>{})));
-  static constexpr bool kScaleSwizzleOk =
+  static constexpr bool kScaleSwizzleOkInner =
 #if defined(PPU_SCALE_SWIZZLE) && (PPU_SCALE_SWIZZLE != 0)
       cute::is_static<PlainSmemLayoutScale>::value &&
       ((int(cute::cosize_v<PlainSmemLayoutScale>) & (int(cute::cosize_v<PlainSmemLayoutScale>) - 1)) == 0) &&
@@ -464,8 +484,17 @@ public:
 #else
       false;
 #endif
-  using ScaleSwizzle = cute::Swizzle<2, 3, 5>;
-  using SmemLayoutScale = typename detail::MaybeScaleSwizzle<kScaleSwizzleOk, ScaleSwizzle, PlainSmemLayoutScale>::type;
+  using SmemLayoutScale = typename detail::MaybeScaleSwizzle<kScaleSwizzleOkInner, ScaleSwizzleT, PlainSmemLayoutScale>::type;
+#endif
+  // DECLARED IN BOTH BRANCHES, because partition_extra_mma_info uses them unconditionally. Putting them only in the
+  // #else broke `PPU_SCALE_PAD=8` outright -- "identifier ScaleSwizzle is undefined" -- and the local front-end check
+  // does not exercise that macro unless asked, so it shipped. Same shape as every other defect here: a definition and
+  // its use governed by two different conditions.
+  static constexpr bool kScaleSwizzleOk =
+#if defined(PPU_SCALE_PAD) && (PPU_SCALE_PAD > 0)
+      false;                       // padding already changes the map; the two are alternatives, not a stack
+#else
+      kScaleSwizzleOkInner;
 #endif
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
@@ -1519,7 +1548,7 @@ private:
       using PlainSmemCopyLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{},
           make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<smem_scale_k>{})));
       using SmemCopyLayoutScale =
-          typename detail::MaybeScaleSwizzle<kScaleSwizzleOk, ScaleSwizzle, PlainSmemCopyLayoutScale>::type;
+          typename detail::MaybeScaleSwizzle<kScaleSwizzleOk, ScaleSwizzleT, PlainSmemCopyLayoutScale>::type;
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemCopyLayoutScale{});
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
       Tensor tCrS = make_scale_fragment(thr_mma, sS);
