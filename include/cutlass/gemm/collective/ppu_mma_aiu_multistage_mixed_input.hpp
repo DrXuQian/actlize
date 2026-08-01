@@ -48,6 +48,17 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace cutlass::gemm::collective::detail {
+// Instantiates composition() ONLY when selected: naming both branches of a conditional_t instantiates both, and the
+// unselected one fires cute's "Requires pow2 shape*stride".
+template <bool On, class Swz, class L> struct MaybeScaleSwizzle { using type = L; };
+template <class Swz, class L> struct MaybeScaleSwizzle<true, Swz, L> {
+  using type = decltype(cute::composition(Swz{}, L{}));
+};
+}  // namespace cutlass::gemm::collective::detail
+
+
+
 // ONE definition of the packed cube pitch, used by BOTH sides. The read's pitch is baked into A's atom by the
 // builder and the write's is computed in the collective; as two separate literals they diverged -- 16 against 64 --
 // and the kernel wrote at one spacing, read at another, and faulted with an invalid VA. 64 halfs = 128 B keeps every
@@ -414,9 +425,47 @@ public:
                 Int<int(shape<0>(ScaleTileShape{})) + kScalePad>{},
                 Int<(int(shape<0>(ScaleTileShape{})) + kScalePad) * int(shape<1>(ScaleTileShape{}))>{})));
 #else
-  using SmemLayoutScale = decltype(tile_to_shape(
+  // PPU_SCALE_SWIZZLE -- an XOR on the scale tile's address, chosen by sweeping the collective's OWN layout in
+  // fold_derivation/l98 rather than derived here. Today's map is 4-way conflicted on 4 banks (l94 (2) and l98 agree);
+  // Swizzle<2,3,5> takes it to 1-way on 16 banks. It moves two bits from position 8 -- inside the group field, since
+  // the group stride is 128 halfs = bit 7 -- down to position 3, so it never touches the stage field and stays a
+  // permutation of the allocation (cosize 2048 halfs is a power of two, which l98 checks).
+  //
+  // WHY A SWIZZLE AND NOT PADDING: PPU_SCALE_PAD added halfs to the group stride and LOST, because an additive pad
+  // makes the address non-power-of-two and the multiply costs more than the conflict. An XOR is free.
+  //
+  // WHY IT IS WORTH TRYING, bounded by numbers already in TODO.md: SK_QUANT=0 prices the whole per-group scale reload
+  // at 7.3%, and PPU_SCALE_PREFETCH -- which removes only the WAITING -- recovered 0.7%. So nine tenths of that
+  // channel is work, not stall, and a 4-way conflict is work: four shared-pipe services for one instruction, which
+  // prefetching provably cannot reach. This attacks the part prefetch left behind.
+  //
+  // IT MUST BE COMPOSED ON BOTH VIEWS. partition_extra_inputs builds sS with THIS layout while
+  // partition_extra_mma_info builds a tensor also called sS with SmemCopyLayoutScale (n, 1, stage*Scale_TileK + g).
+  // composition(Swz, L)(c) = Swz(L(c)), so the two stay equal iff they are equal unswizzled -- l98 (2) checks exactly
+  // that, 0 bad over every coordinate, before and after. Swizzling one and not the other is the same class of bug as
+  // the two-literals pitch that faulted with an invalid VA.
+  //
+  // APPLICABILITY, AND WHY IT IS A PARTIAL SPECIALISATION AND NOT conditional_t. cute requires a power-of-two
+  // shape*stride to compose a swizzle, and this bench builds many units into one binary -- Stages = 3 alone makes
+  // smem_scale_k = 3*Scale_TileK non-power-of-two. `conditional_t` does not help: BOTH branch types are instantiated
+  // to be named, so the assert fires from the branch that was not taken. A partial specialisation instantiates only
+  // the selected body. The local front-end check caught this on the first build; a static_assert here would instead
+  // have failed the whole binary for the shapes that cannot carry it, which is the mistake PPU_SCALE_PREFETCH made.
+  using PlainSmemLayoutScale = decltype(tile_to_shape(
     SmemLayoutAtomScale{},
     make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<DispatchPolicy::Stages>{})));
+  static constexpr bool kScaleSwizzleOk =
+#if defined(PPU_SCALE_SWIZZLE) && (PPU_SCALE_SWIZZLE != 0)
+      cute::is_static<PlainSmemLayoutScale>::value &&
+      ((int(cute::cosize_v<PlainSmemLayoutScale>) & (int(cute::cosize_v<PlainSmemLayoutScale>) - 1)) == 0) &&
+      ((int(DispatchPolicy::Stages) & (int(DispatchPolicy::Stages) - 1)) == 0) &&
+      ((int(shape<0>(ScaleTileShape{})) & (int(shape<0>(ScaleTileShape{})) - 1)) == 0) &&
+      ((int(shape<1>(ScaleTileShape{})) & (int(shape<1>(ScaleTileShape{})) - 1)) == 0);
+#else
+      false;
+#endif
+  using ScaleSwizzle = cute::Swizzle<2, 3, 5>;
+  using SmemLayoutScale = typename detail::MaybeScaleSwizzle<kScaleSwizzleOk, ScaleSwizzle, PlainSmemLayoutScale>::type;
 #endif
 
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
@@ -1465,8 +1514,12 @@ private:
       auto smem_thr_copy_S     = smem_tiled_copy_S.get_thread_slice(thread_idx);
 
       static constexpr int smem_scale_k = Scale_TileK * DispatchPolicy::Stages;
-      using SmemCopyLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{},
+      // THE SAME swizzle as SmemLayoutScale, for the reason spelled out there: one buffer, two views, and they are
+      // equal only while both carry it.
+      using PlainSmemCopyLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{},
           make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<smem_scale_k>{})));
+      using SmemCopyLayoutScale =
+          typename detail::MaybeScaleSwizzle<kScaleSwizzleOk, ScaleSwizzle, PlainSmemCopyLayoutScale>::type;
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemCopyLayoutScale{});
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
       Tensor tCrS = make_scale_fragment(thr_mma, sS);
