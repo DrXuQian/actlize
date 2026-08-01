@@ -542,6 +542,15 @@ public:
   int64_t scale_residue_n = 0;
   int64_t scale_residue_k = 0;
   bool scale_valid = true;
+  // THE PACKED COPY NEEDS ITS OWN N PREDICATE. scale_valid is derived from the fp16 copy's coordinate, whose
+  // thread -> N map is 8*(p % 16) for a (16,8) x (_8,_1) layout, while the packed copy is partitioned ONE COLUMN PER
+  // THREAD. Using one for the other is only invisible because every shape measured so far has N a multiple of TileN.
+  // With a residue it fails both ways at once: at residue_n = 20 thread 3 owns packed column 3 (valid) but its fp16
+  // coordinate is 24, so its cp.async is skipped while the decode loop still reads that column -- bytes nobody
+  // copied; and thread 32 has fp16 coordinate 0, so it copies packed column 32 out of a tile that has twenty, an
+  // out-of-bounds GLOBAL read. Neither depends on PPU_PACKED_SPLIT_GROUPS; the split only makes the first one a
+  // stated invariant that is false rather than an accident that happens to hold.
+  bool scale_valid_pk = true;
   //
   // Methods
   //
@@ -780,6 +789,13 @@ public:
     Tensor tCrA     = thr_mma.partition_fragment_A(sA(_,_,0));                // (MMA,MMA_M,MMA_K)
 #endif
     Tensor tCrB_mma = thr_mma.partition_fragment_B(sB(_,_,0));                // (MMA,MMA_N,MMA_K)
+#if defined(PPU_B_DEQUANT_NOP) && (PPU_B_DEQUANT_NOP != 0)
+    // The ablation must not change what the MMA pipe is fed. partition_fragment_B does not initialise, and with the
+    // conversion removed nothing else would either, so every atom would consume indeterminate bits -- which as fp16
+    // are freely NaN or Inf, and a timing measurement taken over exceptional operands measures the exception
+    // handling. One fill, outside the k-loop, so it costs nothing the measurement cares about.
+    cute::fill(tCrB_mma, static_cast<typename decltype(tCrB_mma)::value_type>(1.0f));
+#endif
 
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));                    // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB_mma) == size<2>(accum));                // MMA_N
@@ -1057,7 +1073,8 @@ private:
         else {
           scale_load_k = k_idx / mainloop_params.reload_factor; // This will always be 0 when group_size == K.
         }
-        if (scale_valid && (scale_load_k * Scale_TileK < scale_residue_k)) {
+        // kPackedScaleOn picks the predicate that belongs to the copy actually being issued.
+        if ((kPackedScaleOn ? scale_valid_pk : scale_valid) && (scale_load_k * Scale_TileK < scale_residue_k)) {
           if constexpr (kPackedScaleOn)
             // scale_load_k IS ALREADY A TILE INDEX (partition_S leaves the last mode selecting which block of
             // Scale_TileK groups a call loads), and one k-tile is one superblock, so it indexes superblocks directly and
@@ -1136,6 +1153,13 @@ private:
       else
         scale_residue_k = mainloop_params.scale_k - get<1>(tScS(0,0,0));
       scale_valid = get<0>(tScS(0,0,0)) < scale_residue_n;
+      // From the PACKED partition's own identity tensor rather than from thread_idx arithmetic: the guard and the
+      // partition it guards then come from one object, which is the only form of this that cannot drift.
+      if constexpr (kPackedScaleOn) {
+        Tensor cSp   = make_identity_tensor(make_shape(Int<Scale_TileN>{}, Int<kPackedScaleUnit>{}));
+        Tensor tScSp = gmem_thr_copy_raw.partition_S(cSp);
+        scale_valid_pk = get<0>(tScSp(0,0,0)) < scale_residue_n;
+      }
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         return cute::make_tuple(tSgS, tSsS, tScS, tSgSp, tSsSp);
@@ -1652,9 +1676,11 @@ private:
 
     using CPY_VEC = Int<4 * 32 / sizeof_bits<RealInternalElementB>::value>;
 #if defined(PPU_B_DEQUANT_NOP) && (PPU_B_DEQUANT_NOP != 0)
-    // one 32-bit word, so the B s2r load that feeds cvt_in cannot be eliminated; the rest of cvt_out keeps the
-    // previous k-tile's already-converted halfs, which are finite, so the mma sees no NaN storm
-    recast<uint32_t>(cvt_out)(0) = recast<uint32_t>(cvt_in)(0);
+    // Nothing. The earlier version copied one 32-bit word of cvt_in into cvt_out to keep the B load alive, on the
+    // belief that the rest of cvt_out held the previous k-tile's converted halfs -- it does not, the fragment is
+    // never initialised, and those raw int4 bits read as fp16 are NaN or Inf about as often as not. The B s2r does
+    // not need that crutch: it is a TSM_LD_SWZL implemented as asm volatile, so it survives its results going unused.
+    (void)cvt_in; (void)cvt_out;
 #else
     convert_tensor(cvt_in, cvt_out, CPY_VEC{});
 #endif
