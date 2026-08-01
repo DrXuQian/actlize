@@ -1464,12 +1464,19 @@ private:
           // no longer existed: it did not survive the F/F' rewrites and nothing noticed, because a timing flag has no
           // gate that fails. Same defect shape as the rest of this task, one level up.
 #if defined(PPU_PACKED_SCALE_NOP) && (PPU_PACKED_SCALE_NOP != 0)
-          // NORMAL VALUES, NOT d AND dmin. The first version wrote the unit's own d and dmin into the planes to keep
-          // the 16 B shared load alive -- and d is SUBNORMAL for 80.5% of superblocks on the real fixture (range
-          // 1.585e-05 against fp16's smallest normal 6.104e-05; measured, see the subnormal section above). So every
-          // element of every k-tile then ran the downstream `scale*emitted + zero` on subnormal operands, and the
-          // ablation timed the hardware's denormal handling rather than the absence of the decode. That is why
-          // packnop came out SLOWER than pack, which is causally impossible for an ablation that only REMOVES work.
+          // NORMAL VALUES, NOT d AND dmin. Writing the unit's own d and dmin kept the 16 B load alive but made the
+          // planes depend on the input, and d IS subnormal for 80.5% of superblocks on the real fixture.
+          //
+          // THAT IS NOT WHY packnop CAME OUT SLOWER, and I asserted it was. test_moe_splitk_bench fills its scale
+          // buffer with a constant 0.0625 and its zero buffer with -0.0625 and hands the same allocation to the
+          // packed path, which reinterprets it as 16-byte units -- so the bench's d and dmin are 0.0625, normal, and
+          // the fixture's subnormals never reach it. Second time I attached that measured fact to the wrong effect.
+          // The packnop anomaly is still unexplained; the leading candidates are timing noise at 2.3% against a
+          // documented 13% dispersion, and a different compiler schedule, since the full decoder consumes all four
+          // u[] words while this consumes only u[0] and the other shared loads may simply be eliminated.
+          //
+          // The change is kept because input-independent constants are the right shape for an ablation regardless --
+          // it just does not buy what the first version of this comment claimed.
           //
           // 0x3C00 is 1.0 and 0x0000 is +0; ORing one bit of u[0] into the mantissa keeps the load from being dead
           // while staying firmly normal. The planes are still wrong on purpose -- read the time, never the MATCH.
