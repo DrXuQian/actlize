@@ -1464,9 +1464,18 @@ private:
           // no longer existed: it did not survive the F/F' rewrites and nothing noticed, because a timing flag has no
           // gate that fails. Same defect shape as the rest of this task, one level up.
 #if defined(PPU_PACKED_SCALE_NOP) && (PPU_PACKED_SCALE_NOP != 0)
+          // NORMAL VALUES, NOT d AND dmin. The first version wrote the unit's own d and dmin into the planes to keep
+          // the 16 B shared load alive -- and d is SUBNORMAL for 80.5% of superblocks on the real fixture (range
+          // 1.585e-05 against fp16's smallest normal 6.104e-05; measured, see the subnormal section above). So every
+          // element of every k-tile then ran the downstream `scale*emitted + zero` on subnormal operands, and the
+          // ablation timed the hardware's denormal handling rather than the absence of the decode. That is why
+          // packnop came out SLOWER than pack, which is causally impossible for an ablation that only REMOVES work.
+          //
+          // 0x3C00 is 1.0 and 0x0000 is +0; ORing one bit of u[0] into the mantissa keeps the load from being dead
+          // while staying firmly normal. The planes are still wrong on purpose -- read the time, never the MATCH.
           cutlass::gguf_packed::GroupScale sz;
-          sz.scale = cutlass::half_t::bitcast(uint16_t(u[0] & 0xFFFFu));
-          sz.zero  = cutlass::half_t::bitcast(uint16_t(u[0] >> 16));
+          sz.scale = cutlass::half_t::bitcast(uint16_t(0x3C00u | (u[0] & 1u)));
+          sz.zero  = cutlass::half_t::bitcast(uint16_t((u[0] >> 16) & 1u));
           if (false)
 #else
           cutlass::gguf_packed::GroupScale sz;
