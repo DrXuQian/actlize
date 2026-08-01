@@ -1534,7 +1534,16 @@ private:
       // to avoid that, and EDG instantiates the lambda body anyway -- so the empty stand-in reached partition_S. Its
       // cost is measured, not guessed: ~1.5 us on the TK=64 control rows. Second-order next to the decode, and revisited
       // only after the decode's win is on the table; one variable at a time.
-      Tensor sSp  = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t*>(storage.smem_scale.begin())),
+      // POINTED AT THE BUFFER ITS LAYOUT DESCRIBES. This tensor is dead -- ScaleOnly puts it at tuple index 2 and that
+      // arm reads only 0 and 1; ScaleZero puts it at 4 and nothing reads past 3 -- but it was built on smem_scale, the
+      // fp16 plane, with SmemLayoutScalePackedStaged, which describes the 16-byte staging. That is a leftover from
+      // when the staging lived inside smem_scale, and it is exactly the kind of thing that is revived and then wrong
+      // twice over: wrong buffer, and (since PPU_SCALE_SWIZZLE) an unswizzled view of a buffer every live view now
+      // swizzles. Repointed rather than deleted so the tuple indices, which every consumer reads positionally, do not
+      // move. Found by enumerating every tensor built on smem_scale/smem_zero -- six of them, where I had claimed two.
+      Tensor sSp  = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t*>(
+                                    kPackedScaleOn ? (void*)storage.smem_scale_raw.begin()
+                                                   : (void*)storage.smem_scale.begin())),
                                 SmemLayoutScalePackedStaged{});
       Tensor tCcS = smem_thr_copy_S.partition_S(make_identity_tensor(shape(sS)));
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
