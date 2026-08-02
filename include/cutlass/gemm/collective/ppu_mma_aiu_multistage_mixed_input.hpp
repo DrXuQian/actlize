@@ -497,6 +497,7 @@ public:
       kScaleSwizzleOkInner;
 #endif
 
+
   static_assert(DispatchPolicy::Stages >= 2, "CpAsync mainloop must have at least 2 stages in the pipeline.");
 
 private:
@@ -517,13 +518,105 @@ private:
   static constexpr bool ModeHasScales = KernelConversionMode == ConversionMode::ConvertAndScale ||
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
 
+  // PLACED HERE, AFTER KernelConversionMode, AND THAT IS NOT COSMETIC. This block first sat next to the swizzle
+  // constants 70 lines above, where KernelConversionMode does not exist yet -- and because the offending conjunct
+  // lives inside `#if defined(PPU_PACKED_SCALE_FUSED)`, EVERY build without the macro preprocessed it away and
+  // compiled. The one configuration that used it was the only one that could not build, and nothing local covered
+  // that configuration, so it reached the box as a define that quietly failed to apply. See ci/local_gates.py's
+  // SYNTAX table, which now carries the macro, and l100_fused_active, which asserts the path is actually on.
+  // -----------------------------------------------------------------------------------------------------------------
+  // PPU_PACKED_SCALE_FUSED -- ONE INTERLEAVED (scale, zero) TILE INSTEAD OF TWO PLANES.
+  //
+  // WHAT IT IS FOR, and it is the STORE side only. The packed decoder writes `sS(n,G,st)` and `sZ(n,G,st)` as two
+  // 16-bit stores; 32 lanes with consecutive n cover 32 adjacent 2-byte slots, which is 16 of the 32 four-byte banks
+  // two deep, and stores cannot broadcast. acu measured the cost exactly: +73,728 conflicts against base, matching
+  // `4 decoder warps x 8 groups x 2 planes x 9 passes x 128 CTAs` to the unit. Interleaving makes it ONE 32-bit store
+  // whose 32 lanes hit all 32 banks once.
+  //
+  // WHY THIS ONE AND NOT THE OTHER TWO CANDIDATES, both already tried and both dead:
+  //   * PAIRING ADJACENT COLUMNS to widen the store RACES. cp_async_wait is per thread, so between the wait and the
+  //     publishing __syncthreads a thread may only read bytes it copied itself; the paired version read column 2p+1
+  //     and rowC went to bad=128/4096, concentrated in odd columns. This is ownership-safe by construction: a thread
+  //     derives BOTH halves from its OWN column's unit.
+  //   * AN OFFLINE PERMUTATION of the scale tensor cannot do it at all. A reorder changes which VALUE sits at an
+  //     address; a bank conflict is a property of the ADDRESSES the warp issues, which are unchanged -- and composing
+  //     the permutation into the read view to keep it correct is exactly the runtime address arithmetic that made
+  //     PPU_SCALE_SWIZZLE cost ~7% for zero conflicts removed.
+  //
+  // BYTES ARE UNCHANGED, in both memories. Stored bytes: the interleave is a pure rearrangement. Shared: scale 4 KiB
+  // plus zero 4 KiB is 8 KiB either way -- the fused tile takes 2x the elements and the zero tile goes to zero, so
+  // SharedStorage is the same size. Anyone expecting an occupancy gain here will not get one.
+  //
+  // THE READ SIDE IS DELIBERATELY UNTOUCHED. sS and sZ stay half-typed views over the fused buffer at offsets 0 and
+  // 1 with every stride doubled, so all six tensors, the copy atom, the fragments and the four transform arms keep
+  // their shapes and their code. The load bank map does not get worse: the current map puts 8 lanes on each of 4
+  // banks in pairs; doubling the stride spreads them to 8 banks, still 4-way from the 256-element thread stride, so
+  // the SERVICE count per pair of reads is what it was. Halving the read count is a SEPARATE change (one 32-bit read
+  // plus a register deinterleave) and is not attempted here -- one variable at a time, and this one is the 73,728.
+  static constexpr bool kFusedScaleZero =
+#if defined(PPU_PACKED_SCALE_FUSED) && (PPU_PACKED_SCALE_FUSED != 0)
+      kPackedScaleOn && (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) && !kScaleSwizzleOk;
+#else
+      false;
+#endif
+
+  // THE ASSUMPTION IS CHECKED, NOT ASSUMED. The fused layouts below are written out compactly rather than derived
+  // from SmemLayoutScale, because a stride-doubling transform of an arbitrary (possibly swizzled, possibly padded)
+  // layout is not a thing I can state in one line and be sure of. That is only sound while the layout it replaces IS
+  // the compact one, so say so and let the build fail otherwise -- the alternative is the failure mode this file has
+  // hit twice, where two functions build a tensor of the same name with different layouts and the second one faults
+  // as "TSM out of range".
+  static constexpr int kSZ_N   = int(shape<0>(ScaleTileShape{}));
+  static constexpr int kSZ_G   = int(shape<1>(ScaleTileShape{}));
+  static constexpr int kSZ_St  = int(DispatchPolicy::Stages);
+  // THE GATE IS A TEMPLATE PARAMETER, NOT `!Fused || ...`. A disjunction does not stop the right-hand side from being
+  // INSTANTIATED, and with PPU_SCALE_SWIZZLE on SmemLayoutScale is a ComposedLayout whose stride<> is deleted -- so the
+  // first version of this check failed to compile the swizzle build while claiming to be inert there. `if constexpr` on
+  // a template parameter is the only form that actually discards, which this file already says in as many words about
+  // kPackedScaleOn. The local syntax gate caught it, which is the whole reason that gate exists.
+  template <bool Fused, class L>
+  static constexpr bool sz_layout_is_compact() {
+    if constexpr (!Fused) { return true; }
+    else {
+      return cute::is_static<L>::value &&
+             int(cute::cosize_v<L>) == kSZ_N * kSZ_G * kSZ_St &&
+             int(cute::stride<0>(L{})) == 1 &&
+             int(cute::stride<1>(L{})) == kSZ_N &&
+             int(cute::stride<2>(L{})) == kSZ_N * kSZ_G;
+    }
+  }
+  static_assert(sz_layout_is_compact<kFusedScaleZero, SmemLayoutScale>(),
+                "PPU_PACKED_SCALE_FUSED assumes the compact (n, group, stage) scale layout");
+  // Same discarding requirement for the flattened read view; see above.
+  template <bool Fused, class L>
+  static constexpr bool sz_copy_layout_is_compact() {
+    if constexpr (!Fused) { return true; }
+    else { return int(cute::stride<0>(L{})) == 1 && int(cute::stride<2>(L{})) == kSZ_N; }
+  }
+
+  // The WORD view the decoder stores through: one 32-bit slot per (n, group, stage), stride 1 in n so 32 lanes with
+  // consecutive n write 32 consecutive words and touch all 32 banks once.
+  using SmemLayoutScaleFusedWord = decltype(make_layout(
+      make_shape(Int<kSZ_N>{}, Int<kSZ_G>{}, Int<kSZ_St>{}),
+      make_stride(_1{}, Int<kSZ_N>{}, Int<kSZ_N * kSZ_G>{})));
+  // The HALF views the readers keep using: same shape, every stride doubled. scale is the low half of each word and
+  // zero the high half, so they differ only by the base pointer -- see scale_zero_base() below.
+  using SmemLayoutScaleFusedHalf = decltype(make_layout(
+      make_shape(Int<kSZ_N>{}, Int<kSZ_G>{}, Int<kSZ_St>{}),
+      make_stride(_2{}, Int<2 * kSZ_N>{}, Int<2 * kSZ_N * kSZ_G>{})));
+  // What every scale/zero TENSOR is built on. One name, so the six construction sites cannot disagree.
+  using SmemLayoutScaleSZ = cute::conditional_t<kFusedScaleZero, SmemLayoutScaleFusedHalf, SmemLayoutScale>;
+
   static constexpr auto
   elements_per_smem_scale() {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return 0;
     }
     else if constexpr (ModeHasScales) {
-      return cute::cosize_v<SmemLayoutScale>;
+      // FUSED TAKES BOTH PLANES' ELEMENTS AND THE ZERO TILE GOES TO ZERO, so the total is byte-identical. Written as
+      // 2 * cosize of the UNFUSED layout, not cosize of the fused one: the fused layout's strides are doubled, so its
+      // cosize is 2*cosize - 1 and the final zero slot would fall outside the allocation.
+      return kFusedScaleZero ? 2 * int(cute::cosize_v<SmemLayoutScale>) : int(cute::cosize_v<SmemLayoutScale>);
     }
     else {
       // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
@@ -538,7 +631,7 @@ private:
       return 0;
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      return cute::cosize_v<SmemLayoutScale>;
+      return kFusedScaleZero ? 0 : int(cute::cosize_v<SmemLayoutScale>);   // fused: zero lives in smem_scale's odd halfs
     }
     else {
       // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
@@ -546,7 +639,34 @@ private:
     }
   }
 
+  // THE ONE PLACE THAT KNOWS WHERE THE ZERO PLANE LIVES. Fused, it is the odd half of every 32-bit slot, i.e. the
+  // scale buffer's base plus one element; unfused it is its own array. Three sites build a zero tensor and all three
+  // go through this, because "six tensors, where I had claimed two" is the recorded way this goes wrong.
+  template <class Storage>
+  CUTLASS_DEVICE static NonVoidElementZero*
+  zero_smem_base(Storage& storage) {
+    if constexpr (kFusedScaleZero) {
+      return reinterpret_cast<NonVoidElementZero*>(storage.smem_scale.begin()) + 1;
+    } else {
+      return storage.smem_zero.begin();
+    }
+  }
+
 public:
+  // OBSERVABLE ON PURPOSE. kFusedScaleZero and the layouts it selects sit in the private section because they live
+  // beside KernelConversionMode, which they need. But a flag nobody outside can read is a flag that silently does
+  // nothing, and that is not hypothetical here: PPU_PACKED_SCALE_FUSED shipped to the box in a state where the only
+  // translation unit that used it could not compile, the define was reported as a WARNING nobody's gate checked, the
+  // binary built without it, correctness passed, and acu reported the store conflicts unchanged at 81,920 (+0.00%).
+  // Every observable the bench and the profiler have -- shared bytes, instruction counts, results -- is identical
+  // whether this path is on or off, BY DESIGN, because the change is byte-neutral. So the only way to know is to ask
+  // the type, and dev/fold_derivation/l100_fused_active.cu asks it in a local gate.
+  static constexpr bool is_fused_scale_zero = kFusedScaleZero;
+  static constexpr bool is_packed_scale     = kPackedScaleOn;
+  static constexpr bool has_zero_channel    = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero);
+  using FusedScaleWordLayout = SmemLayoutScaleFusedWord;   // 32-bit slots, stride 1 in n: the conflict-free store
+  using FusedScaleHalfLayout = SmemLayoutScaleSZ;          // what every reader sees; stride 2 in n when fused
+
   struct SharedStorage
   {
     static constexpr int scale_elements = elements_per_smem_scale();
@@ -1183,7 +1303,7 @@ private:
       return cute::tuple{};
     }
     else if constexpr (ModeHasScales) {
-      Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});
+      Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScaleSZ{});
       Tensor gS = get<2>(load_inputs);
       // Construct identity layout for sS
       constexpr static Tensor cS = make_identity_tensor(make_shape(size<0>(sS), size<1>(sS)));
@@ -1243,7 +1363,7 @@ private:
         return cute::make_tuple(tSgS, tSsS, tScS, tSgSp, tSsSp);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor sZ  = make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});
+        Tensor sZ  = make_tensor(make_smem_ptr(zero_smem_base(shared_tensors)), SmemLayoutScaleSZ{});
         Tensor gZ = get<3>(load_inputs);
 
         auto gmem_thr_copy_zero = mainloop_params.gmem_tiled_copy_zero.get_slice(thread_idx);
@@ -1301,7 +1421,7 @@ private:
     if constexpr (ModeHasScales) {
       return cute::cosize_v<decltype(scale_fragment_layout(
           TiledMma{}.get_thread_slice(0),
-          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScale{})))>;
+          make_tensor(make_smem_ptr((NonVoidElementScale*)nullptr), SmemLayoutScaleSZ{})))>;
     } else {
       return 0;
     }
@@ -1387,8 +1507,13 @@ private:
       constexpr int kGrp     = int(Scale_TileK);
       constexpr int kThreads = int(cute::size(TiledMma{}));
       Tensor sRaw = make_tensor(make_smem_ptr(storage.smem_scale_raw.begin()), SmemLayoutScaleRawStaged{});
-      Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()),     SmemLayoutScale{});
-      Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()),      SmemLayoutScale{});
+      Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()),  SmemLayoutScaleSZ{});
+      Tensor sZ   = make_tensor(make_smem_ptr(zero_smem_base(storage)),     SmemLayoutScaleSZ{});
+      // THE FUSED STORE'S OWN VIEW: 32-bit slots, stride 1 in n. Built beside sS/sZ rather than instead of them so
+      // the unfused arm below is byte-identical and the two cannot drift apart.
+      Tensor sSZw = make_tensor(make_smem_ptr(reinterpret_cast<uint32_t*>(storage.smem_scale.begin())),
+                                SmemLayoutScaleFusedWord{});
+      (void)sSZw;
       // ONE THREAD PER COLUMN, AND THAT IS A CORRECTNESS CONSTRAINT, NOT A CHOICE. cp_async_wait is PER THREAD and the
       // __syncthreads that publishes this stage comes AFTER this function, so between the wait and the sync a thread
       // may only read bytes IT ITSELF copied. GmemTiledCopyScalePacked's thread layout is
@@ -1500,8 +1625,19 @@ private:
           // (n, group, stage): SmemLayoutScale's own modes. NOT the read side's flattened (n, 1, stage*SK+g) -- two
           // functions build a tensor called sS with DIFFERENT layouts, and using the wrong one faulted as
           // "TSM out of range" once already.
-          sS(n, cute::Int<G>{}, stage) = sz.scale;
-          if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, stage) = sz.zero;
+          if constexpr (kFusedScaleZero) {
+            // ONE 32-BIT STORE. scale in the low half, zero in the high half -- the order the readers' even/odd views
+            // above assume, and the order a little-endian half2 already has.
+            //
+            // sz.zero IS THE VALUE TO STORE, NOT y2. group_pair_of_words computes half2(d*sc, -dmin*mn) and then adds
+            // `kPackedZMul * scale` to the zero AFTER splitting it (gguf_packed_scale.h, the ZMul arm), which cancels
+            // the int4 converter's own -8. Packing the pre-correction pair back into 32 bits looks like it saves the
+            // split and is simply WRONG -- it drops that cancellation.
+            sSZw(n, cute::Int<G>{}, stage) = cutlass::gguf_packed::pack_h2(sz.scale, sz.zero);
+          } else {
+            sS(n, cute::Int<G>{}, stage) = sz.scale;
+            if constexpr (kPackedHasMin) sZ(n, cute::Int<G>{}, stage) = sz.zero;
+          }
         };
         if constexpr (kSplitGroups) {
           if (thread_idx < kTN)
@@ -1563,8 +1699,19 @@ private:
       // equal only while both carry it.
       using PlainSmemCopyLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{},
           make_shape(shape<0>(ScaleTileShape{}), Int<1>{}, Int<smem_scale_k>{})));
-      using SmemCopyLayoutScale =
+      using UnfusedSmemCopyLayoutScale =
           typename detail::MaybeScaleSwizzle<kScaleSwizzleOk, ScaleSwizzleT, PlainSmemCopyLayoutScale>::type;
+      // THE READ SIDE'S FLATTENED VIEW, FUSED. Same shape (n, 1, stage*Scale_TileK + g), strides doubled, so a reader
+      // written against the unfused layout keeps its code and only walks 4 bytes per element instead of 2. Checked
+      // against the unfused layout rather than assumed, for the reason given at SmemLayoutScaleFusedWord: this is the
+      // SECOND view of the same buffer, and the two going out of step is the documented failure here.
+      static_assert(sz_copy_layout_is_compact<kFusedScaleZero, UnfusedSmemCopyLayoutScale>(),
+                    "PPU_PACKED_SCALE_FUSED assumes the compact flattened scale copy layout");
+      using FusedSmemCopyLayoutScale = decltype(make_layout(
+          make_shape(Int<kSZ_N>{}, Int<1>{}, Int<smem_scale_k>{}),
+          make_stride(_2{}, _0{}, Int<2 * kSZ_N>{})));
+      using SmemCopyLayoutScale =
+          cute::conditional_t<kFusedScaleZero, FusedSmemCopyLayoutScale, UnfusedSmemCopyLayoutScale>;
       Tensor sS   = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemCopyLayoutScale{});
       Tensor tCsS = smem_thr_copy_S.partition_S(sS);
       Tensor tCrS = make_scale_fragment(thr_mma, sS);
@@ -1595,7 +1742,7 @@ private:
         return cute::make_tuple(tCsS, tCrS, sSp, tCcS);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor sZ   = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemCopyLayoutScale{});
+        Tensor sZ   = make_tensor(make_smem_ptr(zero_smem_base(storage)), SmemCopyLayoutScale{});
         Tensor tCsZ = smem_thr_copy_S.partition_S(sZ);
         Tensor tCrZ = make_scale_fragment(thr_mma, sZ);
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ, sSp, tCcS);
@@ -1965,6 +2112,20 @@ private:
       DstArray* dst_array_ptr = reinterpret_cast<DstArray*>(raw_pointer_cast(out(_, ii).data()));
       *dst_array_ptr = Converter::convert(*src_array_ptr);
     }
+  }
+
+
+public:
+  // A PUBLIC FORWARDER FOR THE PUBLICATION STEP, so it can be compiled in isolation and its emitted stores counted.
+  // packed_decode_stage is private and is only ever reached from mma(), which drags in the whole pipeline -- so the
+  // question "does the fused branch actually emit ONE 32-bit shared store" had no local answer, and the flag shipped
+  // to the box in a state where the counter it must move did not move. Byte-neutral changes cannot be seen in any
+  // run (same shared bytes, same results, same instruction mix on every other path), so the only observables left
+  // are the type, which l100_fused_active.cu asserts, and the generated code, which this makes reachable.
+  template <bool On, class Storage>
+  CUTLASS_DEVICE static void probe_packed_decode_stage(Storage& storage, int stage, int thread_idx,
+                                                       int64_t residue_n) {
+    packed_decode_stage<On>(storage, stage, thread_idx, residue_n);
   }
 
 };
