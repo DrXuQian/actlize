@@ -268,17 +268,21 @@ public:
   // 18. Picking a width that does not divide would either drop bytes or read past the unit.
   // ppu.cp.async ACCEPTS 4, 8 OR 16 BYTES AND NOTHING ELSE (cute/arch/copy_ppu.hpp:262), so the width is the largest
   // of those that divides the unit. 16 for Q4_K and Q5_K, 4 for Q2_K's 20 bytes.
-  // COLUMNS PER THREAD, and this is what unblocks the 2-mod-4 units. Q3_K's unit is 14 bytes and Q6_K's 18, so no
-  // permitted cp.async width divides ONE of them -- but two are 28 and 36, both multiples of 4. A thread that copies
-  // a PAIR and decodes that same pair keeps the ownership invariant exactly: between cp_async_wait and the
-  // publishing __syncthreads it reads only bytes it copied itself.
+  // PAIRING IS WITHDRAWN, and the reason is worth keeping because the idea is still right and the implementation
+  // was not. Q3_K's unit is 14 bytes and Q6_K's 18, so no permitted cp.async width divides ONE of them, while two
+  // are 28 and 36. A thread that copies a pair and decodes THAT SAME pair would keep ownership -- the attempt that
+  // broke ownership had a thread copy column 2p and READ 2p+1, which is a different thing.
   //
-  // I recorded this option as breaking ownership and that was wrong. The attempt that broke it had a thread copy
-  // column 2p and READ column 2p+1 -- rowC went to bad=128/4096 -- which is a different thing from owning both.
-  static constexpr int kPackedColsPerThread = (kPackedScaleUnit % 4 == 0) ? 1 : 2;
+  // But make_tiled_copy(atom, (TN/2, 1), (1, 2*unit)) builds a tiler of (TN/2, 2*unit), while the staged tensor
+  // stays logically (TN, unit): nothing recasts the tile into pairs, so thread t still starts at column t while the
+  // decode assumed 2t. Making this work needs the STAGING TENSOR recast to (TN/2, 2*unit) as well, which is a
+  // change to SmemLayoutScaleRawStaged and to every partition of it -- not a thread-layout tweak.
+  static constexpr int kPackedColsPerThread = 1;
   static constexpr int kPackedCopySpan = kPackedColsPerThread * kPackedScaleUnit;
   static_assert(kPackedCopySpan % 4 == 0,
-                "even two columns of this unit are not a multiple of 4 bytes; ppu.cp.async cannot move it");
+                "this format's packed unit is 2 mod 4 bytes (Q3_K 14, Q6_K 18) and ppu.cp.async takes only 4, 8 or "
+                "16. Pairing columns is the right idea and needs the staged tensor recast to (TN/2, 2*unit) as well "
+                "as the thread layout -- see the comment at kPackedColsPerThread");
   static_assert(int(Scale_TileN) % kPackedColsPerThread == 0,
                 "the column tile must divide evenly among the copying threads");
   static constexpr int kPackedCopyBytes = (kPackedCopySpan % 16 == 0) ? 16
@@ -294,7 +298,10 @@ public:
   //     bytes it copied itself, and the paired-column attempt that ignored this took rowC to bad=128/4096;
   //   * give these two formats a non-async loader, which is what the staging tile exists to avoid.
   // Failing at compile time with the reason is the honest state; silently picking an unsupported width was not.
-  static_assert(kPackedCopyBytes != 0, "no permitted cp.async width divides even a pair of these units");
+  static_assert(kPackedCopyBytes != 0,
+                "this format's packed unit is 2 mod 4 bytes (Q3_K 14, Q6_K 18) and ppu.cp.async takes only 4, 8 or "
+                "16. Pairing columns is the right idea and needs the staged tensor recast to (TN/2, 2*unit) too, "
+                "not just the thread layout -- see the comment at kPackedColsPerThread");
   using PackedCopyElem =
       cute::conditional_t<kPackedCopyBytes == 16, cute::uint128_t,
       cute::conditional_t<kPackedCopyBytes == 8,  uint64_t, uint32_t>>;
@@ -1509,9 +1516,13 @@ private:
   static constexpr bool kPackedHasMin    = PackedUnit::kHasMin;
   // 8 cancels the int4 converter's own -8, which this path leaves in place: see group_of's comment for why that is the
   // better of the two ways to reconcile them.
-  // ZMul cancels the CONSUMER converter's own shift, so it is a property of the weight width and not of the
-  // scale format -- int4 emits q-8, hence 8. It stays a literal for that reason.
-  static constexpr int  kPackedZMul      = 8;
+  // ZMul CANCELS THE WEIGHT CONVERTER'S OWN SHIFT, so it follows the weight's element width -- and writing it as a
+  // literal 8 was wrong for exactly the reason I gave for keeping it one. The int4 converter emits q-8, so int4
+  // needs 8; the uint2 converter emits q in [0,3] with NO bias ("the per-group affine 'zero' term absorbs the
+  // offset", fast_numeric_conversion_for_mix_gemm.h at the W2A16 specialisation), so a 2-bit weight needs 0.
+  // Q2_K's weights are 2-bit, so the literal would have shifted every one of them by 8*scale.
+  static constexpr int  kPackedZMul      =
+      (cute::sizeof_bits_v<RealInternalElementB> == 4) ? 8 : 0;
   // ROUNDED UP. Q3_K's unit is 14 bytes and Q6_K's 18, i.e. 3.5 and 4.5 words, and truncating loses the tail --
   // which for Q3_K is groups 12..15 and for Q6_K the last two scales, read as zero. The staging tile is padded to
   // whole words for the same reason, so reading the extra bytes is in-bounds.
