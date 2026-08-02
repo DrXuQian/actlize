@@ -268,9 +268,22 @@ public:
   // 18. Picking a width that does not divide would either drop bytes or read past the unit.
   // ppu.cp.async ACCEPTS 4, 8 OR 16 BYTES AND NOTHING ELSE (cute/arch/copy_ppu.hpp:262), so the width is the largest
   // of those that divides the unit. 16 for Q4_K and Q5_K, 4 for Q2_K's 20 bytes.
-  static constexpr int kPackedCopyBytes = (kPackedScaleUnit % 16 == 0) ? 16
-                                        : (kPackedScaleUnit % 8  == 0) ? 8
-                                        : (kPackedScaleUnit % 4  == 0) ? 4 : 0;
+  // COLUMNS PER THREAD, and this is what unblocks the 2-mod-4 units. Q3_K's unit is 14 bytes and Q6_K's 18, so no
+  // permitted cp.async width divides ONE of them -- but two are 28 and 36, both multiples of 4. A thread that copies
+  // a PAIR and decodes that same pair keeps the ownership invariant exactly: between cp_async_wait and the
+  // publishing __syncthreads it reads only bytes it copied itself.
+  //
+  // I recorded this option as breaking ownership and that was wrong. The attempt that broke it had a thread copy
+  // column 2p and READ column 2p+1 -- rowC went to bad=128/4096 -- which is a different thing from owning both.
+  static constexpr int kPackedColsPerThread = (kPackedScaleUnit % 4 == 0) ? 1 : 2;
+  static constexpr int kPackedCopySpan = kPackedColsPerThread * kPackedScaleUnit;
+  static_assert(kPackedCopySpan % 4 == 0,
+                "even two columns of this unit are not a multiple of 4 bytes; ppu.cp.async cannot move it");
+  static_assert(int(Scale_TileN) % kPackedColsPerThread == 0,
+                "the column tile must divide evenly among the copying threads");
+  static constexpr int kPackedCopyBytes = (kPackedCopySpan % 16 == 0) ? 16
+                                        : (kPackedCopySpan % 8  == 0) ? 8
+                                        : (kPackedCopySpan % 4  == 0) ? 4 : 0;
   // Q3_K's unit is 14 bytes and Q6_K's 18, both 2 mod 4, so NO permitted width divides them and this fires. The
   // three ways out, none of which is a one-line change and all of which have a cost worth stating:
   //   * pad the unit to 16 and 20 -- +2 bytes per (superblock, column), which is +1.8% of a Q3_K block and breaks
@@ -281,17 +294,15 @@ public:
   //     bytes it copied itself, and the paired-column attempt that ignored this took rowC to bad=128/4096;
   //   * give these two formats a non-async loader, which is what the staging tile exists to avoid.
   // Failing at compile time with the reason is the honest state; silently picking an unsupported width was not.
-  static_assert(kPackedCopyBytes != 0,
-                "this format's packed unit is 2 mod 4 bytes (Q3_K 14, Q6_K 18) and ppu.cp.async takes only 4, 8 or "
-                "16 -- see the comment above for the three ways out and what each costs");
+  static_assert(kPackedCopyBytes != 0, "no permitted cp.async width divides even a pair of these units");
   using PackedCopyElem =
       cute::conditional_t<kPackedCopyBytes == 16, cute::uint128_t,
       cute::conditional_t<kPackedCopyBytes == 8,  uint64_t, uint32_t>>;
 
   using GmemTiledCopyScalePacked = decltype(
     make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<PackedCopyElem>, uint8_t>{},
-                    Layout<Shape <Int<Scale_TileN>, _1>>{},          // one thread per column
-                    Layout<Shape <_1, Int<kPackedScaleUnit>>>{}));   // its whole unit, however many ops that takes
+                    Layout<Shape <Int<Scale_TileN / kPackedColsPerThread>, _1>>{},   // one thread per column GROUP
+                    Layout<Shape <_1, Int<kPackedCopySpan>>>{}));    // its whole span, however many ops that takes
   // The staged view, which is what SharedStorage actually holds: stage s starts at s * TN * 16 bytes.
   using SmemLayoutScalePackedStaged =
       Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>, Int<DispatchPolicy::Stages>>,
@@ -827,9 +838,11 @@ public:
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
                     Layout<Shape < _8,_1>>{});
       p.ptr_S = reinterpret_cast<NonVoidElementScale const*>(args.ptr_S);
-      p.gmem_tiled_copy_scale_packed = make_tiled_copy(
-          Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
-          Layout<Shape <Int<Scale_TileN>, _1>>{}, Layout<Shape <_1, Int<kPackedScaleUnit>>>{});
+      // THE SAME TYPE THE MEMBER IS DECLARED AS, not a second construction of it. This line spelled the atom out as
+      // uint128 while GmemTiledCopyScalePacked derived it from the unit, so the moment the unit stopped being 16
+      // bytes the two disagreed -- and the failure surfaced as "TiledCopy uses too few vals" pointing at a copy that
+      // looked correct where it was declared. One relation, one place; the member's own type is that place.
+      p.gmem_tiled_copy_scale_packed = GmemTiledCopyScalePacked{};
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         p.gmem_tiled_copy_zero = make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, NonVoidElementZero>{},
                     Layout<Shape <Scale_GmemCopyThrLayoutH, Scale_GmemCopyThrLayoutW>>{},
@@ -1620,7 +1633,15 @@ private:
 #endif
       constexpr int kHalfG = kGrp / 2;
 
-      for (int n = kSplitGroups ? (thread_idx % kTN) : thread_idx; n < kTN; n += kSplitGroups ? kTN : kThreads) {
+      // ONE THREAD, ITS OWN COLUMNS. With kPackedColsPerThread > 1 the copy gave thread t the span starting at
+      // t * cpt, so t decodes exactly that span -- which is why this is ownership-safe where reading a neighbour's
+      // column was not. At cpt == 1 this is the original loop unchanged.
+      constexpr int kCPT = kPackedColsPerThread;
+      for (int base = (kSplitGroups ? (thread_idx % kTN) : thread_idx) * kCPT; base < kTN;
+           base += (kSplitGroups ? kTN : kThreads) * kCPT)
+      for (int sub = 0; sub < kCPT; ++sub) {
+        int const n = base + sub;
+        if (n >= kTN) break;
         if (n >= residue_n) continue;                        // the same N bound the fp16 path predicates on
         uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n, cute::Int<0>{}, stage));
         uint32_t u[kPackedUnitWords];
