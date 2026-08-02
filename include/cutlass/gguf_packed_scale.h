@@ -59,14 +59,87 @@ CUTLASS_HOST_DEVICE void put_code(uint8_t* unit, int g, int which, int v) {     
 // byte-addressing a register array forces it to local memory. Measured on ppu001, that one mistake made the packed path
 // 70% slower than the fp16 one it replaces (16x64:256 S=4: 34.02 -> 57.83 us) -- the 16 shared loads it saves per k-tile
 // were traded for 64 local ones.
-template <int Bit, int NWords>
+// Bits DEFAULTS TO 6 so every existing call site is unchanged; Q2_K's fields are 4 and Q6_K's are 8, and a mask
+// written as a literal 0x3F would silently truncate the latter and pick up a neighbour's bits for the former.
+template <int Bit, int NWords, int Bits = 6>
 CUTLASS_HOST_DEVICE int code_from_words(uint32_t const (&u)[NWords]) {
   constexpr int w = Bit >> 5, off = Bit & 31;
   static_assert(w < NWords, "the field lies outside the unit");
+  static_assert(Bits > 0 && Bits <= 16, "field widths beyond 16 bits need a second word unconditionally");
   uint32_t v = u[w] >> off;
-  // A 6-bit field straddles a word only when it starts within 5 bits of the top.
-  if constexpr (off > 26 && w + 1 < NWords) v |= u[w + 1] << (32 - off);
-  return int(v & 0x3Fu);
+  // A field straddles a word exactly when it starts within Bits-1 of the top, so the condition follows the width
+  // rather than assuming six.
+  if constexpr (off > 32 - Bits && w + 1 < NWords) v |= u[w + 1] << (32 - off);
+  return int(v & ((1u << Bits) - 1u));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// THE UNIT, GENERALISED. Everything above describes exactly one format; these traits derive the same numbers for all
+// five, and the static_assert at the bottom checks that the general rule REPRODUCES the hand-written Q4_K bit
+// positions -- which is the only evidence worth having that this is a generalisation and not a second scheme.
+//
+// WHY IT LIVES HERE. The mainloop needs it and the mainloop is here; the harness-side header re-exports rather than
+// copying, for the reason the top of this file gives -- one relation, one definition.
+enum class Fmt { Q4K, Q5K, Q2K, Q3K, Q6K };
+
+template <Fmt F> struct UnitTraits;
+//                          groups scale_bits min_bits has_min signed scale_bias
+template <> struct UnitTraits<Fmt::Q4K> { static constexpr int kGroups=8,  kScaleBits=6, kMinBits=6, kScaleBias=0;
+                                          static constexpr bool kHasMin=true,  kSigned=false; };
+template <> struct UnitTraits<Fmt::Q5K> : UnitTraits<Fmt::Q4K> {};        // same scale block as Q4_K
+template <> struct UnitTraits<Fmt::Q2K> { static constexpr int kGroups=16, kScaleBits=4, kMinBits=4, kScaleBias=0;
+                                          static constexpr bool kHasMin=true,  kSigned=false; };
+template <> struct UnitTraits<Fmt::Q3K> { static constexpr int kGroups=16, kScaleBits=6, kMinBits=0, kScaleBias=32;
+                                          static constexpr bool kHasMin=false, kSigned=false; };
+template <> struct UnitTraits<Fmt::Q6K> { static constexpr int kGroups=16, kScaleBits=8, kMinBits=0, kScaleBias=0;
+                                          static constexpr bool kHasMin=false, kSigned=true;  };
+
+// The derived shape. kUnitBytes DIFFERS PER FORMAT -- 16, 16, 20, 14, 18 -- which is exactly what the collective's
+// single 128-bit cp.async assumes away, so the staging tile and its copy must read this rather than a literal.
+template <Fmt F> struct Unit {
+  using T = UnitTraits<F>;
+  static constexpr int  kGroups      = T::kGroups;
+  static constexpr int  kScaleBits   = T::kScaleBits;
+  static constexpr int  kMinBits     = T::kMinBits;
+  static constexpr bool kHasMin      = T::kHasMin;
+  static constexpr bool kSigned      = T::kSigned;
+  static constexpr int  kScaleBias   = T::kScaleBias;
+  static constexpr int  kHeaderBytes = kHasMin ? 4 : 2;                 // d, plus dmin only if there is a min
+  static constexpr int  kCodeBits    = kGroups * (kScaleBits + kMinBits);
+  static constexpr int  kUnitBytes   = kHeaderBytes + kCodeBits / 8;
+  // Fields lie group-major inside a RUN, and each run is self-contained so a k-tile covering part of a superblock
+  // reads a contiguous byte range -- the entire reason the unit is reordered at all.
+  static constexpr int  kRunGroups   = kHasMin ? (kGroups / 2) : kGroups;
+  static constexpr int  kRunBits     = kRunGroups * (kScaleBits + kMinBits);
+  static_assert(kCodeBits % 8 == 0, "the code field must fill whole bytes");
+  static_assert(kRunBits % 8 == 0, "a run must be whole bytes or it is not self-contained in memory");
+  CUTLASS_HOST_DEVICE static constexpr int bit_of(int g, int which) {
+    return kHeaderBytes * 8 + (g / kRunGroups) * kRunBits
+         + (g % kRunGroups) * kScaleBits + which * (kRunGroups * kScaleBits)
+         + (which ? (g % kRunGroups) * (kMinBits - kScaleBits) : 0);
+  }
+};
+
+// THE GENERAL RULE MUST REPRODUCE THE SHIPPED ONE. If this ever fires, the generalisation has invented a different
+// layout and every Q4_K artifact on disk is misread -- which is why it is a compile-time check and not a test.
+static_assert(Unit<Fmt::Q4K>::kUnitBytes == kUnitBytes, "generalised Q4_K unit size differs from the shipped one");
+static_assert(Unit<Fmt::Q4K>::bit_of(0,0) == bit_of(0,0) && Unit<Fmt::Q4K>::bit_of(3,0) == bit_of(3,0) &&
+              Unit<Fmt::Q4K>::bit_of(4,0) == bit_of(4,0) && Unit<Fmt::Q4K>::bit_of(7,0) == bit_of(7,0) &&
+              Unit<Fmt::Q4K>::bit_of(0,1) == bit_of(0,1) && Unit<Fmt::Q4K>::bit_of(3,1) == bit_of(3,1) &&
+              Unit<Fmt::Q4K>::bit_of(4,1) == bit_of(4,1) && Unit<Fmt::Q4K>::bit_of(7,1) == bit_of(7,1),
+              "generalised Q4_K bit positions differ from the shipped ones");
+
+// A field is at most 8 bits, so two bytes always suffice -- and the second is read ONLY when the field straddles,
+// because reading it unconditionally runs off the end of the unit for the last field of the last run (Q4_K's ends at
+// bit 122 of 16 bytes; Q6_K's byte-aligned scales put the last at byte 17 of 18).
+template <Fmt F>
+CUTLASS_HOST_DEVICE int code_of_fmt(uint8_t const* unit, int g, int which) {
+  int const bit = Unit<F>::bit_of(g, which);
+  int const bits = which ? Unit<F>::kMinBits : Unit<F>::kScaleBits;
+  int const off = bit & 7;
+  uint32_t w = uint32_t(unit[bit >> 3]);
+  if (off + bits > 8) w |= uint32_t(unit[(bit >> 3) + 1]) << 8;
+  return int((w >> off) & ((1u << bits) - 1u));
 }
 
 struct GroupScale {
@@ -274,11 +347,17 @@ CUTLASS_HOST_DEVICE GroupScale group_pair_of_words(uint32_t const (&u)[NWords], 
 }
 
 // The per-group part only: the two codes and the two products, with d/dmin handed in.
-template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, int NWords>
+//
+// F DEFAULTS TO Q4K so every existing call is unchanged, and every bit position and field width now comes from
+// Unit<F> rather than from the hand-written Q4_K bit_of. Passing G >= 8 to the old form computed a Q4_K position for
+// a group that format does not have, which is what the 16-group formats hit as "the field lies outside the unit".
+template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, Fmt F = Fmt::Q4K, int NWords>
 CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords], UnitHead const h) {
   GroupScale out;
-  out.scale = h.d * int_to_half_small(code_from_words<bit_of(G, 0)>(u) - ScaleBias);
-  if constexpr (HasMin) out.zero = -(h.dmin * int_to_half_small(code_from_words<bit_of(G, 1)>(u)));
+  out.scale = h.d * int_to_half_small(
+      code_from_words<Unit<F>::bit_of(G, 0), NWords, Unit<F>::kScaleBits>(u) - ScaleBias);
+  if constexpr (HasMin)
+    out.zero = -(h.dmin * int_to_half_small(code_from_words<Unit<F>::bit_of(G, 1), NWords, Unit<F>::kMinBits>(u)));
   else                  out.zero = half_t(0.f);
   if constexpr (ZMul != 0) out.zero = out.zero + half_t(float(ZMul)) * out.scale;
   return out;
@@ -286,14 +365,15 @@ CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords], UnitH
 
 // The same dequant as group_of, from REGISTERS. G is a template parameter because that is what makes every bit position
 // a constant; d and dmin are the unit's first four bytes, i.e. the low and high halves of word 0 (little endian).
-template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, int NWords>
+template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, Fmt F = Fmt::Q4K, int NWords>
 CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords]) {
   GroupScale out;
   half_t const d = half_t::bitcast(uint16_t(u[0] & 0xFFFFu));
-  out.scale = d * int_to_half_small(code_from_words<bit_of(G, 0)>(u) - ScaleBias);
+  out.scale = d * int_to_half_small(
+      code_from_words<Unit<F>::bit_of(G, 0), NWords, Unit<F>::kScaleBits>(u) - ScaleBias);
   if constexpr (HasMin) {
     half_t const dmin = half_t::bitcast(uint16_t(u[0] >> 16));
-    out.zero = -(dmin * int_to_half_small(code_from_words<bit_of(G, 1)>(u)));
+    out.zero = -(dmin * int_to_half_small(code_from_words<Unit<F>::bit_of(G, 1), NWords, Unit<F>::kMinBits>(u)));
   } else {
     out.zero = half_t(0.f);
   }

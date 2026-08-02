@@ -209,7 +209,14 @@ public:
   //     touches 8 CONSECUTIVE columns, so re-run l94 when the warp shape changes.
   //   * TileK=64 must stay on the fp16 path: 2 groups per tile would read 10 B, i.e. 5.0 B per (group, column), worse
   //     than fp16's 4.0. TileK >= 128 wins (2.5 B) and TileK == 256 is the best case (2.0 B).
-  static constexpr int kPackedScaleUnit = 16;                       // bytes per (superblock, column) for Q4_K
+  // Bytes per (superblock, column). Derived, and it is 16 only for Q4_K and Q5_K.
+  static constexpr int kPackedScaleUnit = cutlass::gguf_packed::Unit<
+#if defined(PPU_PACKED_FORMAT)
+      cutlass::gguf_packed::Fmt(PPU_PACKED_FORMAT)
+#else
+      cutlass::gguf_packed::Fmt::Q4K
+#endif
+      >::kUnitBytes;
   using SmemLayoutScalePacked = Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>>,
                                        Stride<Int<kPackedScaleUnit>, _1>>;
   // APPLICABILITY, NOT A REQUIREMENT. smem delta = TN*Stages*(16 - 4*Scale_TileK): strictly negative only for
@@ -221,9 +228,26 @@ public:
   // covers both the smem win and the load cadence. A static_assert would be wrong here: the splitk bench generates 11
   // differently-shaped units into ONE binary, so a requirement fails the whole build instead of letting the other shapes
   // keep the fp16 path. Same mistake the PPU_SCALE_PREFETCH assert made earlier in this work.
+  // THE FORMAT, AND EVERY CONSTANT DERIVED FROM IT. PPU_PACKED_FORMAT selects one of cutlass::gguf_packed::Fmt and
+  // defaults to Q4_K, so a build that does not set it is byte-identical to what shipped. Before this the six numbers
+  // below were literals -- 16 bytes per unit, Scale_TileK == 8, bias 0, has-min, ZMul 8, four 32-bit words -- and
+  // schemes.py recorded the consequence: Q2_K is single-plane so the SHAPE fits and none of the constants did.
+  //
+  // The unit SIZE genuinely differs per format (16, 16, 20, 14, 18), which is what the single 128-bit cp.async
+  // assumes away, so kPackedUnitWords is derived and the staging layout reads it rather than a literal.
+#if defined(PPU_PACKED_FORMAT)
+  static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt(PPU_PACKED_FORMAT);
+#else
+  static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt::Q4K;
+#endif
+  using PackedUnit = cutlass::gguf_packed::Unit<kPackedFmt>;
+
+  // Scale_TileK is the number of GROUPS a k-tile covers, and one unit carries a whole superblock's worth -- so the
+  // applicability test is "the k-tile is exactly one superblock", which for Q4_K means 8 and for the 16-group
+  // formats means 16. It was written as == 8, which is the same condition only for Q4_K.
   static constexpr bool kPackedScaleOn =
 #if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
-      (int(Scale_TileK) == 8);
+      (int(Scale_TileK) == PackedUnit::kGroups);
 #else
       false;
 #endif
@@ -237,11 +261,37 @@ public:
       Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>, Int<DispatchPolicy::Stages>>,
              Stride<Int<kPackedScaleUnit>, _1, Int<Scale_TileN * kPackedScaleUnit>>>;
 
+  // THE TRANSFER WIDTH FOLLOWS THE UNIT, which is the last thing here that assumed Q4_K. A single uint128 per column
+  // is right only for the 16-byte formats; Q2_K's unit is 20 bytes, Q3_K's 14 and Q6_K's 18, and none is a multiple
+  // of 16. The atom is the largest power-of-two width that DIVIDES the unit, so the copy stays whole-element and the
+  // thread still moves its entire unit -- one uint128 for 16, five uint32 for 20, seven and nine uint16 for 14 and
+  // 18. Picking a width that does not divide would either drop bytes or read past the unit.
+  // ppu.cp.async ACCEPTS 4, 8 OR 16 BYTES AND NOTHING ELSE (cute/arch/copy_ppu.hpp:262), so the width is the largest
+  // of those that divides the unit. 16 for Q4_K and Q5_K, 4 for Q2_K's 20 bytes.
+  static constexpr int kPackedCopyBytes = (kPackedScaleUnit % 16 == 0) ? 16
+                                        : (kPackedScaleUnit % 8  == 0) ? 8
+                                        : (kPackedScaleUnit % 4  == 0) ? 4 : 0;
+  // Q3_K's unit is 14 bytes and Q6_K's 18, both 2 mod 4, so NO permitted width divides them and this fires. The
+  // three ways out, none of which is a one-line change and all of which have a cost worth stating:
+  //   * pad the unit to 16 and 20 -- +2 bytes per (superblock, column), which is +1.8% of a Q3_K block and breaks
+  //     the byte-neutrality that licenses this whole path;
+  //   * have one thread copy a RUN of columns whose total is a multiple of 4 -- two columns give 28 and 36 bytes,
+  //     both fine -- which changes the thread-to-column map and therefore the OWNERSHIP invariant that
+  //     packed_decode_stage rests on: between cp_async_wait and the publishing __syncthreads a thread may only read
+  //     bytes it copied itself, and the paired-column attempt that ignored this took rowC to bad=128/4096;
+  //   * give these two formats a non-async loader, which is what the staging tile exists to avoid.
+  // Failing at compile time with the reason is the honest state; silently picking an unsupported width was not.
+  static_assert(kPackedCopyBytes != 0,
+                "this format's packed unit is 2 mod 4 bytes (Q3_K 14, Q6_K 18) and ppu.cp.async takes only 4, 8 or "
+                "16 -- see the comment above for the three ways out and what each costs");
+  using PackedCopyElem =
+      cute::conditional_t<kPackedCopyBytes == 16, cute::uint128_t,
+      cute::conditional_t<kPackedCopyBytes == 8,  uint64_t, uint32_t>>;
+
   using GmemTiledCopyScalePacked = decltype(
-    make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, uint8_t>{},
+    make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<PackedCopyElem>, uint8_t>{},
                     Layout<Shape <Int<Scale_TileN>, _1>>{},          // one thread per column
-                    Layout<Shape <_1, Int<kPackedScaleUnit>>>{}));   // its whole 16 B unit
-  static_assert(kPackedScaleUnit * 8 == 128, "the packed unit must be exactly one uint128 cp.async per column");
+                    Layout<Shape <_1, Int<kPackedScaleUnit>>>{}));   // its whole unit, however many ops that takes
   // The staged view, which is what SharedStorage actually holds: stage s starts at s * TN * 16 bytes.
   using SmemLayoutScalePackedStaged =
       Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>, Int<DispatchPolicy::Stages>>,
@@ -1442,12 +1492,17 @@ private:
   static constexpr int kPackedSlots = 2;
   // Q4_K for now: unsigned codes with no centre, and a min channel. Q3_K would be <32, false> and Q6_K
   // <0, false>; they are template parameters of group_of precisely so no second decode is written.
-  static constexpr int  kPackedScaleBias = 0;
-  static constexpr bool kPackedHasMin    = true;
+  static constexpr int  kPackedScaleBias = PackedUnit::kScaleBias;
+  static constexpr bool kPackedHasMin    = PackedUnit::kHasMin;
   // 8 cancels the int4 converter's own -8, which this path leaves in place: see group_of's comment for why that is the
   // better of the two ways to reconcile them.
+  // ZMul cancels the CONSUMER converter's own shift, so it is a property of the weight width and not of the
+  // scale format -- int4 emits q-8, hence 8. It stays a literal for that reason.
   static constexpr int  kPackedZMul      = 8;
-  static constexpr int kPackedUnitWords = kPackedScaleUnit / 4;
+  // ROUNDED UP. Q3_K's unit is 14 bytes and Q6_K's 18, i.e. 3.5 and 4.5 words, and truncating loses the tail --
+  // which for Q3_K is groups 12..15 and for Q6_K the last two scales, read as zero. The staging tile is padded to
+  // whole words for the same reason, so reading the extra bytes is in-bounds.
+  static constexpr int kPackedUnitWords = (kPackedScaleUnit + 3) / 4;
 
   // THE PACKED (f16x2) PER-GROUP DECODE, which needs both fields to pack against each other and the 6-bit unsigned
   // extraction code_pair_from_words performs. Q4_K is the only format with a min, so this is exactly Q4_K today; the
@@ -1464,7 +1519,11 @@ private:
 #if defined(PPU_PACKED_PAIR) && (PPU_PACKED_PAIR == 0)
   static constexpr bool kPackedPairFast = false;
 #else
-  static constexpr bool kPackedPairFast = kPackedHasMin && (kPackedScaleBias == 0);
+  // AND SIX-BIT FIELDS. The pair path folds the field width into kMagic1152x2, so Q2_K (4 bits) and Q6_K
+  // (8 bits) must take the scalar arm -- which they would otherwise enter, since Q2_K has a min and a zero
+  // bias and satisfies the old condition exactly.
+  static constexpr bool kPackedPairFast = kPackedHasMin && (kPackedScaleBias == 0)
+                                      && (PackedUnit::kScaleBits == 6) && (PackedUnit::kMinBits == 6);
 #endif
 
 
@@ -1566,7 +1625,23 @@ private:
         uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n, cute::Int<0>{}, stage));
         uint32_t u[kPackedUnitWords];
         CUTLASS_PRAGMA_UNROLL
-        for (int w = 0; w < kPackedUnitWords; ++w) u[w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
+        // THE LAST WORD MAY BE PARTIAL. With a unit that is not a multiple of four bytes the final read would run
+        // past it, so the tail is assembled byte by byte -- the bytes beyond the unit are never referenced by any
+        // field, and reading them would be out of bounds on the last column of the tile.
+        CUTLASS_PRAGMA_UNROLL
+        for (int w = 0; w < kPackedUnitWords; ++w) {
+          if constexpr (kPackedScaleUnit % 4 == 0) {
+            u[w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
+          } else {
+            uint32_t acc = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int b = 0; b < 4; ++b) {
+              int const idx = 4 * w + b;
+              if (idx < kPackedScaleUnit) acc |= uint32_t(unit[idx]) << (8 * b);
+            }
+            u[w] = acc;
+          }
+        }
         // half2(d, -dmin) for the whole column: one xor, hoisted out of the group loop. Replaces head_of_words'
         // two bitcasts AND the per-group negate of the min term.
         uint32_t const m2 = cutlass::gguf_packed::mul2_of_words(u);
@@ -1620,7 +1695,7 @@ private:
             // thread's OWN column, so it is independent of the constraint above.
             sz = cutlass::gguf_packed::group_pair_of_words<G, kPackedZMul, kPackedScaleBias>(u, m2);
           } else {
-            sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul>(u, h);
+            sz = cutlass::gguf_packed::group_of_words<G, kPackedScaleBias, kPackedHasMin, kPackedZMul, kPackedFmt>(u, h);
           }
           // (n, group, stage): SmemLayoutScale's own modes. NOT the read side's flattened (n, 1, stage*SK+g) -- two
           // functions build a tensor called sS with DIFFERENT layouts, and using the wrong one faulted as
