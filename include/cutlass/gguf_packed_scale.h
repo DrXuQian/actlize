@@ -113,10 +113,25 @@ template <Fmt F> struct Unit {
   static constexpr int  kRunBits     = kRunGroups * (kScaleBits + kMinBits);
   static_assert(kCodeBits % 8 == 0, "the code field must fill whole bytes");
   static_assert(kRunBits % 8 == 0, "a run must be whole bytes or it is not self-contained in memory");
+
+  // CUTE OWNS THE FIELD ADDRESS. Scale and min have different strides within a run, so keep one truthful layout per
+  // field and pass the selected layout to field_bit_of. This is the device-side twin of the offline packed-unit
+  // writer's layouts; activating a new format must not introduce a second hand-expanded run/field bit formula.
+  using RunShape = cute::Shape<cute::Int<kRunGroups>, cute::Int<kGroups / kRunGroups>>;
+  using ScaleBitLayout = cute::Layout<RunShape,
+                                      cute::Stride<cute::Int<kScaleBits>, cute::Int<kRunBits>>>;
+  using MinBitLayout = cute::Layout<RunShape,
+                                    cute::Stride<cute::Int<kMinBits>, cute::Int<kRunBits>>>;
+
+  template <class BitLayout>
+  CUTLASS_HOST_DEVICE static constexpr int field_bit_of(int g, BitLayout const& layout) {
+    return int(layout(g % kRunGroups, g / kRunGroups));
+  }
+
   CUTLASS_HOST_DEVICE static constexpr int bit_of(int g, int which) {
-    return kHeaderBytes * 8 + (g / kRunGroups) * kRunBits
-         + (g % kRunGroups) * kScaleBits + which * (kRunGroups * kScaleBits)
-         + (which ? (g % kRunGroups) * (kMinBits - kScaleBits) : 0);
+    return kHeaderBytes * 8 + (which
+        ? kRunGroups * kScaleBits + field_bit_of(g, MinBitLayout{})
+        : field_bit_of(g, ScaleBitLayout{}));
   }
 };
 
