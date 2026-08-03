@@ -324,6 +324,61 @@ struct MixGemmNumericArrayConverter
 {
 };
 
+// Device-pass fact exported for a runtime box probe. The host and device passes intentionally see different values:
+// a kernel writes this to memory so test_ppu_f16x2_probe can prove that hgcc selected the PPU instruction arm.
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100)
+#  define CUTLASS_MIX_GEMM_BYTE4_TO_HALF_PPU_ASM 1
+#else
+#  define CUTLASS_MIX_GEMM_BYTE4_TO_HALF_PPU_ASM 0
+#endif
+
+// Four byte lanes -> four fp16 values. The byte selectors and exponent bias live here because both mixed-input
+// GEMM and native-GGUF SIMT decode need the same operation; keeping a GEMV-private prmt copy made the two paths
+// independently mutable. Bias is a VALUE convention: 0 converts ordinary unsigned bytes, while 128 preserves the
+// historical biased-int8 converter below. Interleave preserves that converter's (0,2,1,3) emission; false emits
+// ordinary adjacent pairs for callers whose packed word already follows logical element order.
+template <int Bias, bool Interleave = true>
+struct MixGemmByte4ToHalf {
+    using result_type = Array<half_t, 4>;
+    static_assert(Bias >= 0 && Bias <= 255, "byte4 bias must fit the source lane");
+
+    CUTLASS_DEVICE
+    static result_type convert(uint32_t bytes)
+    {
+        result_type result;
+        uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+        static constexpr uint32_t kMaskForPair0 = Interleave ? 0x5250u : 0x5150u;
+        static constexpr uint32_t kMaskForPair1 = Interleave ? 0x5351u : 0x5352u;
+
+#if CUTLASS_MIX_GEMM_BYTE4_TO_HALF_PPU_ASM
+        static constexpr uint32_t kStartByteForFp16 = 0x64646464u;
+        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n"
+                     : "=r"(h[0]) : "r"(bytes), "n"(kStartByteForFp16), "n"(kMaskForPair0));
+        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n"
+                     : "=r"(h[1]) : "r"(bytes), "n"(kStartByteForFp16), "n"(kMaskForPair1));
+
+        static constexpr uint32_t kHalfOffset = 0x6400u + uint32_t(Bias); // fp16(1024 + Bias), exact
+        static constexpr uint32_t kOffset = kHalfOffset | (kHalfOffset << 16);
+        asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(kOffset));
+        asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(kOffset));
+#elif defined(__CUDA_ARCH__)
+        static constexpr uint32_t kStartByteForFp16 = 0x64646464u;
+        h[0] = __byte_perm(bytes, kStartByteForFp16, kMaskForPair0);
+        h[1] = __byte_perm(bytes, kStartByteForFp16, kMaskForPair1);
+        half2 const offset = __float2half2_rn(float(1024 + Bias));
+        reinterpret_cast<half2*>(h)[0] = __hsub2(reinterpret_cast<half2*>(h)[0], offset);
+        reinterpret_cast<half2*>(h)[1] = __hsub2(reinterpret_cast<half2*>(h)[1], offset);
+#else
+        // Keep the reference arm in the selected emission order so it witnesses the object the device returns.
+        result[0] = half_t(float(int((bytes      ) & 0xffu) - Bias));
+        result[1] = half_t(float(int((bytes >> (Interleave ? 16 : 8)) & 0xffu) - Bias));
+        result[2] = half_t(float(int((bytes >> (Interleave ? 8 : 16)) & 0xffu) - Bias));
+        result[3] = half_t(float(int((bytes >> 24) & 0xffu) - Bias));
+#endif
+        return result;
+    }
+};
+
 template <>
 struct MixGemmNumericArrayConverter<half_t, int8_t, 4>
 {
@@ -333,23 +388,27 @@ struct MixGemmNumericArrayConverter<half_t, int8_t, 4>
     CUTLASS_DEVICE
     static result_type convert(source_type const& source)
     {
-        result_type result;
-
-        uint32_t* h = reinterpret_cast<uint32_t*>(&result);
         uint32_t const i8s = reinterpret_cast<uint32_t const&>(source);
+        return MixGemmByte4ToHalf<128>::convert(i8s);
+    }
 
-        static constexpr uint32_t mask_for_elt_01 = 0x5250;
-        static constexpr uint32_t mask_for_elt_23 = 0x5351;
-        static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
-        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
-        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
+    CUTLASS_DEVICE
+    result_type operator()(source_type const& s)
+    {
+        return convert(s);
+    }
+};
 
-        // Lastly, we subtract 1152 from our constructed number using fp16 math to get our signed integer as fp16.
-        static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
-        asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
-        asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I8s_TO_F16s_MAGIC_NUM));
+template <>
+struct MixGemmNumericArrayConverter<half_t, uint8_t, 4>
+{
+    using result_type = Array<half_t, 4>;
+    using source_type = Array<uint8_t, 4>;
 
-        return result;
+    CUTLASS_DEVICE
+    static result_type convert(source_type const& source)
+    {
+        return MixGemmByte4ToHalf<0, false>::convert(reinterpret_cast<uint32_t const&>(source));
     }
 
     CUTLASS_DEVICE
