@@ -312,20 +312,33 @@ public:
   static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt::Q4K;
 #endif
   using PackedUnit = cutlass::gguf_packed::Unit<kPackedFmt>;
-  static constexpr int kPackedScaleUnit = PackedUnit::kUnitBytes;
+  static constexpr int kPackedSbBytes = PackedUnit::kSbBytes;
+  static constexpr int kPackedSbPerUnit = PackedUnit::kSbPerUnit;
+  static constexpr int kPackedScaleUnit = PackedUnit::kUnitTotal;
   static constexpr bool kPackedFormatMatchesPlanes =
       (kPackedFmt == cutlass::gguf_packed::Fmt::Q5K && kLowBits == 4 && kHiBits == 1) ||
       (kPackedFmt == cutlass::gguf_packed::Fmt::Q3K && kLowBits == 2 && kHiBits == 1) ||
       (kPackedFmt == cutlass::gguf_packed::Fmt::Q6K && kLowBits == 4 && kHiBits == 2);
+  static constexpr bool kPackedTileDividesSb = PackedUnit::kGroups % int(Scale_TileK) == 0;
   static constexpr bool kPackedScaleOn =
 #if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
-      kPackedFormatMatchesPlanes && (int(Scale_TileK) == PackedUnit::kGroups);
+      kPackedFormatMatchesPlanes && kPackedTileDividesSb;
 #else
       false;
 #endif
 
-  // Q5 is one legal 16-byte cp.async per column. The trait-derived form is retained here because Q3/Q6 will reuse
-  // this exact plumbing once their 14/18-byte superblocks are recast as paired 28/36-byte staging units.
+  // A copyable unit owns one or two complete superblocks of ONE column. Q3 consumes one 256-K tile per superblock;
+  // Q6 deliberately retains its validated 128-K weight tactic and therefore consumes two tiles per superblock.
+  // These are derived delivery counts, not raw tactic coordinates: the pair index and the sub-range decoded from it
+  // follow from (groups in a superblock, groups in this tile, superblocks in a copyable unit).
+  static_assert(!kPackedFormatMatchesPlanes || kPackedTileDividesSb,
+                "a packed k-tile must cover an integral group run inside its superblock");
+  static constexpr int kPackedTilesPerSb = kPackedTileDividesSb ? PackedUnit::kGroups / int(Scale_TileK) : 1;
+  static constexpr int kPackedTilesPerUnit = kPackedSbPerUnit * kPackedTilesPerSb;
+
+  // Q5 is one legal 16-byte cp.async per column; Q3/Q6 are seven/nine 4-byte copies of their byte-neutral 28/36-byte
+  // paired units. The value layout keeps every copy owned by the same thread/column, so the pre-publication decode
+  // never reads a neighbour's cp.async transaction.
   static_assert(!kPackedScaleOn || (kPackedScaleUnit % 4 == 0),
                 "the selected two-plane packed unit must divide into legal 4/8/16-byte cp.async transfers");
   static constexpr int kPackedCopyBytes = (kPackedScaleUnit % 16 == 0) ? 16
@@ -562,6 +575,10 @@ public:
   int64_t scale_residue_k = 0;
   bool scale_valid = true;
   bool scale_valid_pk = true;
+  // Per-thread pipeline state for the unit that THIS thread copied into each stage. The decoder runs before the CTA
+  // publication barrier, so retaining the tile-within-unit coordinate locally preserves the same-thread ownership
+  // guarantee as the raw bytes themselves.
+  int packed_tile_in_unit[DispatchPolicy::Stages] = {};
   //
   // Methods
   //
@@ -667,14 +684,15 @@ public:
       // init scale_residue_n
       scale_residue_n = N - size<0>(gB) * n_coord;
 
-      // [nsb,N,unit] packed metadata, kept in the tuple even for an off instantiation so macro selection does not
-      // change the function's deduced return type. Plane 2 remains the final tuple member by contract.
-      int const nsb_ = scale_k / int(Scale_TileK);
+      // [copyable-unit,N,bytes] packed metadata, kept in the tuple even for an off instantiation so macro selection
+      // does not change the function's deduced return type. Plane 2 remains the final tuple member by contract.
+      int const packed_tiles_ = scale_k / int(Scale_TileK);
+      int const packed_units_ = packed_tiles_ / kPackedTilesPerUnit;
       Tensor mSp = make_tensor(make_gmem_ptr(reinterpret_cast<uint8_t const*>(mainloop_params.ptr_S)),
-                               make_shape(N, Int<kPackedScaleUnit>{}, nsb_, L),
+                               make_shape(N, Int<kPackedScaleUnit>{}, packed_units_, L),
                                make_stride(Int<kPackedScaleUnit>{}, _1{},
                                            Int<kPackedScaleUnit>{} * N,
-                                           Int<kPackedScaleUnit>{} * N * nsb_));
+                                           Int<kPackedScaleUnit>{} * N * packed_units_));
       Tensor gSp = local_tile(mSp(_,_,_,l_coord), Shape<Int<Scale_TileN>, Int<kPackedScaleUnit>>{},
                               make_coord(n_coord, 0, _));
 
@@ -933,7 +951,8 @@ public:
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
       cp_async_wait<DispatchPolicy::Stages-2>();
-      packed_decode_stage<kPackedScaleOn>(storage, smem_pipe_read, thread_idx, scale_residue_n);
+      packed_decode_stage<kPackedScaleOn>(storage, smem_pipe_read, packed_tile_in_unit[smem_pipe_read],
+                                          thread_idx, scale_residue_n);
       __syncthreads();
       // Prefetch the first rmem from the first k-tile
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
@@ -966,7 +985,8 @@ public:
 
           // Commit the smem for smem_pipe_read
           cp_async_wait<DispatchPolicy::Stages-2>();
-          packed_decode_stage<kPackedScaleOn>(storage, smem_pipe_read, thread_idx, scale_residue_n);
+          packed_decode_stage<kPackedScaleOn>(storage, smem_pipe_read, packed_tile_in_unit[smem_pipe_read],
+                                              thread_idx, scale_residue_n);
           __syncthreads();
         }
 
@@ -1174,11 +1194,12 @@ private:
           (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) ? 5 : 3;
       // per-column path
       if constexpr(DispatchPolicy::StaticGroupSize == -1) {
-        if constexpr (kPackedScaleOn)
+        if constexpr (kPackedScaleOn) {
+          packed_tile_in_unit[write_stage] = 0;
           copy(mainloop_params.gmem_tiled_copy_scale_packed,
                get<kPkG>(extra_input_partitions)(_,_,_,0),
                get<kPkG + 1>(extra_input_partitions)(_,_,_,write_stage));
-        else
+        } else
           copy(mainloop_params.gmem_tiled_copy_scale, tSgS(_,_,_,0), tSsS(_,_,_,write_stage));
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && !kPackedScaleOn) {
           auto tZgZ = get<3>(extra_input_partitions);
@@ -1199,11 +1220,12 @@ private:
         }
         if ((kPackedScaleOn ? scale_valid_pk : scale_valid) &&
             (scale_load_k * Scale_TileK < scale_residue_k)) {
-          if constexpr (kPackedScaleOn)
+          if constexpr (kPackedScaleOn) {
+            packed_tile_in_unit[write_stage] = scale_load_k % kPackedTilesPerUnit;
             copy(mainloop_params.gmem_tiled_copy_scale_packed,
-                 get<kPkG>(extra_input_partitions)(_,_,_,scale_load_k),
+                 get<kPkG>(extra_input_partitions)(_,_,_,scale_load_k / kPackedTilesPerUnit),
                  get<kPkG + 1>(extra_input_partitions)(_,_,_,write_stage));
-          else
+          } else
             copy(mainloop_params.gmem_tiled_copy_scale,
                  tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && !kPackedScaleOn) {
@@ -1333,43 +1355,57 @@ private:
   // PACKED UNIT -> THE EXISTING FP16 SHARED PLANES. The code/min bit positions and arithmetic are the same actlize
   // gguf_packed helpers the single-plane collective calls; this collective adds only transport/publication around
   // its mandatory second B plane. One thread decodes the exact column it copied, after cp_async_wait and before the
-  // publishing CTA barrier.
-  static constexpr int kPackedUnitWords = (kPackedScaleUnit + 3) / 4;
+  // publishing CTA barrier. A paired staging unit is split only AFTER it lands; each branch below reconstructs the
+  // selected superblock's own word array, so Q3's second 14-byte share need not begin on a 32-bit boundary.
+  static constexpr int kPackedUnitWords = (kPackedSbBytes + 3) / 4;
+  // The two-plane converter's emitted integer and the GGUF code's centre are separate facts:
+  // Q5 emits q-8 for an uncentred q; Q3 emits q for q-4; Q6 emits q-8 for q-32.
   static constexpr int kPackedZMul =
-      (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero && kLowBits == 4) ? 8 : 0;
+      kPackedFmt == cutlass::gguf_packed::Fmt::Q5K ? 8 :
+      kPackedFmt == cutlass::gguf_packed::Fmt::Q3K ? -4 :
+      kPackedFmt == cutlass::gguf_packed::Fmt::Q6K ? -24 : 0;
+  static_assert(!kPackedScaleOn || KernelConversionMode == ConversionMode::ConvertAndScaleWithZero,
+                "two-plane packed formats publish their code-centre correction through the zero plane");
 
   template <bool On, class Storage>
   CUTLASS_DEVICE static void
-  packed_decode_stage(Storage& storage, int stage, int thread_idx, int64_t residue_n) {
+  packed_decode_stage(Storage& storage, int stage, int tile_in_unit, int thread_idx, int64_t residue_n) {
     if constexpr (On) {
       if (thread_idx >= int(Scale_TileN) || thread_idx >= residue_n) return;
       Tensor sRaw = make_tensor(make_smem_ptr(storage.smem_scale_raw.begin()), SmemLayoutScaleRawStaged{});
       Tensor sS = make_tensor(make_smem_ptr(storage.smem_scale.begin()), SmemLayoutScale{});
       Tensor sZ = make_tensor(make_smem_ptr(storage.smem_zero.begin()), SmemLayoutScale{});
-      uint8_t const* unit = reinterpret_cast<uint8_t const*>(
+      uint8_t const* paired = reinterpret_cast<uint8_t const*>(
           &sRaw(thread_idx, cute::Int<0>{}, stage));
-      uint32_t words[kPackedUnitWords];
-      CUTLASS_PRAGMA_UNROLL
-      for (int w = 0; w < kPackedUnitWords; ++w) {
-        if constexpr (kPackedScaleUnit % 4 == 0) {
-          words[w] = *reinterpret_cast<uint32_t const*>(unit + 4 * w);
-        } else {
-          uint32_t tail = 0;
+      // The tile coordinate is runtime pipeline state, while group bit positions must remain compile-time constants.
+      // Enumerating the at-most-four positions gives both: one branch executes, and every selected group is a template
+      // argument to the same shared decoder used by the single-plane collective.
+      for_each(make_int_sequence<kPackedTilesPerUnit>{}, [&](auto tile_) {
+        constexpr int Tile = decltype(tile_)::value;
+        if (tile_in_unit != Tile) return;
+        constexpr int Sb = Tile / kPackedTilesPerSb;
+        constexpr int GroupBase = (Tile % kPackedTilesPerSb) * int(Scale_TileK);
+        uint8_t const* unit = paired + Sb * kPackedSbBytes;
+        uint32_t words[kPackedUnitWords];
+        CUTLASS_PRAGMA_UNROLL
+        for (int w = 0; w < kPackedUnitWords; ++w) {
+          uint32_t word = 0;
           CUTLASS_PRAGMA_UNROLL
           for (int b = 0; b < 4; ++b) {
             int const idx = 4 * w + b;
-            if (idx < kPackedScaleUnit) tail |= uint32_t(unit[idx]) << (8 * b);
+            if (idx < kPackedSbBytes) word |= uint32_t(unit[idx]) << (8 * b);
           }
-          words[w] = tail;
+          words[w] = word;
         }
-      }
-      auto const head = cutlass::gguf_packed::head_of_words(words);
-      for_each(make_int_sequence<PackedUnit::kGroups>{}, [&](auto g_) {
-        constexpr int G = decltype(g_)::value;
-        auto const sz = cutlass::gguf_packed::group_of_words<
-            G, PackedUnit::kScaleBias, PackedUnit::kHasMin, kPackedZMul, kPackedFmt>(words, head);
-        sS(thread_idx, cute::Int<G>{}, stage) = sz.scale;
-        if constexpr (PackedUnit::kHasMin) sZ(thread_idx, cute::Int<G>{}, stage) = sz.zero;
+        auto const head = cutlass::gguf_packed::head_of_words(words);
+        for_each(make_int_sequence<int(Scale_TileK)>{}, [&](auto g_) {
+          constexpr int G = decltype(g_)::value;
+          constexpr int UnitG = GroupBase + G;
+          auto const sz = cutlass::gguf_packed::group_of_words<
+              UnitG, PackedUnit::kScaleBias, PackedUnit::kHasMin, kPackedZMul, kPackedFmt>(words, head);
+          sS(thread_idx, cute::Int<G>{}, stage) = sz.scale;
+          sZ(thread_idx, cute::Int<G>{}, stage) = sz.zero;
+        });
       });
     }
   }

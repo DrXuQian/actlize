@@ -209,14 +209,19 @@ public:
   //     touches 8 CONSECUTIVE columns, so re-run l94 when the warp shape changes.
   //   * TileK=64 must stay on the fp16 path: 2 groups per tile would read 10 B, i.e. 5.0 B per (group, column), worse
   //     than fp16's 4.0. TileK >= 128 wins (2.5 B) and TileK == 256 is the best case (2.0 B).
-  // Bytes per (superblock, column). Derived, and it is 16 only for Q4_K and Q5_K.
-  static constexpr int kPackedScaleUnit = cutlass::gguf_packed::Unit<
 #if defined(PPU_PACKED_FORMAT)
-      cutlass::gguf_packed::Fmt(PPU_PACKED_FORMAT)
+  static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt(PPU_PACKED_FORMAT);
 #else
-      cutlass::gguf_packed::Fmt::Q4K
+  static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt::Q4K;
 #endif
-      >::kUnitBytes;
+  using PackedUnit = cutlass::gguf_packed::Unit<kPackedFmt>;
+  // This collective has ONE weight plane. A format selector for Q3/Q5/Q6 must therefore leave every instantiation
+  // here on fp16 metadata even when its low plane happens to have the same bit width as Q2/Q4. Besides preventing a
+  // scale-pointer reinterpretation, the type-level match gives inactive formats a harmless legal staging type.
+  static constexpr bool kPackedFormatMatchesElement =
+      (kPackedFmt == cutlass::gguf_packed::Fmt::Q4K && std::is_same_v<ElementB, cutlass::int4b_t>) ||
+      (kPackedFmt == cutlass::gguf_packed::Fmt::Q2K && std::is_same_v<ElementB, cutlass::uint2b_t>);
+  static constexpr int kPackedScaleUnit = kPackedFormatMatchesElement ? PackedUnit::kUnitBytes : 16;
   using SmemLayoutScalePacked = Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>>,
                                        Stride<Int<kPackedScaleUnit>, _1>>;
   // APPLICABILITY, NOT A REQUIREMENT. smem delta = TN*Stages*(16 - 4*Scale_TileK): strictly negative only for
@@ -233,21 +238,14 @@ public:
   // below were literals -- 16 bytes per unit, Scale_TileK == 8, bias 0, has-min, ZMul 8, four 32-bit words -- and
   // schemes.py recorded the consequence: Q2_K is single-plane so the SHAPE fits and none of the constants did.
   //
-  // The unit SIZE genuinely differs per format (16, 16, 20, 14, 18), which is what the single 128-bit cp.async
-  // assumes away, so kPackedUnitWords is derived and the staging layout reads it rather than a literal.
-#if defined(PPU_PACKED_FORMAT)
-  static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt(PPU_PACKED_FORMAT);
-#else
-  static constexpr cutlass::gguf_packed::Fmt kPackedFmt = cutlass::gguf_packed::Fmt::Q4K;
-#endif
-  using PackedUnit = cutlass::gguf_packed::Unit<kPackedFmt>;
-
+  // The selected trait's unit size genuinely differs per format. Only Q4/Q2 can activate this one-plane collective;
+  // a two-plane selector keeps an inert legal 16-byte staging type here and is consumed by the other collective.
   // Scale_TileK is the number of GROUPS a k-tile covers, and one unit carries a whole superblock's worth -- so the
   // applicability test is "the k-tile is exactly one superblock", which for Q4_K means 8 and for the 16-group
   // formats means 16. It was written as == 8, which is the same condition only for Q4_K.
   static constexpr bool kPackedScaleOn =
 #if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
-      (int(Scale_TileK) == PackedUnit::kGroups);
+      kPackedFormatMatchesElement && (int(Scale_TileK) == PackedUnit::kGroups);
 #else
       false;
 #endif
@@ -261,47 +259,22 @@ public:
       Layout<Shape <Int<Scale_TileN>, Int<kPackedScaleUnit>, Int<DispatchPolicy::Stages>>,
              Stride<Int<kPackedScaleUnit>, _1, Int<Scale_TileN * kPackedScaleUnit>>>;
 
-  // THE TRANSFER WIDTH FOLLOWS THE UNIT, which is the last thing here that assumed Q4_K. A single uint128 per column
-  // is right only for the 16-byte formats; Q2_K's unit is 20 bytes, Q3_K's 14 and Q6_K's 18, and none is a multiple
-  // of 16. The atom is the largest power-of-two width that DIVIDES the unit, so the copy stays whole-element and the
-  // thread still moves its entire unit -- one uint128 for 16, five uint32 for 20, seven and nine uint16 for 14 and
-  // 18. Picking a width that does not divide would either drop bytes or read past the unit.
+  // THE TRANSFER WIDTH FOLLOWS THE ACTIVE UNIT. A single uint128 per column is right for Q4; Q2's 20-byte unit is
+  // five uint32 copies. Picking a width that does not divide would either drop bytes or read past the unit.
   // ppu.cp.async ACCEPTS 4, 8 OR 16 BYTES AND NOTHING ELSE (cute/arch/copy_ppu.hpp:262), so the width is the largest
-  // of those that divides the unit. 16 for Q4_K and Q5_K, 4 for Q2_K's 20 bytes.
-  // PAIRING IS WITHDRAWN, and the reason is worth keeping because the idea is still right and the implementation
-  // was not. Q3_K's unit is 14 bytes and Q6_K's 18, so no permitted cp.async width divides ONE of them, while two
-  // are 28 and 36. A thread that copies a pair and decodes THAT SAME pair would keep ownership -- the attempt that
-  // broke ownership had a thread copy column 2p and READ 2p+1, which is a different thing.
-  //
-  // But make_tiled_copy(atom, (TN/2, 1), (1, 2*unit)) builds a tiler of (TN/2, 2*unit), while the staged tensor
-  // stays logically (TN, unit): nothing recasts the tile into pairs, so thread t still starts at column t while the
-  // decode assumed 2t. Making this work needs the STAGING TENSOR recast to (TN/2, 2*unit) as well, which is a
-  // change to SmemLayoutScaleRawStaged and to every partition of it -- not a thread-layout tweak.
+  // of those that divides the unit: 16 for Q4_K and 4 for Q2_K. Q3/Q6's paired 28/36-byte transport lives in the
+  // two-plane collective that owns their weight shapes, not in this file.
   static constexpr int kPackedColsPerThread = 1;
   static constexpr int kPackedCopySpan = kPackedColsPerThread * kPackedScaleUnit;
   static_assert(kPackedCopySpan % 4 == 0,
-                "this format's packed unit is 2 mod 4 bytes (Q3_K 14, Q6_K 18) and ppu.cp.async takes only 4, 8 or "
-                "16. Pairing columns is the right idea and needs the staged tensor recast to (TN/2, 2*unit) as well "
-                "as the thread layout -- see the comment at kPackedColsPerThread");
+                "an active single-plane packed unit must divide into legal ppu.cp.async transfers");
   static_assert(int(Scale_TileN) % kPackedColsPerThread == 0,
                 "the column tile must divide evenly among the copying threads");
   static constexpr int kPackedCopyBytes = (kPackedCopySpan % 16 == 0) ? 16
                                         : (kPackedCopySpan % 8  == 0) ? 8
                                         : (kPackedCopySpan % 4  == 0) ? 4 : 0;
-  // Q3_K's unit is 14 bytes and Q6_K's 18, both 2 mod 4, so NO permitted width divides them and this fires. The
-  // three ways out, none of which is a one-line change and all of which have a cost worth stating:
-  //   * pad the unit to 16 and 20 -- +2 bytes per (superblock, column), which is +1.8% of a Q3_K block and breaks
-  //     the byte-neutrality that licenses this whole path;
-  //   * have one thread copy a RUN of columns whose total is a multiple of 4 -- two columns give 28 and 36 bytes,
-  //     both fine -- which changes the thread-to-column map and therefore the OWNERSHIP invariant that
-  //     packed_decode_stage rests on: between cp_async_wait and the publishing __syncthreads a thread may only read
-  //     bytes it copied itself, and the paired-column attempt that ignored this took rowC to bad=128/4096;
-  //   * give these two formats a non-async loader, which is what the staging tile exists to avoid.
-  // Failing at compile time with the reason is the honest state; silently picking an unsupported width was not.
   static_assert(kPackedCopyBytes != 0,
-                "this format's packed unit is 2 mod 4 bytes (Q3_K 14, Q6_K 18) and ppu.cp.async takes only 4, 8 or "
-                "16. Pairing columns is the right idea and needs the staged tensor recast to (TN/2, 2*unit) too, "
-                "not just the thread layout -- see the comment at kPackedColsPerThread");
+                "an active single-plane packed unit must divide into 4, 8 or 16-byte ppu.cp.async transfers");
   using PackedCopyElem =
       cute::conditional_t<kPackedCopyBytes == 16, cute::uint128_t,
       cute::conditional_t<kPackedCopyBytes == 8,  uint64_t, uint32_t>>;

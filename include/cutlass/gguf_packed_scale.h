@@ -94,8 +94,9 @@ template <> struct UnitTraits<Fmt::Q3K> { static constexpr int kGroups=16, kScal
 template <> struct UnitTraits<Fmt::Q6K> { static constexpr int kGroups=16, kScaleBits=8, kMinBits=0, kScaleBias=0;
                                           static constexpr bool kHasMin=false, kSigned=true;  };
 
-// The derived shape. kUnitBytes DIFFERS PER FORMAT -- 16, 16, 20, 14, 18 -- which is exactly what the collective's
-// single 128-bit cp.async assumes away, so the staging tile and its copy must read this rather than a literal.
+// The derived shape. kUnitBytes is one superblock's metadata share and DIFFERS PER FORMAT -- 16, 16, 20, 14, 18.
+// A copyable unit pairs two consecutive superblocks of the SAME column when that share is 2 mod 4; this keeps the
+// stored bytes neutral and preserves thread/column ownership while satisfying ppu.cp.async's 4-byte minimum.
 template <Fmt F> struct Unit {
   using T = UnitTraits<F>;
   static constexpr int  kGroups      = T::kGroups;
@@ -107,6 +108,9 @@ template <Fmt F> struct Unit {
   static constexpr int  kHeaderBytes = kHasMin ? 4 : 2;                 // d, plus dmin only if there is a min
   static constexpr int  kCodeBits    = kGroups * (kScaleBits + kMinBits);
   static constexpr int  kUnitBytes   = kHeaderBytes + kCodeBits / 8;
+  static constexpr int  kSbBytes     = kUnitBytes;
+  static constexpr int  kSbPerUnit   = (kSbBytes % 4 == 0) ? 1 : 2;
+  static constexpr int  kUnitTotal   = kSbPerUnit * kSbBytes;
   // Fields lie group-major inside a RUN, and each run is self-contained so a k-tile covering part of a superblock
   // reads a contiguous byte range -- the entire reason the unit is reordered at all.
   static constexpr int  kRunGroups   = kHasMin ? (kGroups / 2) : kGroups;
@@ -138,6 +142,9 @@ template <Fmt F> struct Unit {
 // THE GENERAL RULE MUST REPRODUCE THE SHIPPED ONE. If this ever fires, the generalisation has invented a different
 // layout and every Q4_K artifact on disk is misread -- which is why it is a compile-time check and not a test.
 static_assert(Unit<Fmt::Q4K>::kUnitBytes == kUnitBytes, "generalised Q4_K unit size differs from the shipped one");
+static_assert(Unit<Fmt::Q5K>::kUnitTotal == 16 && Unit<Fmt::Q2K>::kUnitTotal == 20 &&
+              Unit<Fmt::Q3K>::kUnitTotal == 28 && Unit<Fmt::Q6K>::kUnitTotal == 36,
+              "copyable packed units must remain byte-neutral 16/20/28/36-byte metadata records");
 static_assert(Unit<Fmt::Q4K>::bit_of(0,0) == bit_of(0,0) && Unit<Fmt::Q4K>::bit_of(3,0) == bit_of(3,0) &&
               Unit<Fmt::Q4K>::bit_of(4,0) == bit_of(4,0) && Unit<Fmt::Q4K>::bit_of(7,0) == bit_of(7,0) &&
               Unit<Fmt::Q4K>::bit_of(0,1) == bit_of(0,1) && Unit<Fmt::Q4K>::bit_of(3,1) == bit_of(3,1) &&
@@ -369,8 +376,12 @@ CUTLASS_HOST_DEVICE GroupScale group_pair_of_words(uint32_t const (&u)[NWords], 
 template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, Fmt F = Fmt::Q4K, int NWords>
 CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords], UnitHead const h) {
   GroupScale out;
-  out.scale = h.d * int_to_half_small(
-      code_from_words<Unit<F>::bit_of(G, 0), NWords, Unit<F>::kScaleBits>(u) - ScaleBias);
+  int sc = code_from_words<Unit<F>::bit_of(G, 0), NWords, Unit<F>::kScaleBits>(u);
+  if constexpr (Unit<F>::kSigned) {
+    constexpr int kSign = 1 << (Unit<F>::kScaleBits - 1);
+    if (sc & kSign) sc -= 1 << Unit<F>::kScaleBits;
+  }
+  out.scale = h.d * int_to_half_small(sc - ScaleBias);
   if constexpr (HasMin)
     out.zero = -(h.dmin * int_to_half_small(code_from_words<Unit<F>::bit_of(G, 1), NWords, Unit<F>::kMinBits>(u)));
   else                  out.zero = half_t(0.f);
@@ -384,8 +395,12 @@ template <int G, int ScaleBias = 0, bool HasMin = true, int ZMul = 0, Fmt F = Fm
 CUTLASS_HOST_DEVICE GroupScale group_of_words(uint32_t const (&u)[NWords]) {
   GroupScale out;
   half_t const d = half_t::bitcast(uint16_t(u[0] & 0xFFFFu));
-  out.scale = d * int_to_half_small(
-      code_from_words<Unit<F>::bit_of(G, 0), NWords, Unit<F>::kScaleBits>(u) - ScaleBias);
+  int sc = code_from_words<Unit<F>::bit_of(G, 0), NWords, Unit<F>::kScaleBits>(u);
+  if constexpr (Unit<F>::kSigned) {
+    constexpr int kSign = 1 << (Unit<F>::kScaleBits - 1);
+    if (sc & kSign) sc -= 1 << Unit<F>::kScaleBits;
+  }
+  out.scale = d * int_to_half_small(sc - ScaleBias);
   if constexpr (HasMin) {
     half_t const dmin = half_t::bitcast(uint16_t(u[0] >> 16));
     out.zero = -(dmin * int_to_half_small(code_from_words<Unit<F>::bit_of(G, 1), NWords, Unit<F>::kMinBits>(u)));
