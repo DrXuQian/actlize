@@ -1656,7 +1656,6 @@ private:
         if (n >= residue_n) continue;                        // the same N bound the fp16 path predicates on
         uint8_t const* unit = reinterpret_cast<uint8_t const*>(&sRaw(n, cute::Int<0>{}, stage));
         uint32_t u[kPackedUnitWords];
-        CUTLASS_PRAGMA_UNROLL
         // THE LAST WORD MAY BE PARTIAL. With a unit that is not a multiple of four bytes the final read would run
         // past it, so the tail is assembled byte by byte -- the bytes beyond the unit are never referenced by any
         // field, and reading them would be out of bounds on the last column of the tile.
