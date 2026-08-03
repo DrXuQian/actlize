@@ -726,9 +726,21 @@ public:
   // nothing, and that is not hypothetical here: PPU_PACKED_SCALE_FUSED shipped to the box in a state where the only
   // translation unit that used it could not compile, the define was reported as a WARNING nobody's gate checked, the
   // binary built without it, correctness passed, and acu reported the store conflicts unchanged at 81,920 (+0.00%).
-  // Every observable the bench and the profiler have -- shared bytes, instruction counts, results -- is identical
-  // whether this path is on or off, BY DESIGN, because the change is byte-neutral. So the only way to know is to ask
-  // the type, and dev/fold_derivation/l100_fused_active.cu asks it in a local gate.
+  //
+  // CORRECTION, and it matters because the wrong version of this sentence closed off the one probe that works.
+  // This used to read "every observable the bench and the profiler have -- shared bytes, instruction counts,
+  // results -- is identical whether this path is on or off, BY DESIGN". Shared BYTES and RESULTS are identical, and
+  // the read side is untouched. The STORE INSTRUCTION COUNT IS NOT: the publication below emits ONE uint32_t
+  // assignment where the unfused branch emits two half assignments, so at this launch's
+  //     4 warps x 8 groups x 9 publications x 128 CTAs = 36,864
+  // shared-store instructions disappear. acu's `Shared Store / Inst` is therefore a valid machine-code probe --
+  // ~84,480 -> ~47,616 -- and reading only `Bank Conflicts` is what made the previous round look undecidable.
+  // (A backend is still free to lower the 32-bit store into two 16-bit ones. That is exactly what the Inst count
+  // detects, and it is why the count is the probe rather than the source.)
+  //
+  // What the type-level gate is still for: dev/fold_derivation/l100_fused_active.cu answers "is this path selected
+  // for THIS configuration" without a device, which no counter can do, and it is what proves a null result is a
+  // real null rather than an inactive path.
   static constexpr bool is_fused_scale_zero = kFusedScaleZero;
   static constexpr bool is_packed_scale     = kPackedScaleOn;
   static constexpr bool has_zero_channel    = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero);
