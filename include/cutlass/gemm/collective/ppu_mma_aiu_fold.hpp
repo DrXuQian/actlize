@@ -368,6 +368,10 @@ private:
   }
 
 public:
+  // The compact plain-copy A path currently lives in the ordinary one-plane collective. Expose zero explicitly so
+  // launchers can distinguish "macro present" from "this selected collective actually compacted A".
+  static constexpr int compact_a_rows = 0;
+
   struct SharedStorage
   {
     static constexpr int scale_elements = elements_per_smem_scale();

@@ -311,15 +311,23 @@ public:
   // using InternalElementB = cute::conditional_t<!SwapAB, ConvertedElementB, ConvertedElementA>;
 
   using RealInternalElementA = cute::conditional_t<!SwapAB, ElementA, ElementB>;
-  // PPU_A_CPASYNC: A's own gmem->smem copy, one row, plain cp.async instead of the AIU.
+  // PPU_A_CPASYNC: A's own gmem->smem copy, a compile-time number of real rows, plain cp.async instead of the AIU.
+  // The macro's VALUE is the row capacity: the historical `PPU_A_CPASYNC=1` remains the one-row decode path, while
+  // values 2 and 4 make the same mechanism available to the small-M sweep without allocating all TileM rows.
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+  static constexpr int kACompactRows = PPU_A_CPASYNC;
+#else
+  static constexpr int kACompactRows = 0;
+#endif
   //
   // The AIU/swzl pair cannot deliver a one-row A tile: l82 replays the read's simulator and shows the 16 rows come
   // from vreg_row_idx = (v/2)*8 + lane/4 + coord_h, the instruction's lane/vreg structure, with m16n16 in the
   // mnemonic. There is no stride operand to zero -- the asm takes only (base, coord_h, CUBE_H, channel offset) --
   // and CUBE_H scales the SLICE stride, so shrinking it aliases 360 of 512 reads instead of collapsing rows.
   //
-  // A plain cp.async has none of that: cute computes the address from the layout, so a stride-0 M mode genuinely
-  // aliases and one row is enough. Atom and the thread_idx % n slicing are copied from GmemTiledCopyScale, which
+  // A plain cp.async has none of that: cute computes the address from the layout. The compact layout keeps the first
+  // kACompactRows distinct and aliases every padding row modulo that capacity, so all MMA rows remain readable while
+  // only the real prefix is loaded. Atom and the thread_idx % n slicing are copied from GmemTiledCopyScale, which
   // already moves a small operand this way in this same collective and rides the same cp_async_fence.
   // PPU_A_PACK geometry, all read off fold_derivation/l84-l86 rather than derived here:
   //   row 0 of a 16x64 fp16 cube occupies 4 runs of 16 halfs at half-offsets {0, 288, 528, 816}
@@ -440,12 +448,21 @@ public:
   // grouped kernel -- and the instruction is ...padz..., so at one row per expert the AIU already fetches exactly
   // one row per k-tile and zero-fills the rest of the cube.
 #if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
-  // Stride 0 on M: cosize_v drops from TileM*TileK*Stages to TileK*Stages, so SharedStorage allocates ONE row.
-  // Legal here and not under the AIU because every A access on this path is a plain copy, which takes its address
-  // from this layout. Sound only at Mmax == 1; launch() enforces that.
+  static_assert(kACompactRows > 0, "PPU_A_CPASYNC's value is its positive A-row capacity");
+  static_assert(kACompactRows <= int(shape<0>(TileShape{})),
+                "PPU_A_CPASYNC row capacity cannot exceed TileM");
+  static_assert(int(shape<0>(TileShape{})) % kACompactRows == 0,
+                "PPU_A_CPASYNC row capacity must divide TileM so padding rows alias exactly");
+  // Keep rows [0,kACompactRows) distinct and alias every later MMA row modulo that prefix. The hierarchical M mode
+  // has logical size TileM but physical strides (TK,0), so cosize_v is kACompactRows*TileK*Stages. At runtime only
+  // min(M-residue,kACompactRows) rows are copied; the remaining physical rows are zeroed and all logical padding
+  // rows still address valid shared memory.
   using SmemLayoutA = decltype(make_layout(
-      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
-      make_stride(_0{}, _1{}, shape<2>(TileShape{}))));
+      make_shape(make_shape(Int<kACompactRows>{},
+                            Int<int(shape<0>(TileShape{})) / kACompactRows>{}),
+                 shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
+      make_stride(make_stride(shape<2>(TileShape{}), _0{}),
+                  _1{}, Int<kACompactRows * int(shape<2>(TileShape{}))>{})));
   // A compact twin, never allocated, used only to shape the mma fragment: partition_fragment_A on the stride-0
   // layout would inherit the zero and allocate fewer registers than the mma reads.
   using SmemLayoutAFrag = decltype(tile_to_shape(
@@ -717,6 +734,9 @@ public:
   static constexpr bool is_fused_scale_zero = kFusedScaleZero;
   static constexpr bool is_packed_scale     = kPackedScaleOn;
   static constexpr bool has_zero_channel    = (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero);
+  // Type-level witness for launchers and sweep inventory. Zero means this collective uses the ordinary TileM-row
+  // AIU A tile; positive values are the maximum real M accepted by the compact plain-copy path.
+  static constexpr int compact_a_rows       = kACompactRows;
   using FusedScaleWordLayout = SmemLayoutScaleFusedWord;   // 32-bit slots, stride 1 in n: the conflict-free store
   using FusedScaleHalfLayout = SmemLayoutScaleSZ;          // what every reader sees; stride 2 in n when fused
 
@@ -792,6 +812,7 @@ public:
   GmemTiledCopyB gmem_tiled_copy_B;
   int64_t scale_residue_n = 0;
   int64_t scale_residue_k = 0;
+  int a_residue_m = 0;
   bool scale_valid = true;
   // THE PACKED COPY NEEDS ITS OWN N PREDICATE. scale_valid is derived from the fp16 copy's coordinate, whose
   // thread -> N map is 8*(p % 16) for a (16,8) x (_8,_1) layout, while the packed copy is partitioned ONE COLUMN PER
@@ -859,6 +880,14 @@ public:
     // Separate out problem shape for convenience
     auto [M,N,K,L] = problem_shape_MNKL;
     auto [m_coord, n_coord, _, l_coord] = blk_coord_mnkl;
+
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+    // Number of real rows in this CTA's compact A prefix. Grouped problems pass the per-expert M here, so ragged
+    // experts shorter than the build's row capacity are predicated independently. The launcher refuses Mmax above
+    // kACompactRows; the clamp also makes the last dense tile correct if this path is reused with several M tiles.
+    int const a_left = int(M) - int(m_coord) * int(shape<0>(TileShape{}));
+    a_residue_m = a_left <= 0 ? 0 : (a_left < kACompactRows ? a_left : kACompactRows);
+#endif
 
     // A init
     using TilerA = typename GmemTiledCopyA::Tiler_MN;
@@ -989,12 +1018,21 @@ public:
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
 
 #if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
-    // ROW 0 ONLY. sA's M stride is 0, so row 0 IS the single physical row and every other m index aliases onto it.
-    // thread_idx % kACpThreads mirrors the scale copy's slicing; the guard keeps the surplus threads out instead of
-    // having them re-issue the same cp.async, which is what the scale path settles for.
+    // One K-row copy partition reused for each compact M row. thread_idx % kACpThreads mirrors the scale copy's
+    // slicing; the guard keeps surplus threads out instead of having them re-issue the same cp.async.
     auto a_cp_thr = GmemTiledCopyACp{}.get_slice(thread_idx % kACpThreads);
-    Tensor tAgA = a_cp_thr.partition_S(gA(Int<0>{},_,_));                      // (ACPY,ACPY_K,k)
-    Tensor tAsA = a_cp_thr.partition_D(sA(Int<0>{},_,_));                      // (ACPY,ACPY_K,PIPE)
+    auto copy_A_compact = [&] (int k_tile, int pipe) {
+      for_each(make_int_sequence<kACompactRows>{}, [&] (auto row) {
+        Tensor tAgA_row = a_cp_thr.partition_S(gA(row,_,_));                    // (ACPY,ACPY_K,k)
+        Tensor tAsA_row = a_cp_thr.partition_D(sA(row,_,_));                    // (ACPY,ACPY_K,PIPE)
+        if (thread_idx < kACpThreads) {
+          if (int(row) < a_residue_m)
+            copy(GmemTiledCopyACp{}, tAgA_row(_,_,k_tile), tAsA_row(_,_,pipe));
+          else
+            clear(tAsA_row(_,_,pipe));   // padding fragments may be discarded, but their reads must be finite/in-bounds
+        }
+      });
+    };
 #else
     Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
@@ -1011,7 +1049,7 @@ public:
       copy_A_packed_row0(gA, storage.smem_a.begin(), *k_tile_iter, k_pipe, thread_idx);
 #elif defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
       copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,k_pipe), warp_idx);
-      if (thread_idx < kACpThreads) copy(GmemTiledCopyACp{}, tAgA(_,_,*k_tile_iter), tAsA(_,_,k_pipe));
+      copy_A_compact(*k_tile_iter, k_pipe);
 #else
       copy_aiu(
         gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
@@ -1076,9 +1114,9 @@ public:
     auto thr_mma_s8 = tiled_mma_s8.get_thread_slice(thread_idx);
 
 #if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
-    // Plain vectorised copy, addressed from sA's layout -- so the stride-0 M mode aliases and every m slot of the
-    // fragment gets row 0. Sliced per thread (not per warp-group like the AIU atom) because this one is a normal
-    // load, and partition_S takes the PLAIN sA, not a mix tensor.
+    // Plain vectorised copy, addressed from sA's layout: the first kACompactRows fragment rows remain distinct and
+    // later padding rows alias that prefix. Sliced per thread (not per warp-group like the AIU atom) because this is
+    // a normal load, and partition_S takes the PLAIN sA, not a mix tensor.
     auto smem_tiled_copy_A = make_tiled_copy_A(
         Copy_Atom<DefaultCopy, RealInternalElementA>{}, tiled_mma);   // DefaultCopy: width from the layouts, no
                                                                      // alignment assumed -- a per-thread offset
@@ -1212,8 +1250,7 @@ public:
           copy_A_packed_row0(gA, storage.smem_a.begin(), *k_tile_iter, smem_pipe_write, thread_idx);
 #elif defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
           copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write), warp_idx);
-          if (thread_idx < kACpThreads)
-            copy(GmemTiledCopyACp{}, tAgA(_,_,*k_tile_iter), tAsA(_,_,smem_pipe_write));
+          copy_A_compact(*k_tile_iter, smem_pipe_write);
 #else
           copy_aiu(
             gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),

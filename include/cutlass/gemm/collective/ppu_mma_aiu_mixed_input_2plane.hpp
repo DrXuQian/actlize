@@ -511,6 +511,8 @@ private:
 public:
   // Type-level witness used by the dense/grouped launchers: packed bytes must never silently enter the fp16 path.
   static constexpr bool is_packed_scale = kPackedScaleOn;
+  // The compact plain-copy A path currently lives in the ordinary one-plane collective.
+  static constexpr int compact_a_rows = 0;
 
   struct SharedStorage
   {
