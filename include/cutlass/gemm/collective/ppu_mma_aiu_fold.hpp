@@ -181,6 +181,15 @@ public:
 
   constexpr static int Scale_TileN = shape<0>(ScaleTileShape{});
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
+  // partition_extra_inputs selects this copy with thread_idx modulo the copy's thread slots. If the copy asks for
+  // more slots than TiledMma launches, the missing slots are not diagnosed by CuTe: their scale groups are simply
+  // never loaded. Keep this as a public type witness as well as an assertion so both operator launchers bind the
+  // coverage invariant when they bind the instantiated mainloop.
+  constexpr static int Scale_NumThreads = size(TiledMma{});
+  constexpr static int Scale_CopyThreadSlots = (Scale_TileN / 8) * Scale_TileK;
+  constexpr static bool scale_copy_thread_coverage = Scale_CopyThreadSlots <= Scale_NumThreads;
+  static_assert(scale_copy_thread_coverage,
+                "scale copy asks for more thread slots than the CTA has -- the modulo slice would silently truncate it");
   using Scale_GmemCopyThrLayoutH = Int<Scale_TileN / 8>;
   using Scale_GmemCopyThrLayoutW = Int<Scale_TileK>;
   using GmemTiledCopyScale = decltype(

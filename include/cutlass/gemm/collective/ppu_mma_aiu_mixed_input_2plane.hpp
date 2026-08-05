@@ -250,6 +250,9 @@ public:
   constexpr static int Scale_ElemsPerThr = Scale_TileN / Scale_ThrH;
   // (j3) thread_idx -> thread slot, with the duplication explicit. Slots <= Scale_NumThreads is enforced above.
   constexpr static int Scale_Slots = Scale_ThrH * Scale_TileK;
+  constexpr static bool scale_copy_thread_coverage = Scale_Slots <= Scale_NumThreads;
+  static_assert(scale_copy_thread_coverage,
+      "scale copy coverage witness must remain true after capping its thread layout");
   using ScaleThrDupL = cute::Layout<cute::Shape <cute::Int<Scale_Slots>,
                                                  cute::Int<(Scale_NumThreads + Scale_Slots - 1) / Scale_Slots>>,
                                     cute::Stride<cute::_1, cute::_0>>;
