@@ -66,6 +66,7 @@
 
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "cutlass/gemm/collective/detail/ppu_mixed_metadata_policy.hpp"
+#include "cutlass/gemm/collective/detail/ppu_mixed_pipeline.hpp"
 #include "cutlass/detail/collective.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -174,6 +175,7 @@ public:
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
   using MetadataPolicy = detail::MixedMetadataPolicy<ElementScale, Scale_TileK,
       !cute::is_void_v<ElementZero>, detail::FlatMetadataAddress>;
+  using PipelineDriver = detail::MixedPipelineDriver;
   // partition_extra_inputs selects this copy with thread_idx modulo the copy's thread slots. If the copy asks for
   // more slots than TiledMma launches, the missing slots are not diagnosed by CuTe: their scale groups are simply
   // never loaded. Keep this as a public type witness as well as an assertion so both operator launchers bind the
@@ -678,14 +680,6 @@ public:
     // PIPELINED MAIN LOOP
     //
 
-    // Current pipe index in smem to read from
-    int smem_pipe_read  = 0;
-    // Current pipe index in smem to write to
-    int smem_pipe_write = DispatchPolicy::Stages-1;
-
-    Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
-    Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
-
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrB_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrB_mma) / size<2>(tCrB_copy_view);
@@ -710,80 +704,33 @@ public:
         "PPU_B_CHUNK: the delivery's 128 outputs must split evenly into K_ATOM_PER_COPY chunks");
     Tensor tCrB_one = make_fragment_like(tCrB_mma(_,_,Int<0>{}));
 
-    // PREFETCH register pipeline
-    if (K_BLOCK_MAX > 1) {
-      // Wait until our first prefetched tile is loaded in
-      cp_async_wait<DispatchPolicy::Stages-2>();
-      __syncthreads();
-      // Prefetch the first rmem from the first k-tile
+    int initial_read_stage = 0;
+    Tensor tCsA_p = tCsA(_,_,_,initial_read_stage);
+    Tensor tCsB_p = tCsB(_,_,_,initial_read_stage);
+    auto bind_read = [&] (int stage) {
+      tCsA_p = tCsA(_,_,_,stage);
+      tCsB_p = tCsB(_,_,_,stage);
+    };
+    auto publish = [] (int) {};
+    auto prepare = [&] (auto k_block, int read_stage, auto) {
       copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
-          partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read);
-      copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
-if constexpr (!kBChunk) {
-      transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, 0, K_ATOM_PER_COPY,
-          copy_partitions_extra_info, smem_pipe_read);
+          partitioned_extra_info, copy_partitions_extra_info, k_block, read_stage);
+      copy(smem_tiled_copy_A, tCsA_p(_,_,k_block), tCrA_copy_view(_,_,k_block));
+      if constexpr (!kBChunk) {
+        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block,
+            K_ATOM_PER_COPY, copy_partitions_extra_info, read_stage);
       }
-    }
-
-    CUTLASS_PRAGMA_NO_UNROLL
-    for ( ; k_tile_count > -(DispatchPolicy::Stages-1); --k_tile_count)
-    {
-      // Pipeline the outer products with a static for loop.
-      //
-      // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
-      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block)
-      {
-        if (k_block == K_BLOCK_MAX - 1)
-        {
-          // Slice the smem_pipe_read smem
-          tCsA_p = tCsA(_,_,_,smem_pipe_read);
-          tCsB_p = tCsB(_,_,_,smem_pipe_read);
-
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
-          __syncthreads();
-        }
-
-        // THE STAGE THE CONSUMED DATA BELONGS TO, captured BEFORE smem_pipe_read advances below. The scale reload
-        // must use this, not the post-advance value: with K_BLOCK_MAX == 1 the
-        //   if (k_block == K_BLOCK_MAX-2 || K_BLOCK_MAX == 1) { ++smem_pipe_read; }
-        // block fires EVERY iteration and sits BEFORE the mma loop, so a per-atom transform placed in that loop reads
-        // an already-advanced stage. Measured, not guessed: decoding the mismatching outputs against
-        // scale(g,n) = 1 + (1/16)*((5n+3g) mod 13) gave g = 2 for EVERY printed line where g = 0 was correct, and one
-        // stage is Scale_TileK = 2 groups. The unchunked path never had this because its transform runs at step 2,
-        // before the advance.
-        int const b_consume_stage = smem_pipe_read;
-
-        // Load A, B shmem->regs for k_block+1
-        auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
-        copy_B_and_extra_info(smem_tiled_copy_B, tCsB, tCrB_copy_view,
-          partitioned_extra_info, copy_partitions_extra_info, k_block_next, smem_pipe_read);
-        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
-if constexpr (!kBChunk) {
-        transform_B_kblock<RealInternalElementB>(tCrB_copy_view, tCrB_mma, partitioned_extra_info, k_block_next, K_ATOM_PER_COPY,
-          copy_partitions_extra_info, smem_pipe_read);
-      }
-
-        // Copy gmem to smem before computing gemm on each k-pipe
-        if (k_block == 0)
-        {
-          auto k_iter_crd = cute::idx2crd(*k_tile_iter, k_iter_shape);
+    };
+    auto prefetch = [&] (auto k_tile, int write_stage) {
+          auto k_iter_crd = cute::idx2crd(k_tile, k_iter_shape);
           copy_aiu(
-            gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
-            gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,smem_pipe_write),
+            gmem_tiled_copy_A, tAgA(_,_,_,k_tile), tAsA(_,_,_,write_stage),
+            gmem_tiled_copy_B, tBgB(_,_,_,k_iter_crd), tBsB(_,_,_,write_stage),
             warp_idx
           );
-          copy_async_extra_info(mainloop_params, extra_input_partitions, *k_tile_iter, smem_pipe_write);
-          cp_async_fence();
-          if (k_tile_count > 1) { ++k_tile_iter; }
-        }
-        if (k_block == K_BLOCK_MAX - 2 || K_BLOCK_MAX == 1) {
-          // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
-          smem_pipe_write = smem_pipe_read;
-          ++smem_pipe_read;
-          smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
-        }
-
+          copy_async_extra_info(mainloop_params, extra_input_partitions, k_tile, write_stage);
+    };
+    auto consume = [&] (auto k_block, int b_consume_stage) {
         // N-FOLD: IDENTICAL to the unfolded mainloop. The fold lives only in the load layer -- gmem/smem are
         // (N/FoldF) x (FoldF*K) to satisfy the AIU 32B contiguous minimum, and the swzl ldmatrix already delivers the
         // fragment with ordinary N x K register semantics (same as int4). So no fold-specific compute code at all.
@@ -836,12 +783,10 @@ if constexpr (!kBChunk) {
             cute::gemm(tiled_mma, tCrA(_,_,atom_idx), tCrB_mma(_,_,atom_idx), accum);
           }
         }
-      });
+    };
 
-    }
-
-    cp_async_wait<0>();
-    __syncthreads();
+    detail::run_mixed_pipeline<DispatchPolicy::Stages>(K_BLOCK_MAX, k_tile_iter, k_tile_count,
+        bind_read, publish, prepare, prefetch, consume);
   }
 
 private:
