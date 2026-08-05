@@ -179,6 +179,8 @@ public:
 
   constexpr static int Scale_TileN = shape<0>(ScaleTileShape{});
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
+  static_assert(Scale_TileK > 0,
+                "ScaleTileShape.K must be positive; use ceil(TileK / group_size), not integer truncation");
   using Scale_GmemCopyThrLayoutH = Int<Scale_TileN / 8>;
   using Scale_GmemCopyThrLayoutW = Int<Scale_TileK>;
   using GmemTiledCopyScale = decltype(
@@ -677,8 +679,8 @@ private:
       return kFusedScaleZero ? 2 * int(cute::cosize_v<SmemLayoutScale>) : int(cute::cosize_v<SmemLayoutScale>);
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Conversion mode not handled in scale smem allocation");
     }
   }
 
@@ -692,8 +694,8 @@ private:
       return kFusedScaleZero ? 0 : int(cute::cosize_v<SmemLayoutScale>);   // fused: zero lives in smem_scale's odd halfs
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Conversion mode not handled in zero smem allocation");
     }
   }
 
@@ -947,13 +949,13 @@ public:
         return cute::make_tuple(gA, gB, gS, gZ, gSp);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled in load_init");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "load_init requires direct conversion or scale metadata");
     }
   }
 
@@ -1468,13 +1470,13 @@ private:
         return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ, tSgSp, tSsSp);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled for input partitioning");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Input partitioning requires direct conversion or scale metadata");
     }
   }
 
@@ -1876,13 +1878,13 @@ private:
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ, sSp, tCcS);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled while partitioning scale fragments");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Scale-fragment partitioning requires direct conversion or scale metadata");
     }
   }
 
@@ -1911,13 +1913,13 @@ private:
         return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled while retiling scale fragments");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Scale-fragment retiling requires direct conversion or scale metadata");
     }
   }
 
@@ -1940,13 +1942,15 @@ private:
 
     copy(smem_tiled_copy_B, tCsB(_,_,k_block,read_stage), tCrB_copy_view(_,_,k_block));
 
-    // COARSE scale path: gs spans >= one full B copy step (Scale_TileK <= K_BLOCK_MAX), so one scale group
-    // covers >=1 whole copy steps -> load it here, once per GroupK steps. The FINE case (gs < copy-step K, e.g.
-    // gs=32 with a 64-K single-step copy -> Scale_TileK > K_BLOCK_MAX) makes GroupK=0 (a div-by-zero) and one
-    // group can't cover the whole step; there the scale is loaded PER mma-atom in transform_B_kblock instead.
+    // COARSE is a relation between the scale tile and the ACTUAL retiled B copy view. It is not a group-size rule:
+    // KBM_ also depends on SmemCopyAtomB and tiled_mma_s8. When the scale tile has no more K slots than the copy
+    // view, one scale covers one or more whole copy steps and is loaded here once per GroupK steps. Otherwise the
+    // FINE path reloads scale per MMA atom in transform_B_kblock.
     constexpr int KBM_ = decltype(cute::size<2>(tCrB_copy_view))::value;
     if constexpr (int(Scale_TileK) <= KBM_) {
-     auto GroupK= size<2>(tCrB_copy_view) / Scale_TileK;
+     static_assert(KBM_ % int(Scale_TileK) == 0,
+                   "COARSE scale groups must evenly partition the B copy steps");
+     constexpr int GroupK = KBM_ / int(Scale_TileK);
      if (k_block % GroupK == 0) {
       // We are starting a new group k-tile so copy the scale
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
@@ -1963,14 +1967,10 @@ private:
           auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
           copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
         }
-        if constexpr (false) {} else {
-          // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-          assert(false);
-        }
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "COARSE scale copy requires a scale-bearing conversion mode");
       }
      }  // if (k_block % GroupK == 0)
     }   // if constexpr (Scale_TileK <= K_BLOCK_MAX)  [COARSE]
@@ -2191,8 +2191,8 @@ private:
       }
     }
     else {
-      assert(false);
-    //   static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Conversion mode not handled while transforming B");
     }
   }
 
