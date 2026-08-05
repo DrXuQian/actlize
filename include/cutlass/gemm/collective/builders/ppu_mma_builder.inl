@@ -596,7 +596,7 @@ struct CollectiveBuilder<
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs128> ||
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs64> ||
        cute::is_same_v<KernelScheduleType, KernelAiuMultistageMixedInputFinegrainedGs32> ||
-       (fold_schedule_traits<KernelScheduleType>::FoldF > 0))>   // N-FOLD: KernelAiuFold<FoldF, Base>
+       (fold_schedule_traits<KernelScheduleType>::ArtifactLowFold > 0))>   // artifact-fold contract
 > {
 private:
   using ScaleA = detail::deduce_mixed_width_dtype_t<1, ElementPairA_>;
@@ -644,10 +644,15 @@ public:
   // (N/FoldF) x (FoldF*K) form and force a 2-pass mainloop.
   // (e) ONE definition, shared with the offline generators -- see MixGemmMmaPermK in
   // fast_numeric_conversion_for_mix_gemm.h for why restating it broke a folded plane.
+  static constexpr int ArtifactLowFold =
+      fold_schedule_traits<KernelScheduleType>::ArtifactLowFold > 0
+          ? fold_schedule_traits<KernelScheduleType>::ArtifactLowFold : 1;
+  static constexpr int ExplicitArtifactHighFold =
+      fold_schedule_traits<KernelScheduleType>::ArtifactHighFold;
   static constexpr int MmaPermK =
       cutlass::MixGemmMmaPermK<sizeof_bits<RealInternalElementB>::value,
                                cute::get<2>(TileShape_MNK{}),
-                               (fold_schedule_traits<KernelScheduleType>::FoldF > 0 ? 2 : 1)>::value;
+                               ArtifactLowFold>::value;
   using TiledMma = typename detail::get_tiled_mma<
         Arch, ElementMma, ElementMma, ElementAccumulator, TileShape_MNK, ClusterShape_MNK,
         Int<MmaPermK>>::TiledMma;
@@ -672,18 +677,18 @@ public:
   using PlaneB2 = detail::deduce_mixed_width_dtype_t<3, ElementPairB>;
   static constexpr bool HasPlane2 = !cute::is_void_v<PlaneB2>;
 
-  // N-FOLD: KernelScheduleType may be KernelAiuFold<FoldF, Base>. Extract FoldF + the underlying (group-size) base
-  // schedule; when folding, route to MainloopPPUAiuFold and give the B operand a folded Block_K (below).
-  static constexpr int FoldF = fold_schedule_traits<KernelScheduleType>::FoldF;
-  static constexpr bool HasFold = FoldF > 0;
+  // ArtifactLowFold comes from the resident byte layout. It must never be re-derived from blockK: blockK is the
+  // tactic's TileK, and a larger-tile tactic deliberately reads the same folded artifact. A fold of one keeps the
+  // ordinary low-plane collective even when an independently folded high plane supplied the wrapper.
+  static constexpr int FoldF = ArtifactLowFold;  // compatibility inside the existing collective API
+  static constexpr bool HasFold = ArtifactLowFold > 1;
   using BaseSchedule = typename fold_schedule_traits<KernelScheduleType>::Base;   // == KernelScheduleType if no fold
 
   // HasPlane2 must WIN over HasFold. It used to be the other way round, which meant a 2-plane build whose LOW plane
   // needs a fold (int2 at Block_K=64 -> F1=2) was routed to the single-plane fold collective and plane 2 was silently
-  // dropped. FoldF does not need to enter the 2-plane dispatch policy: each plane's fold factor is readable off its own
-  // SmemLayoutAtom, which the builder already sizes folded (BFoldBlockK / the per-plane B2 block), exactly as the
-  // collective already does for P2Fold. BaseSchedule keeps the group-size schedule either way, and MmaPermK above is
-  // already the fold rule whenever FoldF > 0, which is what a folded low plane needs.
+  // dropped. Both artifact folds enter the operand atoms below; the 2-plane collective reads their ratio back from the
+  // two layouts. BaseSchedule keeps the group-size schedule, while MmaPermK follows the low plane because that plane
+  // owns the shared MMA fragment.
   using DispatchPolicy = cute::conditional_t<HasPlane2,
       MainloopPPUAiuMixedInput2Plane<PipelineStages, kContinous, BaseSchedule>,
       cute::conditional_t<HasFold,
@@ -701,12 +706,13 @@ public:
   // N-FOLD: the B plane's AIU contiguous run folds FoldF adjacent N-cols x blockK each, so its operand Block_K =
   // FoldF*blockK (=> AiuContElemSize = FoldF*blockK, reusing a validated config, e.g. int2 blockK=64 FoldF=2 => 128
   // == int2@TK128). A stays blockK. The collective's fold-in-N SmemLayoutB then presents this as (FoldF*Ng, blockK).
-  static constexpr int BFoldBlockK = (HasFold ? FoldF : 1) * blockK;
+  static constexpr int BFoldBlockK = ArtifactLowFold * blockK;
   // ...and the PHYSICAL row count halves/quarters correspondingly: folding FoldF N-columns into one contiguous run
   // means the B tile physically has blockN/FoldF rows of FoldF*blockK each (same total bytes). Folding only K while
   // leaving Block_MN=blockN makes the swzl atom address a 2x-too-large tile per stage -> "TSM out of range" at
   // runtime (observed: tsm.ld.swzl stepping 0x800 through a 0x400-per-stage buffer).
-  static constexpr int BFoldBlockN = blockN / (HasFold ? FoldF : 1);
+  static_assert(blockN % ArtifactLowFold == 0, "artifact low fold must divide Block_N");
+  static constexpr int BFoldBlockN = blockN / ArtifactLowFold;
   // (MOEG_FOLD_DEBUG dump removed -- it confirmed fold_dbg<64,64,64,2,32,128>: builder params are CORRECT,
   //  i.e. B operand gets Block_MN=32 / Block_K=128 -> swzl CUBE <32,32> -> 1024B/stage, matching SmemLayoutB.)
   using DefaultOperandA = detail::MixGemm_AIU_Operand<RealInternalElementA, false, Int<blockM>, Int<blockK>, true>;
@@ -735,19 +741,24 @@ public:
   // NOTE Block_K here must ALSO be the folded one (BFoldBlockK): even in single-plane builds this type gets
   // instantiated (it feeds the unused BPlanes fallback), so with a fold the plain blockK would give a sub-32B
   // contiguous run and trip MixGemm_AIU_Operand's `BlockContSize % 32 == 0` static_assert.
-  // PER-PLANE N-FOLD. The fold factor is a per-plane quantity -- F_p = contig_p >= 32 ? 1 : 32/contig_p with
-  // contig_p = Block_K * bits_p / 8 -- and plane 2 is the SPARSER plane, so at the same Block_K its contiguous run is
-  // 2x/4x smaller and can fall below the AIU's 32 B minimum. Giving both planes ONE fold factor is exactly what pinned
-  // the 2-plane path to Block_K >= 256: the only K where int2 and int1 both reach 32 B unfolded. Plane 2 now folds the
-  // EXTRA amount it needs on top of plane 1's (BFoldBlockK already carries plane 1's), so Q3 reaches Block_K = 128
-  // (int2 F=1, int1 F=2) and 64 (F=2 / F=4). Derived (fold_derivation/l42_2plane_fold.cu): every folded configuration
-  // comes out with P2_DIV = 1, simpler than today's 2, and at Block_K=64 the shared logical mma fragment is the same
-  // ((2,2,2),4,4):((1,2,4),32,8) as the single-plane int1 config that measures 63.7%.
+  // PER-PLANE ARTIFACT FOLD. BFoldBlockK already contains ArtifactLowFold. The second operand needs the remaining
+  // ratio ArtifactHighFold/ArtifactLowFold, independent of the tactic blockK. Re-deriving it from blockK made a
+  // large-TileK consumer silently reinterpret a small-TileK artifact, and was already wrong for Q3 at artifact TK64
+  // where the two physical planes are F_low=2 and F_high=4.
   using P2Elem = cute::conditional_t<HasPlane2, PlaneB2, RealInternalElementB>;
   static constexpr int P2Contig = BFoldBlockK * cutlass::sizeof_bits<P2Elem>::value / 8;  // bytes AFTER plane 1's fold
-  static constexpr int P2Fold   = P2Contig >= 32 ? 1 : 32 / P2Contig;   // the extra fold plane 2 needs
+  // Direct CollectiveBuilder users predating the shared policy carry no explicit high fold. Preserve their legacy
+  // tactic-derived result; every quactlize two-plane policy supplies the explicit artifact value.
+  static constexpr int LegacyP2Fold = P2Contig >= 32 ? 1 : 32 / P2Contig;
+  static constexpr int ArtifactHighFold = ExplicitArtifactHighFold > 0
+      ? ExplicitArtifactHighFold : ArtifactLowFold * LegacyP2Fold;
+  static_assert(!HasPlane2 || ArtifactHighFold >= ArtifactLowFold,
+                "artifact high fold cannot be smaller than the low fold");
+  static_assert(!HasPlane2 || ArtifactHighFold % ArtifactLowFold == 0,
+                "artifact plane folds must form an integral physical-tiler ratio");
+  static constexpr int P2Fold = HasPlane2 ? ArtifactHighFold / ArtifactLowFold : 1;
   static_assert(P2Contig * P2Fold >= 32 || !HasPlane2,
-      "plane 2 cannot reach the AIU 32 B contiguous minimum at this Block_K even folded -- raise Block_K");
+      "artifact high fold cannot reach the AIU 32 B contiguous minimum at this tactic Block_K");
   static_assert(BFoldBlockN % P2Fold == 0 || !HasPlane2, "plane 2's fold must divide Block_N");
   using DefaultOperandB2 = detail::MixGemm_AIU_Operand<
       P2Elem, false, Int<BFoldBlockN / P2Fold>, Int<BFoldBlockK * P2Fold>, true>;

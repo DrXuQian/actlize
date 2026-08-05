@@ -145,13 +145,33 @@ struct KernelAiuMultistageMixedInputFinegrainedGs128 { };
 struct KernelAiuMultistageMixedInputFinegrainedGs64 { };
 struct KernelAiuMultistageMixedInputFinegrainedGs32 { };  // gs=32 (Q4_0/Q4_1/Q4_K-as-AWQ)
 
-// N-FOLD schedule wrapper: signals the builder to route to MainloopPPUAiuFold (B operand Block_K = FoldF*blockK,
-// fold-in-N SmemLayoutB), carrying both the fold factor and the base group-size schedule (for StaticGroupSize).
-template<int FoldF_, class BaseSchedule_ = KernelAiuMultistageMixedInputFinegrainedGs32>
-struct KernelAiuFold { static constexpr int FoldF = FoldF_; using BaseSchedule = BaseSchedule_; };
-// detection trait (FoldF=0 / Base=self when not a fold schedule)
-template<class T> struct fold_schedule_traits { static constexpr int FoldF = 0; using Base = T; };
-template<int F, class B> struct fold_schedule_traits<KernelAiuFold<F,B>> { static constexpr int FoldF = F; using Base = B; };
+// Artifact-fold schedule wrapper. The folds describe the resident B planes, not the consumer TileShape.K: a tactic
+// with a larger TileK may read the same bytes, but it must keep both physical (N/F, F*K) descriptors. The low fold
+// selects the ordinary-vs-folded collective; the independent high fold sizes the second plane. Keep BaseSchedule_ in
+// the middle so existing KernelAiuFold<F, Base> spellings remain source compatible.
+template<int ArtifactLowFold_, class BaseSchedule_ = KernelAiuMultistageMixedInputFinegrainedGs32,
+         int ArtifactHighFold_ = 0>
+struct KernelAiuFold {
+  static constexpr int FoldF = ArtifactLowFold_;  // compatibility for downstream users of the old name
+  static constexpr int ArtifactLowFold = ArtifactLowFold_;
+  static constexpr int ArtifactHighFold = ArtifactHighFold_;
+  using BaseSchedule = BaseSchedule_;
+};
+// A zero fold means that no artifact contract was supplied. The builder retains its legacy derivation only for such
+// direct CollectiveBuilder users; the shared quactlize policy always supplies both folds when either plane is folded.
+template<class T> struct fold_schedule_traits {
+  static constexpr int FoldF = 0;
+  static constexpr int ArtifactLowFold = 0;
+  static constexpr int ArtifactHighFold = 0;
+  using Base = T;
+};
+template<int LowFold, class B, int HighFold>
+struct fold_schedule_traits<KernelAiuFold<LowFold, B, HighFold>> {
+  static constexpr int FoldF = LowFold;
+  static constexpr int ArtifactLowFold = LowFold;
+  static constexpr int ArtifactHighFold = HighFold;
+  using Base = B;
+};
 struct KernelAiuMultistageBatchArray { };
 struct KernelAiuMultistageBatchArrayOverlapPrologue { };
 struct KernelAiuMultistageStreamK { };
@@ -467,4 +487,3 @@ struct MainloopPPUCpAsyncBatchArray {
 //////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::gemm
-
