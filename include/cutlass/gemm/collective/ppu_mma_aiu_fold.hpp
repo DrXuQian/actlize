@@ -356,8 +356,8 @@ private:
       return cute::cosize_v<SmemLayoutScale>;
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Conversion mode not handled in scale smem allocation");
     }
   }
 
@@ -371,8 +371,8 @@ private:
       return cute::cosize_v<SmemLayoutScale>;
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Conversion mode not handled in zero smem allocation");
     }
   }
 
@@ -523,13 +523,13 @@ public:
         return cute::make_tuple(gA, gB, gS, gZ);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled in load_init");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "load_init requires direct conversion or scale metadata");
     }
   }
 
@@ -978,13 +978,13 @@ private:
         return cute::make_tuple(tSgS, tSsS, tScS, tZgZ, tZsZ);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled for input partitioning");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Input partitioning requires direct conversion or scale metadata");
     }
   }
 
@@ -1084,13 +1084,13 @@ private:
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled while partitioning scale fragments");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Scale-fragment partitioning requires direct conversion or scale metadata");
     }
   }
 
@@ -1119,13 +1119,13 @@ private:
         return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "Conversion mode not handled while retiling scale fragments");
       }
     }
     else {
-      // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-      assert(false);
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                    "Scale-fragment retiling requires direct conversion or scale metadata");
     }
   }
 
@@ -1173,13 +1173,13 @@ private:
           auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
           copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
         } else {
-          // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-          assert(false);
+          static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                        "Conversion mode not handled in COARSE scale copy");
         }
       }
       else {
-        // static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
-        assert(false);
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                      "COARSE scale copy requires a scale-bearing conversion mode");
       }
      }  // if (k_block % GroupK == 0)
     }   // if constexpr (Scale_TileK <= K_BLOCK_MAX)  [COARSE]
