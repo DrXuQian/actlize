@@ -54,16 +54,6 @@
 
 #pragma once
 
-// VERSION GATE for the scale-fragment API. A harness static_asserts on this, so a STALE actlize submodule on the box
-// fails to COMPILE instead of silently producing a binary identical to the previous one -- which is exactly the
-// ambiguity that made an "every acu counter is identical" A/B uninterpretable. Bump it whenever the scale-fragment
-// construction changes in a way a measurement is supposed to see.
-//   1 = materialised fragment (make_fragment_like of partition_fragment_B)
-//   2 = stride-0 broadcast -- REVERTED: a no-op in generated code, and it traded a cute idiom for a hand-built stride
-//   3 = back to the cute idiom, as ONE shared entry point across the three collectives, plus scale_frag_cosize()
-#define PPU_SCALE_FRAGMENT_API 3
-
-
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
@@ -75,6 +65,7 @@
 #include "cute/numeric/arithmetic_tuple.hpp"
 
 #include "cutlass/gemm/collective/collective_mma.hpp"
+#include "cutlass/gemm/collective/detail/ppu_mixed_metadata_policy.hpp"
 #include "cutlass/detail/collective.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -181,15 +172,16 @@ public:
 
   constexpr static int Scale_TileN = shape<0>(ScaleTileShape{});
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
+  using MetadataPolicy = detail::MixedMetadataPolicy<ElementScale, Scale_TileK,
+      !cute::is_void_v<ElementZero>, detail::FlatMetadataAddress>;
   // partition_extra_inputs selects this copy with thread_idx modulo the copy's thread slots. If the copy asks for
   // more slots than TiledMma launches, the missing slots are not diagnosed by CuTe: their scale groups are simply
   // never loaded. Keep this as a public type witness as well as an assertion so both operator launchers bind the
   // coverage invariant when they bind the instantiated mainloop.
   constexpr static int Scale_NumThreads = size(TiledMma{});
   constexpr static int Scale_CopyThreadSlots = (Scale_TileN / 8) * Scale_TileK;
-  constexpr static bool scale_copy_thread_coverage = Scale_CopyThreadSlots <= Scale_NumThreads;
-  static_assert(scale_copy_thread_coverage,
-                "scale copy asks for more thread slots than the CTA has -- the modulo slice would silently truncate it");
+  using ScaleCoverage = typename MetadataPolicy::template Coverage<Scale_CopyThreadSlots, Scale_NumThreads>;
+  constexpr static bool scale_copy_thread_coverage = ScaleCoverage::value;
   using Scale_GmemCopyThrLayoutH = Int<Scale_TileN / 8>;
   using Scale_GmemCopyThrLayoutW = Int<Scale_TileK>;
   using GmemTiledCopyScale = decltype(
@@ -1027,7 +1019,7 @@ private:
   template <class TiledMma, class STensor>
   CUTLASS_DEVICE
   static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS) {
-    return make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
+    return MetadataPolicy::make_fragment(thr_mma, sS(_,_,Int<0>{}));
   }
 
   // The same layout, HOST-callable, for the compile-time witness below (make_scale_fragment is CUTLASS_DEVICE and
@@ -1035,7 +1027,7 @@ private:
   // make_tensor<T>(make_layout_like(t.layout())), so these two stay in step by construction.
   template <class TiledMma, class STensor>
   CUTE_HOST_DEVICE static constexpr auto scale_fragment_layout(TiledMma const& thr_mma, STensor const& sS) {
-    return make_layout_like(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})).layout());
+    return MetadataPolicy::fragment_layout(thr_mma, sS(_,_,Int<0>{}));
   }
 
   // Kept from the reverted work because it has independent value: it is what let a STALE submodule be distinguished
@@ -1153,36 +1145,23 @@ private:
     // gs=32 with a 64-K single-step copy -> Scale_TileK > K_BLOCK_MAX) makes GroupK=0 (a div-by-zero) and one
     // group can't cover the whole step; there the scale is loaded PER mma-atom in transform_B_kblock instead.
     constexpr int KBM_ = decltype(cute::size<2>(tCrB_copy_view))::value;
-    if constexpr (int(Scale_TileK) <= KBM_) {
-     auto GroupK= size<2>(tCrB_copy_view) / Scale_TileK;
-     if (k_block % GroupK == 0) {
+    using ScalePolicy = typename MetadataPolicy::template Coarse<KBM_>;
+    if constexpr (ScalePolicy::active) {
+     if (ScalePolicy::starts_group(k_block)) {
       // We are starting a new group k-tile so copy the scale
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
         // nothing to do
       }
       else if constexpr (ModeHasScales) {
-        const int scale_k_idx = read_stage * Scale_TileK + k_block / GroupK;
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
-        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-          // Nothing extra to do
-        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          auto tCsZ              = cute::get<2>(partitioned_mma_extra_info);
-          auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
-          copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
-        } else {
-          static_assert(cutlass::detail::dependent_false<KernelSchedule>,
-                        "Conversion mode not handled in COARSE scale copy");
-        }
+        MetadataPolicy::reload(partitioned_mma_extra_info, tiled_copy_and_views,
+                               ScalePolicy::group(k_block), read_stage);
       }
       else {
         static_assert(cutlass::detail::dependent_false<KernelSchedule>,
                       "COARSE scale copy requires a scale-bearing conversion mode");
       }
-     }  // if (k_block % GroupK == 0)
-    }   // if constexpr (Scale_TileK <= K_BLOCK_MAX)  [COARSE]
+     }
+    }
   }
   /// Utilities to transform B.
   // FINE-grained scale (gs < B-copy-step K, i.e. Scale_TileK > K_BLOCK_MAX): a single copy step's K_ATOM_PER_COPY
@@ -1208,23 +1187,12 @@ private:
                         int const read_stage) {
     if constexpr (ModeHasScales) {
       if constexpr (FINE) {
-        auto smem_tiled_copy_S = cute::get<0>(views);
-        auto tCsS              = cute::get<0>(info);
-        auto tCrS_copy_view    = cute::get<1>(views);
-        if (atom_idx % APG == 0) {                        // reload only at a scale group's first atom
-          const int sk = read_stage * int(Scale_TileK) + atom_idx / APG;
-          copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
-          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-            auto tCsZ           = cute::get<2>(info);
-            auto tCrZ_copy_view = cute::get<2>(views);
-            copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
-          }
+        using Split = detail::ScaleSplit<APG, int(Scale_TileK)>;
+        if (Split::in_group(atom_idx) == 0) {              // reload only at a scale group's first atom
+          MetadataPolicy::reload(info, views, Split::group(atom_idx), read_stage);
         }
       }
-      cute::transform(b_slice, cute::get<1>(info)(_,_,0), b_slice, cute::multiplies{});
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        cute::transform(b_slice, cute::get<3>(info)(_,_,0), b_slice, cute::plus{});
-      }
+      MetadataPolicy::apply(b_slice, info);
     }
   }
 
@@ -1252,8 +1220,9 @@ private:
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
     constexpr int KBM_    = MMA_KA_ / K_ATOM_PER_COPY;                  // K_BLOCK_MAX (copy steps)
-    constexpr bool FINE   = (int(Scale_TileK) > KBM_);                  // gs < copy-step K -> per-atom scale
-    constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;    // mma atoms per scale group (FINE only)
+    using FinePolicy = typename MetadataPolicy::template Fine<KBM_, MMA_KA_>;
+    constexpr bool FINE = FinePolicy::active;
+    constexpr int APG_  = FinePolicy::atoms_per_group;
 
     // The four hand-rolled branches (FINE x zero) collapsed into one call: the per-atom rule now lives in
     // apply_scale_atom and both this function and transform_B_atom go through it.
@@ -1314,8 +1283,9 @@ private:
     // int1's KBM_ is 1.
     constexpr int KBM_    = decltype(cute::size<2>(tCrB_load))::value;   // copy steps per k-tile
     constexpr int MMA_KA_ = NChunk * KBM_;                               // total mma-K atoms in the tile
-    constexpr bool FINE   = (int(Scale_TileK) > KBM_);
-    constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;
+    using FinePolicy = typename MetadataPolicy::template Fine<KBM_, MMA_KA_>;
+    constexpr bool FINE = FinePolicy::active;
+    constexpr int APG_  = FinePolicy::atoms_per_group;
     apply_scale_atom<FINE, APG_>(tCrB_one, partitioned_extra_info, tiled_copy_and_views, atom_idx, read_stage);
   }
 

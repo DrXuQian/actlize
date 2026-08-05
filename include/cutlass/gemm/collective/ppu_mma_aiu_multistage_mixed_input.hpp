@@ -44,6 +44,7 @@
 #include "cute/numeric/arithmetic_tuple.hpp"
 
 #include "cutlass/gemm/collective/collective_mma.hpp"
+#include "cutlass/gemm/collective/detail/ppu_mixed_metadata_policy.hpp"
 #include "cutlass/detail/collective.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -179,6 +180,8 @@ public:
 
   constexpr static int Scale_TileN = shape<0>(ScaleTileShape{});
   constexpr static int Scale_TileK = shape<1>(ScaleTileShape{});
+  using MetadataPolicy = detail::MixedMetadataPolicy<ElementScale, Scale_TileK,
+      !cute::is_void_v<ElementZero>, detail::FlatMetadataAddress>;
   static_assert(Scale_TileK > 0,
                 "ScaleTileShape.K must be positive; use ceil(TileK / group_size), not integer truncation");
   // partition_extra_inputs selects this copy with thread_idx modulo the copy's thread slots. If the copy asks for
@@ -187,9 +190,8 @@ public:
   // coverage invariant when they bind the instantiated mainloop.
   constexpr static int Scale_NumThreads = size(TiledMma{});
   constexpr static int Scale_CopyThreadSlots = (Scale_TileN / 8) * Scale_TileK;
-  constexpr static bool scale_copy_thread_coverage = Scale_CopyThreadSlots <= Scale_NumThreads;
-  static_assert(scale_copy_thread_coverage,
-                "scale copy asks for more thread slots than the CTA has -- the modulo slice would silently truncate it");
+  using ScaleCoverage = typename MetadataPolicy::template Coverage<Scale_CopyThreadSlots, Scale_NumThreads>;
+  constexpr static bool scale_copy_thread_coverage = ScaleCoverage::value;
   using Scale_GmemCopyThrLayoutH = Int<Scale_TileN / 8>;
   using Scale_GmemCopyThrLayoutW = Int<Scale_TileK>;
   using GmemTiledCopyScale = decltype(
@@ -1507,7 +1509,7 @@ private:
   template <class TiledMma, class STensor>
   CUTLASS_DEVICE
   static auto make_scale_fragment(TiledMma const& thr_mma, STensor const& sS) {
-    return make_fragment_like<ElementScale>(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})));
+    return MetadataPolicy::make_fragment(thr_mma, sS(_,_,Int<0>{}));
   }
 
   // The same layout, HOST-callable, for the compile-time witness below (make_scale_fragment is CUTLASS_DEVICE and
@@ -1515,7 +1517,7 @@ private:
   // make_tensor<T>(make_layout_like(t.layout())), so these two stay in step by construction.
   template <class TiledMma, class STensor>
   CUTE_HOST_DEVICE static constexpr auto scale_fragment_layout(TiledMma const& thr_mma, STensor const& sS) {
-    return make_layout_like(thr_mma.partition_fragment_B(sS(_,_,Int<0>{})).layout());
+    return MetadataPolicy::fragment_layout(thr_mma, sS(_,_,Int<0>{}));
   }
 
   // Kept from the reverted work because it has independent value: it is what let a STALE submodule be distinguished
@@ -1956,33 +1958,23 @@ private:
     // view, one scale covers one or more whole copy steps and is loaded here once per GroupK steps. Otherwise the
     // FINE path reloads scale per MMA atom in transform_B_kblock.
     constexpr int KBM_ = decltype(cute::size<2>(tCrB_copy_view))::value;
-    if constexpr (int(Scale_TileK) <= KBM_) {
-     static_assert(KBM_ % int(Scale_TileK) == 0,
-                   "COARSE scale groups must evenly partition the B copy steps");
-     constexpr int GroupK = KBM_ / int(Scale_TileK);
-     if (k_block % GroupK == 0) {
+    using ScalePolicy = typename MetadataPolicy::template Coarse<KBM_>;
+    if constexpr (ScalePolicy::active) {
+     if (ScalePolicy::starts_group(k_block)) {
       // We are starting a new group k-tile so copy the scale
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
         // nothing to do
       }
       else if constexpr (ModeHasScales) {
-        const int scale_k_idx = read_stage * Scale_TileK + k_block / GroupK;
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
-        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        copy(smem_tiled_copy_S, tCsS(_,_,0,scale_k_idx), tCrS_copy_view(_,_,0));
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          auto tCsZ           = cute::get<2>(partitioned_mma_extra_info);
-          auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
-          copy(smem_tiled_copy_S, tCsZ(_,_,0,scale_k_idx), tCrZ_copy_view(_,_,0));
-        }
+        MetadataPolicy::reload(partitioned_mma_extra_info, tiled_copy_and_views,
+                               ScalePolicy::group(k_block), read_stage);
       }
       else {
         static_assert(cutlass::detail::dependent_false<KernelSchedule>,
                       "COARSE scale copy requires a scale-bearing conversion mode");
       }
-     }  // if (k_block % GroupK == 0)
-    }   // if constexpr (Scale_TileK <= K_BLOCK_MAX)  [COARSE]
+     }
+    }
   }
 #if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
   /// A's row 0 into the PACKED cube layout. Four contiguous 16-half runs per cube at the offsets l86 exported, and
@@ -2078,8 +2070,9 @@ private:
 
     constexpr int MMA_KA_ = decltype(cute::size<2>(tCrB_mma))::value;   // total mma-K atoms in the tile
     constexpr int KBM_    = MMA_KA_ / K_ATOM_PER_COPY;                  // K_BLOCK_MAX (copy steps)
-    constexpr bool FINE   = (int(Scale_TileK) > KBM_);                  // gs < copy-step K -> per-atom scale
-    constexpr int APG_    = FINE ? (MMA_KA_ / int(Scale_TileK)) : 1;    // mma atoms per scale group (FINE only)
+    using FinePolicy = typename MetadataPolicy::template Fine<KBM_, MMA_KA_>;
+    constexpr bool FINE = FinePolicy::active;
+    constexpr int APG_  = FinePolicy::atoms_per_group;
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       // do nothing
@@ -2094,9 +2087,6 @@ private:
       } else {
         // FINE: write via tCrS_copy_view (a retile VIEW of the ORIGINAL fragment) then read the ORIGINAL back --
         // NOT the local `tCrS` copy above (make_fragment_like is owning, so `auto tCrS` snapshots stale rmem).
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCsS              = cute::get<0>(partitioned_extra_info);
-        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
     // COMPILE-TIME ATOM INDEX. i used to be a runtime int, so atom_idx, g = atom_idx / APG_ and the
     // `atom_idx % APG_ == 0` guard all became runtime work even though K_ATOM_PER_COPY, APG_ and k_block are
     // constants: the profile showed s.cmp 0.54 + s.csel 0.41 + s.cbr 0.56 + s.shra 0.09 + s.mull 0.16 per mma,
@@ -2106,9 +2096,9 @@ private:
         cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
           constexpr int I = decltype(i_)::value;
           constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
-          constexpr int g = atom_idx / APG_;                            // this atom's scale group within the tile
-          if constexpr (atom_idx % APG_ == 0)                             // reload only at a group's first atom
-            copy(smem_tiled_copy_S, tCsS(_,_,0, read_stage * int(Scale_TileK) + g), tCrS_copy_view(_,_,0));
+          if constexpr (FinePolicy::starts_group(atom_idx))              // reload only at a group's first atom
+            MetadataPolicy::reload(partitioned_extra_info, tiled_copy_and_views,
+                                   FinePolicy::group(atom_idx), read_stage);
           bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                           tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
         });
@@ -2125,11 +2115,6 @@ private:
         });
       } else {
         // FINE: see ConvertAndScale note -- write via the copy VIEWs, read the ORIGINAL fragments back.
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCsS              = cute::get<0>(partitioned_extra_info);
-        auto tCsZ              = cute::get<2>(partitioned_extra_info);
-        auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
-        auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
     // COMPILE-TIME ATOM INDEX. i used to be a runtime int, so atom_idx, g = atom_idx / APG_ and the
     // `atom_idx % APG_ == 0` guard all became runtime work even though K_ATOM_PER_COPY, APG_ and k_block are
     // constants: the profile showed s.cmp 0.54 + s.csel 0.41 + s.cbr 0.56 + s.shra 0.09 + s.mull 0.16 per mma,
@@ -2150,10 +2135,15 @@ private:
             false;
 #endif
         if constexpr (kPfOk) {
+          auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+          auto tCsS              = cute::get<0>(partitioned_extra_info);
+          auto tCsZ              = cute::get<2>(partitioned_extra_info);
+          auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
+          auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
           // BOTH groups load before any transform, group gi into register set gi % 2, so the second group's data has
           // a whole group of atoms to arrive in instead of being used one instruction after its load. pf carries the
           // second set: fragments 0,1 and their copy views 2,3.
-          constexpr int g0 = (K_BLOCK_STATIC * K_ATOM_PER_COPY) / APG_;
+          constexpr int g0 = FinePolicy::group(K_BLOCK_STATIC * K_ATOM_PER_COPY);
           cute::for_each(cute::make_int_sequence<GRP>{}, [&] (auto gi_) {
             constexpr int GI = decltype(gi_)::value;
             const int sk = read_stage * int(Scale_TileK) + g0 + GI;
@@ -2185,11 +2175,9 @@ private:
           cute::for_each(cute::make_int_sequence<K_ATOM_PER_COPY>{}, [&] (auto i_) {
             constexpr int I = decltype(i_)::value;
             constexpr int atom_idx = K_BLOCK_STATIC * K_ATOM_PER_COPY + I;
-            constexpr int g = atom_idx / APG_;
-            if constexpr (atom_idx % APG_ == 0) {                        // reload only at a group's first atom
-              const int sk = read_stage * int(Scale_TileK) + g;
-              copy(smem_tiled_copy_S, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
-              copy(smem_tiled_copy_S, tCsZ(_,_,0,sk), tCrZ_copy_view(_,_,0));
+            if constexpr (FinePolicy::starts_group(atom_idx)) {          // reload only at a group's first atom
+              MetadataPolicy::reload(partitioned_extra_info, tiled_copy_and_views,
+                                     FinePolicy::group(atom_idx), read_stage);
             }
             bdq_transform(tCrB_mma(_, _, Int<atom_idx>{}), cute::get<1>(partitioned_extra_info)(_, _, 0),
                             tCrB_mma(_, _, Int<atom_idx>{}), cute::multiplies{});
