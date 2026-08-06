@@ -72,13 +72,40 @@ struct MixGemmNumericArrayConverter<half_t, int8_t, 4>
         static constexpr uint32_t mask_for_elt_01 = 0x5250;
         static constexpr uint32_t mask_for_elt_23 = 0x5351;
         static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
-        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
-        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
-
         // Lastly, we subtract 1152 from our constructed number using fp16 math to get our signed integer as fp16.
         static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
+        // THE PPU ARM IS BEHIND AN ARCHITECTURE GUARD, and this is a portability fix in the same class as
+        // cd17c2b9 rather than a behaviour change: `ppu.prmt.b32` and `ppu.sub.f16x2` are not PTX, so any nvcc
+        // compilation that instantiates this specialisation dies in ptxas with "Not a name of any known
+        // instruction: 'ppu'". This is a FULL specialisation, so `convert` is an ordinary __device__ function and
+        // reaches the assembler whether or not a caller uses it. quactlize's CUDA-side GGUF golden test compiles
+        // this header with nvcc for the host GPU and failed exactly that way on 2026-08-06.
+        //
+        // The guarded arm is byte-identical to what shipped: same masks, same 0x64646464 base, same 1152
+        // subtract. The portable arm computes the SAME value -- construct 1024 + byte, subtract 1152 -- in plain
+        // C++ so a non-PPU compiler has something correct to emit. Neither arm changes what the PPU runs.
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100)
+        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
+        asm volatile("ppu.prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
         asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
         asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I8s_TO_F16s_MAGIC_NUM));
+#else
+        // prmt selector 0x5250 takes bytes (0, 2) of i8s into the low halves of h[0] with 0x64 as the high byte;
+        // 0x5351 takes bytes (1, 3) for h[1]. That interleave is part of this converter's contract -- the mainloop
+        // reads (0, 2, 1, 3) -- so it is reproduced here rather than simplified.
+        auto const lane = [&](int byte) -> uint32_t {
+            return uint32_t(0x6400u | uint32_t((i8s >> (8 * byte)) & 0xFFu));
+        };
+        h[0] = lane(0) | (lane(2) << 16);
+        h[1] = lane(1) | (lane(3) << 16);
+        auto const sub1152 = [](uint32_t packed) -> uint32_t {
+            half_t lo = half_t::bitcast(uint16_t(packed & 0xFFFFu)) - half_t(1152.f);
+            half_t hi = half_t::bitcast(uint16_t(packed >> 16)) - half_t(1152.f);
+            return uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
+        };
+        h[0] = sub1152(h[0]);
+        h[1] = sub1152(h[1]);
+#endif
 
         return result;
     }
