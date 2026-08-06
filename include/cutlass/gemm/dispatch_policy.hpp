@@ -143,35 +143,6 @@ struct KernelAiuMultistageMixedInput { };
 struct KernelAiuMultistageMixedInputPerCol { };
 struct KernelAiuMultistageMixedInputFinegrainedGs128 { };
 struct KernelAiuMultistageMixedInputFinegrainedGs64 { };
-struct KernelAiuMultistageMixedInputFinegrainedGs32 { };  // gs=32 (Q4_0/Q4_1/Q4_K-as-AWQ)
-
-// Artifact-fold schedule wrapper. The folds describe the resident B planes, not the consumer TileShape.K: a tactic
-// with a larger TileK may read the same bytes, but it must keep both physical (N/F, F*K) descriptors. The low fold
-// selects the ordinary-vs-folded collective; the independent high fold sizes the second plane. Keep BaseSchedule_ in
-// the middle so existing KernelAiuFold<F, Base> spellings remain source compatible.
-template<int ArtifactLowFold_, class BaseSchedule_ = KernelAiuMultistageMixedInputFinegrainedGs32,
-         int ArtifactHighFold_ = 0>
-struct KernelAiuFold {
-  static constexpr int FoldF = ArtifactLowFold_;  // compatibility for downstream users of the old name
-  static constexpr int ArtifactLowFold = ArtifactLowFold_;
-  static constexpr int ArtifactHighFold = ArtifactHighFold_;
-  using BaseSchedule = BaseSchedule_;
-};
-// A zero fold means that no artifact contract was supplied. The builder retains its legacy derivation only for such
-// direct CollectiveBuilder users; the shared quactlize policy always supplies both folds when either plane is folded.
-template<class T> struct fold_schedule_traits {
-  static constexpr int FoldF = 0;
-  static constexpr int ArtifactLowFold = 0;
-  static constexpr int ArtifactHighFold = 0;
-  using Base = T;
-};
-template<int LowFold, class B, int HighFold>
-struct fold_schedule_traits<KernelAiuFold<LowFold, B, HighFold>> {
-  static constexpr int FoldF = LowFold;
-  static constexpr int ArtifactLowFold = LowFold;
-  static constexpr int ArtifactHighFold = HighFold;
-  using Base = B;
-};
 struct KernelAiuMultistageBatchArray { };
 struct KernelAiuMultistageBatchArrayOverlapPrologue { };
 struct KernelAiuMultistageStreamK { };
@@ -308,107 +279,6 @@ struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedIn
   using ClusterShape = Shape<_1,_1,_1>;
 };
 
-template<int Stages_, class kContinous_>
-struct MainloopPPUAiuMixedInput<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs32> {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = 32;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-
-// ---- B BIT-PLANE CONCAT (Q3 = int2+int1, Q5 = int4+int1, Q6 = int4+int2) ------------------------------------
-// A DISTINCT mainloop policy, so the two-B-plane collective (ppu_mma_aiu_mixed_input_2plane.hpp) is its OWN
-// CollectiveMma specialization instead of competing with / being if-constexpr'd into the validated single-plane
-// one. Mirrors MainloopPPUAiuMixedInput exactly -- including every per-Schedule StaticGroupSize specialization --
-// because the 2-plane mainloop reuses the same scale/zero machinery (and the GGUF concats are gs=16, i.e. the
-// FINE per-mma-atom scale path).
-template<int Stages_, class kContinous_, typename Schedule_ = KernelAiuMultistageMixedInput>
-struct MainloopPPUAiuMixedInput2Plane {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = 0;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-
-template<int Stages_, class kContinous_>
-struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputPerCol> {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = -1;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-
-template<int Stages_, class kContinous_>
-struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs128> {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = 128;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-
-template<int Stages_, class kContinous_>
-struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs64> {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = 64;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-
-template<int Stages_, class kContinous_>
-struct MainloopPPUAiuMixedInput2Plane<Stages_, kContinous_, KernelAiuMultistageMixedInputFinegrainedGs32> {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = 32;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-
-// ---- N-FOLD (TK-freeing) mainloop policy ---------------------------------------------------------------------
-// A DISTINCT policy so the fold collective (ppu_mma_aiu_fold.hpp) is its OWN CollectiveMma specialization, zero
-// regression to the validated single-plane / 2-plane ones. FoldFactor F = 32B-elems / TileShape.K: the B plane's
-// AIU contiguous run folds F adjacent N-columns to reach 32B while TileShape.K (A / MMA) stays small (A-smem =
-// TileM*TK*2 shrinks by F). B smem K-extent = F * TileShape.K; mainloop runs F gemm passes (B's K-atom blocks,
-// reusing one A) into an F*N-wide accumulator. Offline data prepared by nfold_column_pairs_ppu (P1.1). Mirrors the
-// per-Schedule StaticGroupSize set (GGUF concats are gs=16 = FINE per-atom scale).
-template<int Stages_, class kContinous_, int FoldF_ = 2, typename Schedule_ = KernelAiuMultistageMixedInput>
-struct MainloopPPUAiuFold {
-  constexpr static int Stages = Stages_;
-  constexpr static int StaticGroupSize = 0;
-  constexpr static int FoldFactor = FoldF_;
-  using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput;
-  using ClusterShape = Shape<_1,_1,_1>;
-};
-template<int Stages_, class kContinous_, int FoldF_>
-struct MainloopPPUAiuFold<Stages_, kContinous_, FoldF_, KernelAiuMultistageMixedInputPerCol> {
-  constexpr static int Stages = Stages_; constexpr static int StaticGroupSize = -1;
-  constexpr static int FoldFactor = FoldF_; using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput; using ClusterShape = Shape<_1,_1,_1>;
-};
-template<int Stages_, class kContinous_, int FoldF_>
-struct MainloopPPUAiuFold<Stages_, kContinous_, FoldF_, KernelAiuMultistageMixedInputFinegrainedGs128> {
-  constexpr static int Stages = Stages_; constexpr static int StaticGroupSize = 128;
-  constexpr static int FoldFactor = FoldF_; using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput; using ClusterShape = Shape<_1,_1,_1>;
-};
-template<int Stages_, class kContinous_, int FoldF_>
-struct MainloopPPUAiuFold<Stages_, kContinous_, FoldF_, KernelAiuMultistageMixedInputFinegrainedGs64> {
-  constexpr static int Stages = Stages_; constexpr static int StaticGroupSize = 64;
-  constexpr static int FoldFactor = FoldF_; using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput; using ClusterShape = Shape<_1,_1,_1>;
-};
-template<int Stages_, class kContinous_, int FoldF_>
-struct MainloopPPUAiuFold<Stages_, kContinous_, FoldF_, KernelAiuMultistageMixedInputFinegrainedGs32> {
-  constexpr static int Stages = Stages_; constexpr static int StaticGroupSize = 32;
-  constexpr static int FoldFactor = FoldF_; using kContinous = kContinous_;
-  using Schedule = KernelAiuMultistageMixedInput; using ClusterShape = Shape<_1,_1,_1>;
-};
-
 
 struct KernelMultistageWithScale { };
 struct KernelAiuMultistageWithScale : public KernelAiuMultistage { };
@@ -487,3 +357,4 @@ struct MainloopPPUCpAsyncBatchArray {
 //////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::gemm
+

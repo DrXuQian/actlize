@@ -501,12 +501,6 @@ template <
   bool Swap,
   int StageStride = 0,
   bool Swzl = true
-  // CUBE_H is the number of MN rows ONE cube covers, and for PPU0010 it is assigned Block_MN outright, so a cube
-  // spans the whole tile in M and that extent lives inside the hardware. An override parameter lived here and was
-  // removed: it is inert for the mixed-input A path (that atom is built in MixGemm_AIU_Operand) and, where it did
-  // apply, shrinking CUBE_H changed the swzl permutation rather than just the footprint, so the delivered bits
-  // landed in the wrong registers. Nor can a LAYOUT reach it -- the swzl read is handed a COORDINATE, not a linear
-  // offset, so strides never touch the addressing (fold_derivation/l74_swzl_coord_not_stride.cu measures that).
 > struct DefaultGemm_AIU_Operand;
 
 template <
@@ -543,9 +537,8 @@ template <
   static constexpr bool split_on_k_10500 = AiuContElemSize < Block_K{};
   static constexpr int inst_num = cute::is_same_v<Arch, cutlass::arch::PPU0015> ?
                                   (split_on_k_10500 ? (Block_K{} / AiuContElemSize) : 1) : Block_K{} / AiuContElemSize;
-  static constexpr int CUBE_H_default = cute::is_same_v<Arch, cutlass::arch::PPU0015> ?
+  static constexpr int CUBE_H = cute::is_same_v<Arch, cutlass::arch::PPU0015> ?
                                   (split_on_k_10500 ? Block_MN{} : (Block_MN{} / inst_num)) : Block_MN{};
-  static constexpr int CUBE_H = CUBE_H_default;
   static constexpr int CUBE_W = AiuContElemSize;
   static constexpr int bits_per_aiu = CUBE_H * CUBE_W * sizeof_bits<Element>::value;
   using CopyInst = cute::conditional_t<
