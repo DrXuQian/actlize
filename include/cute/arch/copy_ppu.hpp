@@ -34,6 +34,7 @@
 
 #include <cute/config.hpp>
 #include <cute/arch/copy.hpp>
+#include <cute/util/type_traits.hpp>
 
 // ppu1.x always supports ldmatrix path, macro only for possible upper-layer call
 #define CUTE_ARCH_LDSM_PPU_ENABLED 1
@@ -51,6 +52,41 @@ namespace cute
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
+
+// This SDK rejects the old tc01 `.ex.` plain-LDSM grammar.  Deleting the six
+// direct atoms keeps an unused header valid while making any ppu001 call fail
+// in C++ at the call site.  Do not infer a replacement from the swzl opcode:
+// plain x1/x2/x4 N/T forms need their own SDK compile and numerical gate.
+struct PPU_U32x1_LDSM_N {
+  using SRegisters = uint128_t[1]; using DRegisters = uint32_t[1];
+  CUTE_HOST_DEVICE static void copy(uint128_t const&, uint32_t&) = delete;
+};
+struct PPU_U32x2_LDSM_N {
+  using SRegisters = uint128_t[1]; using DRegisters = uint32_t[2];
+  CUTE_HOST_DEVICE static void copy(uint128_t const&, uint32_t&, uint32_t&) = delete;
+};
+struct PPU_U32x4_LDSM_N {
+  using SRegisters = uint128_t[1]; using DRegisters = uint32_t[4];
+  CUTE_HOST_DEVICE static void copy(
+      uint128_t const&, uint32_t&, uint32_t&, uint32_t&, uint32_t&) = delete;
+};
+struct PPU_U16x2_LDSM_T {
+  using SRegisters = uint128_t[1]; using DRegisters = uint32_t[1];
+  CUTE_HOST_DEVICE static void copy(uint128_t const&, uint32_t&) = delete;
+};
+struct PPU_U16x4_LDSM_T {
+  using SRegisters = uint128_t[1]; using DRegisters = uint32_t[2];
+  CUTE_HOST_DEVICE static void copy(uint128_t const&, uint32_t&, uint32_t&) = delete;
+};
+struct PPU_U16x8_LDSM_T {
+  using SRegisters = uint128_t[1]; using DRegisters = uint32_t[4];
+  CUTE_HOST_DEVICE static void copy(
+      uint128_t const&, uint32_t&, uint32_t&, uint32_t&, uint32_t&) = delete;
+};
+
+#else
+
 struct PPU_U32x1_LDSM_N
 {
   using SRegisters = uint128_t[1];
@@ -61,14 +97,9 @@ struct PPU_U32x1_LDSM_N
        uint32_t& dst)
   {
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];\n"    
-        : "=r"(dst)
-        :  "r"(smem_int_ptr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
-    "ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];\n"    
+    "ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];\n"
         : "=r"(dst)
         :  "r"(smem_int_ptr));
 #endif
@@ -85,14 +116,9 @@ struct PPU_U32x2_LDSM_N
        uint32_t& dst0, uint32_t& dst1)
   {
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"    
-        : "=r"(dst0), "=r"(dst1)
-        :  "r"(smem_int_ptr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
-    "ppu.tc02.ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"    
+    "ppu.tc02.ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
         : "=r"(dst0), "=r"(dst1)
         :  "r"(smem_int_ptr));
 #endif
@@ -109,14 +135,9 @@ struct PPU_U32x4_LDSM_N
        uint32_t& dst0, uint32_t& dst1, uint32_t& dst2, uint32_t& dst3)
   {
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"    
-        : "=r"(dst0), "=r"(dst1), "=r"(dst2), "=r"(dst3)
-        :  "r"(smem_int_ptr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
-    "ppu.tc02.ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"    
+    "ppu.tc02.ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(dst0), "=r"(dst1), "=r"(dst2), "=r"(dst3)
         :  "r"(smem_int_ptr));
 #endif
@@ -133,14 +154,9 @@ struct PPU_U16x2_LDSM_T
        uint32_t& dst)
   {
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];\n"    
-        : "=r"(dst)
-        :  "r"(smem_int_ptr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
-    "ppu.tc02.ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];\n"    
+    "ppu.tc02.ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];\n"
         : "=r"(dst)
         :  "r"(smem_int_ptr));
 #endif
@@ -157,14 +173,9 @@ struct PPU_U16x4_LDSM_T
        uint32_t& dst0, uint32_t& dst1)
   {
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"    
-        : "=r"(dst0), "=r"(dst1)
-        :  "r"(smem_int_ptr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
-    "ppu.tc02.ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"    
+    "ppu.tc02.ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
         : "=r"(dst0), "=r"(dst1)
         :  "r"(smem_int_ptr));
 #endif
@@ -181,23 +192,36 @@ struct PPU_U16x8_LDSM_T
        uint32_t& dst0, uint32_t& dst1, uint32_t& dst2, uint32_t& dst3)
   {
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"    
-        : "=r"(dst0), "=r"(dst1), "=r"(dst2), "=r"(dst3)
-        :  "r"(smem_int_ptr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
-    "ppu.tc02.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"    
+    "ppu.tc02.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(dst0), "=r"(dst1), "=r"(dst2), "=r"(dst3)
         :  "r"(smem_int_ptr));
 #endif
   }
 };
 
+#endif  // ppu001 direct atoms are deleted; other targets retain existing definitions
+
 //
 // Legacy LDSM interfaces that aren't very useful
 //
+
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
+
+template <class T>
+CUTE_HOST_DEVICE void copy_ldsm(uint128_t const* const, T*) {
+  static_assert(dependent_false<T>,
+                "ppu001 plain LDSM is disabled: its SDK grammar is unproved; use the swzl atom or add a numerical gate");
+}
+
+template <class T>
+CUTE_HOST_DEVICE void copy_ldsm_trans(uint128_t const* const, T*) {
+  static_assert(dependent_false<T>,
+                "ppu001 plain LDSM is disabled: its SDK grammar is unproved; use the swzl atom or add a numerical gate");
+}
+
+#else
 
 template <class T>
 CUTE_HOST_DEVICE
@@ -244,6 +268,8 @@ copy_ldsm_trans(uint128_t const* const smem_ptr,
     static_assert(sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 16, "sizeof(T) is not supported");
   }
 }
+
+#endif  // ppu001 legacy helpers fail on instantiation; other targets are unchanged
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 //

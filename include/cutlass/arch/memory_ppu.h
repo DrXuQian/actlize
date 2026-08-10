@@ -88,6 +88,27 @@ CUTLASS_DEVICE unsigned cutlass_get_smem_pointer(void const *ptr) {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
+
+// The six tc01 plain-LDSM spellings previously present below are rejected by
+// this SDK's assembler. Keep the header includable, but make every attempted
+// ppu001 use fail in C++ instead of reaching assembly with an unproved opcode.
+// ppu0015 retains the existing tc02 implementations in the #else arm.
+template <>
+CUTLASS_DEVICE void ldsm<layout::RowMajor, 1>(Array<unsigned, 1>&, void const*) = delete;
+template <>
+CUTLASS_DEVICE void ldsm<layout::RowMajor, 2>(Array<unsigned, 2>&, void const*) = delete;
+template <>
+CUTLASS_DEVICE void ldsm<layout::RowMajor, 4>(Array<unsigned, 4>&, void const*) = delete;
+template <>
+CUTLASS_DEVICE void ldsm<layout::ColumnMajor, 1>(Array<unsigned, 1>&, void const*) = delete;
+template <>
+CUTLASS_DEVICE void ldsm<layout::ColumnMajor, 2>(Array<unsigned, 2>&, void const*) = delete;
+template <>
+CUTLASS_DEVICE void ldsm<layout::ColumnMajor, 4>(Array<unsigned, 4>&, void const*) = delete;
+
+#else
+
 template <>
 CUTLASS_DEVICE void ldsm<layout::RowMajor, 1>(
     Array<unsigned, 1> & D,
@@ -96,10 +117,7 @@ CUTLASS_DEVICE void ldsm<layout::RowMajor, 1>(
     unsigned addr = cutlass_get_smem_pointer(ptr);
 
     int x;
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];"     : "=r"(x) : "r"(addr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
     "ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];"     : "=r"(x) : "r"(addr));
 #endif
@@ -116,10 +134,7 @@ CUTLASS_DEVICE void ldsm<layout::RowMajor, 2>(
     unsigned addr = cutlass_get_smem_pointer(ptr);
 
     int x, y;
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];"     : "=r"(x), "=r"(y) : "r"(addr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
     "ppu.tc02.ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];"     : "=r"(x), "=r"(y) : "r"(addr));
 #endif
@@ -136,10 +151,7 @@ CUTLASS_DEVICE void ldsm<layout::RowMajor, 4>(
     unsigned addr = cutlass_get_smem_pointer(ptr);
 
     int x, y, z, w;
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];"     : "=r"(x), "=r"(y), "=r"(z), "=r"(w) : "r"(addr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
     "ppu.tc02.ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];"     : "=r"(x), "=r"(y), "=r"(z), "=r"(w) : "r"(addr));
 #endif
@@ -160,10 +172,7 @@ CUTLASS_DEVICE void ldsm<layout::ColumnMajor, 1>(
     unsigned addr = cutlass_get_smem_pointer(ptr);
 
     int x;
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];"     : "=r"(x) : "r"(addr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
     "ppu.tc02.ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];"     : "=r"(x) : "r"(addr));
 #endif
@@ -181,10 +190,7 @@ CUTLASS_DEVICE void ldsm<layout::ColumnMajor, 2>(
     unsigned addr = cutlass_get_smem_pointer(ptr);
 
     int x, y;
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];"     : "=r"(x), "=r"(y) : "r"(addr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
     "ppu.tc02.ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];"     : "=r"(x), "=r"(y) : "r"(addr));
 #endif
@@ -201,15 +207,14 @@ CUTLASS_DEVICE void ldsm<layout::ColumnMajor, 4>(
     unsigned addr = cutlass_get_smem_pointer(ptr);
 
     int x, y, z, w;
-#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-asm volatile (
-    "ppu.tc01.ex.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];"     : "=r"(x), "=r"(y), "=r"(z), "=r"(w) : "r"(addr));
-#elif (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+#if (defined __HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
 asm volatile(
     "ppu.tc02.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];"     : "=r"(x), "=r"(y), "=r"(z), "=r"(w) : "r"(addr));
 #endif
     reinterpret_cast<int4 &>(D) = make_int4(x, y, z, w);
 }
+
+#endif  // ppu001 plain LDSM fail-closed; other targets retain existing definitions
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
