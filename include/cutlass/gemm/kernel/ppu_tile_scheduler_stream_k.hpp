@@ -74,7 +74,6 @@ public:
   using BarrierType = typename NamedBarrierManager<1>::T;
 
   using Params = PersistentTileSchedulerPPUStreamKParamsT<MinItersPerSkUnit>;
-  static constexpr uint32_t MinIters = MinItersPerSkUnit;
   using ReductionMode = typename Params::ReductionMode;
   using DecompositionMode = typename Params::DecompositionMode;
 
