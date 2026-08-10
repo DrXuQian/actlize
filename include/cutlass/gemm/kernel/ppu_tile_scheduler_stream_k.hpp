@@ -46,7 +46,8 @@ namespace cutlass::gemm::kernel::detail {
 template <
   class TileShape,
   class ClusterShape,
-  uint32_t MinItersPerSkUnit = 8u
+  uint32_t MinItersPerSkUnit = 8u,
+  uint32_t FixupThreadsPerCta = NumThreadsPerWarpGroup
 >
 class PersistentTileSchedulerPPUStreamK {
   //
@@ -69,6 +70,12 @@ public:
   using RasterOrder = UnderlyingScheduler::RasterOrder;
   using RasterOrderOptions = UnderlyingScheduler::RasterOrderOptions;
   static constexpr bool IsDynamicPersistent = false;
+  // One cohort owns both the named-barrier arrival count and the block-striped
+  // FP32 workspace indices.  It must match the exact CTA size: 64-as-128 can
+  // deadlock and leave holes, while 128-as-64 aliases the two half-CTAs.
+  static constexpr uint32_t FixupThreadCount = FixupThreadsPerCta;
+  static_assert(FixupThreadCount == 64u || FixupThreadCount == 128u,
+                "PPU Stream-K fixup supports exactly 64- or 128-thread CTAs");
 
   // Use a dummy barrier manager to simply get the type used to store the barrier
   using BarrierType = typename NamedBarrierManager<1>::T;
@@ -402,7 +409,7 @@ public:
     uint32_t barrier_idx) {
     static constexpr uint32_t Offset = static_cast<int>(cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
     static constexpr uint32_t MaxNumNamedBarriers = 2;
-    using BarrierManager = NamedBarrierManager<NumThreadsPerWarpGroup, Offset, MaxNumNamedBarriers>;
+    using BarrierManager = NamedBarrierManager<FixupThreadCount, Offset, MaxNumNamedBarriers>;
     return fixup_helper<FrgTensorC, BarrierManager>(
       params, work_tile_info, accumulators, num_barriers, barrier_idx);
   }
