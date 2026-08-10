@@ -181,5 +181,64 @@ struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, Ins
   }
 };
 
-} // namespace cute
+// Logical two-register view of the physical PPU0010 m8n8.x4 swizzle load used
+// by m8n16k16's A operand.  v2/v3 are intentionally absent from every CuTe
+// layout: they are an implementation detail contained by
+// PPU0010_TSM_LD_SWZL_M8 and must never enlarge or overwrite the m8 A
+// fragment.
+template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans,
+          int InstNum, int CubePitch>
+struct Copy_Traits<PPU0010_TSM_LD_SWZL_M8<
+    Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch>>
+{
+  using Operation = PPU0010_TSM_LD_SWZL_M8<
+      Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch>;
 
+  using ThrID = Layout<_32>;
+
+  // Four fp16 values (64 bits) per lane are the semantic source and
+  // destination of this projected copy.  The raw instruction's other two
+  // registers never enter the logical partition.
+  using SrcLayout = Layout<Shape<_32, _64>, Stride<_64, _1>>;
+  using DstLayout = Layout<Shape<_32, Shape<_32, _2>>,
+                           Stride<_32, Stride<_1, _1024>>>;
+  using RefLayout = DstLayout;
+
+  static_assert(size<0>(SrcLayout{}) == 32 && size<1>(SrcLayout{}) == 64,
+                "PPU0010 m8 A projected source must be 64 bits per lane");
+  static_assert(size<0>(DstLayout{}) == 32 && size<1>(DstLayout{}) == 64 &&
+                    size<1, 1>(DstLayout{}) == Operation::kLogicalRegisters,
+                "PPU0010 m8 A projected destination must contain exactly two registers per lane");
+  static_assert(size(SrcLayout{}) == size(DstLayout{}),
+                "PPU0010 m8 A projection must preserve its logical bit count");
+
+  void *smem_base_;
+
+  template <class Coord, int... Is>
+  CUTE_HOST_DEVICE constexpr
+  void
+  copy_unpack_(void *dst_ptr, void *src_ptr,
+               Coord const& src_coord, seq<Is...>) const
+  {
+    Operation::copy(dst_ptr, src_ptr, get<Is>(src_coord)...);
+  }
+
+  template <class TS, class SLayout,
+            class TD, class DLayout>
+  CUTE_HOST_DEVICE friend constexpr
+  void
+  copy_unpack(Copy_Traits        const& traits,
+              Tensor<TS,SLayout> const& src,
+              Tensor<TD,DLayout>      & dst)
+  {
+    if constexpr (is_mix_iterator<typename TS::iterator>::value) {
+      traits.copy_unpack_(cute::raw_pointer_cast(dst.data()), src.data().ptr_.get(),
+                          src.data().coord_, tuple_seq<decltype(src.data().coord_)>{});
+    } else {
+      traits.copy_unpack_(cute::raw_pointer_cast(dst.data()), traits.smem_base_,
+                          src.data().coord_, tuple_seq<decltype(src.data().coord_)>{});
+    }
+  }
+};
+
+} // namespace cute

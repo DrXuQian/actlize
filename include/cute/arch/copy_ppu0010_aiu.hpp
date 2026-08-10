@@ -552,5 +552,45 @@ struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, true, InstNum, CubePit
   }
 
 };
+
+// PPU0010 m8n16k16 consumes only the upper-eight-row half of the physical
+// m8n8.x4 swizzle delivery.  The hardware instruction still writes four
+// registers, so exposing the ordinary PPU0010_TSM_LD_SWZL operation to an m8
+// A fragment (two registers) would either fail CopyAtom matching or overwrite
+// the fragment.  Keep the physical x4 operation intact, contain all four
+// outputs in a private temporary, and publish only v0/v1.
+//
+// This is deliberately a narrow operation rather than a mode on the shipping
+// x4 atom.  The latter is used by every m16 mixed-input path and its four-value
+// contract must remain unchanged.
+template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans,
+          int InstNum = 1, int CubePitch = 0>
+struct PPU0010_TSM_LD_SWZL_M8 {
+  static_assert(is_same_v<Element, half_t>,
+                "PPU0010 m8 A projection is defined only for fp16 operands");
+  static_assert(Swap,
+                "PPU0010 m8 A projection requires the production swap=true swizzle pairing");
+  static_assert(!Trans,
+                "PPU0010 m8 A projection is defined only for the non-transposed A read");
+  static_assert(CUBE_W > 0 && InstNum > 0,
+                "PPU0010 m8 A projection requires a non-empty physical cube");
+
+  static constexpr int kPhysicalRegisters = 4;
+  static constexpr int kLogicalRegisters = 2;
+
+  CUTE_HOST_DEVICE static void
+  copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h,
+       int cube_in_stage = 0, int stage = 0)
+  {
+    uint32_t physical[kPhysicalRegisters];
+    PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans,
+                        InstNum, CubePitch>::copy(
+        physical, smem_base, coord_w, coord_h, cube_in_stage, stage);
+
+    uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
+    logical[0] = physical[0];
+    logical[1] = physical[1];
+  }
+};
 #undef DEBUG_PRINT
 } // namespace cute

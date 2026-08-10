@@ -283,12 +283,20 @@ private:
   constexpr static int WarpN = cute::get<1>(WarpShape_MNK{});
   using WarpOnM = Int<BlockM / WarpM>;
   using WarpOnN = Int<BlockN / WarpN>;
+  static constexpr bool UseM8 = cute::is_same_v<Arch, cutlass::arch::PPU0010> &&
+                                BlockM == 8 && WarpM == 8;
+  using InstM = cute::conditional_t<UseM8, Int<8>, Int<16>>;
   static constexpr int ThreadNum = WarpOnM() * WarpOnN() * 32;
   static constexpr int FragmentSize = BlockM * BlockN / ThreadNum;
   static constexpr int Alignment = platform::min(AlignmentC, AlignmentD);
 
   using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<128>;
-  using GemmEpilogueConfiguration = gemm::config::DefaultGemm_Epilogue_Configuration<EpilogueCopyInst, ElementAccumulator, Alignment, Int<BlockM>, Int<BlockN>, WarpOnM, ThreadNum>;
+  using GemmEpilogueConfiguration = gemm::config::DefaultGemm_Epilogue_Configuration<
+      EpilogueCopyInst, ElementAccumulator, Alignment, Int<BlockM>, Int<BlockN>,
+      WarpOnM, ThreadNum, InstM>;
+  static_assert(cute::size<0>(typename GemmEpilogueConfiguration::SmemLayoutO{}) ==
+                    int(WarpOnM()) * int(InstM()),
+                "PPU modern epilogue layout must carry the selected instruction M");
   using EpilogueDispatchPolicy = cute::conditional_t<(cute::is_same_v<Schedule, EpiloguePtrArraySimtVectorized> || detail::ppu_is_ptr_array_tma_v<Schedule>),
                                                      EpiloguePtrArraySimtVectorized,
                                                      cutlass::epilogue::EpilogueSimtVectorized>;

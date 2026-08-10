@@ -482,8 +482,12 @@ template <
   typename BlockM,
   typename BlockN,
   typename WarpOnM,
-  int ThreadNum
+  int ThreadNum,
+  typename InstM = Int<16>
 > struct DefaultGemm_Epilogue_Configuration {
+  static_assert(InstM() == 8 || InstM() == 16,
+                "PPU epilogue instruction M must be 8 or 16");
+  static constexpr int SmemM = int(WarpOnM()) * int(InstM());
   static constexpr int ElemInLine = min(BlockN(), 128 / sizeof(ElementAcc));
   static constexpr bool kFactor = 128 / ElemInLine / sizeof(ElementAcc);
   static constexpr int SwizzleIdx = kFactor == 1 ? 3 : (kFactor == 2 ? 2 : 1);
@@ -495,7 +499,10 @@ template <
 
   using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
-        Shape<Int<WarpOnM() * 16>, BlockN>{}));
+        Shape<Int<SmemM>, BlockN>{}));
+
+  static_assert(size<0>(SmemLayoutO{}) == SmemM,
+                "PPU epilogue smem M must equal M-warps times the selected instruction M");
 
   using EpilogueTile = decltype(shape(coalesce(make_layout(shape(SmemLayoutO{})), Step<_1, _1>{})));
   
