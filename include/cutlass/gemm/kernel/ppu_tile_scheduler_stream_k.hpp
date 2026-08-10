@@ -45,7 +45,8 @@ namespace cutlass::gemm::kernel::detail {
 // Persistent Thread Block (TB) scheduler leveraging stream-K decomposition
 template <
   class TileShape,
-  class ClusterShape
+  class ClusterShape,
+  uint32_t MinItersPerSkUnit = 8u
 >
 class PersistentTileSchedulerPPUStreamK {
   //
@@ -72,9 +73,10 @@ public:
   // Use a dummy barrier manager to simply get the type used to store the barrier
   using BarrierType = typename NamedBarrierManager<1>::T;
 
-  using Params = PersistentTileSchedulerPPUStreamKParams;
-  using ReductionMode = Params::ReductionMode;
-  using DecompositionMode = Params::DecompositionMode;
+  using Params = PersistentTileSchedulerPPUStreamKParamsT<MinItersPerSkUnit>;
+  static constexpr uint32_t MinIters = MinItersPerSkUnit;
+  using ReductionMode = typename Params::ReductionMode;
+  using DecompositionMode = typename Params::DecompositionMode;
 
   struct WorkTileInfo {
     int32_t M_idx = 0;

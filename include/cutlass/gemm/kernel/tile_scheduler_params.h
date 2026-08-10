@@ -353,8 +353,15 @@ struct PersistentTileSchedulerPPUParams {
   }
 };
 
-// Parameters for PPU persistent stream-K scheduler
-struct PersistentTileSchedulerPPUStreamKParams {
+// Parameters for PPU persistent stream-K scheduler.  Keep the scheduling
+// quantum in the Params type: host decomposition and device-side ownership
+// repair must use one compile-time value or they can silently disagree about
+// which CTA owns a K seam.
+template <uint32_t MinItersPerSkUnit>
+struct PersistentTileSchedulerPPUStreamKParamsT {
+
+  static_assert(MinItersPerSkUnit > 0,
+                "Stream-K requires at least one K tile per work unit");
 
   // Strategies for computing reductions between CTAs computing portions of a given output tile
   enum class ReductionMode {
@@ -462,7 +469,7 @@ struct PersistentTileSchedulerPPUStreamKParams {
   uint32_t separate_reduction_units_ = 0;
 
   // Minimum number of k tiles that can be assigned to a stream-K unit
-  static constexpr uint32_t min_iters_per_sk_unit_ = 8u;
+  static constexpr uint32_t min_iters_per_sk_unit_ = MinItersPerSkUnit;
 
   // Maximum number of groups of stream-K units
   static constexpr uint32_t max_sk_groups_ = 8u;
@@ -1540,6 +1547,12 @@ struct PersistentTileSchedulerPPUStreamKParams {
     return splits;
   }
 };
+
+// Backwards-compatible spelling and policy for every existing actlize caller.
+// Quactlize's short-stripe experiments instantiate ParamsT explicitly rather
+// than changing this default.
+using PersistentTileSchedulerPPUStreamKParams =
+    PersistentTileSchedulerPPUStreamKParamsT<8u>;
 
 
 ////////////////////////////////////////////////////////////////////////////////
