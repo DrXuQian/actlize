@@ -116,6 +116,27 @@ struct GetMmaInst<Arch, cutlass::half_t, cutlass::half_t, float> {
   >;
 };
 
+// Shape-aware refinement of GetMmaInst.  The type-only selector above remains the default for every existing
+// caller and every existing tile.  PPU0010's m8n16k16 is deliberately exposed only for the one geometry whose
+// logical M extent and warp M extent are both eight; selecting it for all fp16/fp32-accumulate GEMMs would silently
+// change every established m16 kernel, while selecting it for a wider TileM/WarpM would merely issue multiple m8
+// atoms and recover none of the decode padding reduction this path exists for.
+//
+// PPU0015 is intentionally NOT accepted here.  The assembler knows the spelling, but llc has no ppu0015 ISel for
+// llvm.ppu.mma.f32.f16.m8n16k16.  The standalone G0 negative build instantiates the raw atom on ppu0015 and requires
+// that precise failure; a selector fallback must never make an unsupported m8 request look successful.
+template <typename Arch, typename TypeA, typename TypeB, typename TypeAcc, int TileM, int WarpM>
+struct GetMmaInstForShape : GetMmaInst<Arch, TypeA, TypeB, TypeAcc> {};
+
+template <int TileM, int WarpM>
+struct GetMmaInstForShape<cutlass::arch::PPU0010,
+                          cutlass::half_t, cutlass::half_t, float, TileM, WarpM> {
+  using type = cute::conditional_t<
+      TileM == 8 && WarpM == 8,
+      PPU0010_8x16x16_F32F16F16F32_TN,
+      PPU0010_16x16x16_F32F16F16F32_TN>;
+};
+
 template <typename Arch>
 struct GetMmaInst<Arch, cutlass::half_t, cutlass::half_t, cutlass::half_t> {
   using type = cute::conditional_t<
@@ -639,5 +660,3 @@ template <
 } // namespace config
 } // namespace gemm
 } // namespace cutlass
-
-

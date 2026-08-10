@@ -49,7 +49,27 @@ namespace {
 using PPU0010_16x16_Row = Layout<Shape <Shape < _4,_8>,Shape < _4,_2>>,
                               Stride<Stride<_16,_1>,Stride<_64,_8>>>;
 
+using PPU0010_8x16_Row = Layout<Shape <Shape < _4,_8>,_4>,
+                             Stride<Stride<_8,_1>,_32>>;
+
 }
+
+template <>
+struct MMA_Traits<PPU0010_8x16x16_F32F16F16F32_TN>
+{
+  using ValTypeD = float;
+  using ValTypeA = half_t;
+  using ValTypeB = half_t;
+  using ValTypeC = float;
+
+  using Shape_MNK = Shape<_8,_16,_16>;
+  using ThrID   = Layout<_32>;
+  using ALayout = Layout<Shape <Shape < _4,_8>,Shape < _2,_2>>,
+                         Stride<Stride<_16,_1>,Stride<_8,_64>>>;
+  using BLayout = Layout<Shape <Shape < _4,_8>,Shape < _2,_2,_2>>,
+                         Stride<Stride<_32,_1>,Stride<_16,_128,_8>>>;
+  using CLayout = PPU0010_8x16_Row;
+};
 
 template <>
 struct MMA_Traits<PPU0010_16x16x16_F16F16F16F16_TN>

@@ -38,6 +38,36 @@
 
 namespace cute {
 
+struct PPU0010_8x16x16_F32F16F16F32_TN
+{
+  using DRegisters = float[4];
+  using ARegisters = uint32_t[2];
+  using BRegisters = uint32_t[4];
+  using CRegisters = float[4];
+
+  CUTE_HOST_DEVICE static void
+  fma(float         & d0, float         & d1, float         & d2, float         & d3,
+      uint32_t const& a0, uint32_t const& a1,
+      uint32_t const& b0, uint32_t const& b1, uint32_t const& b2, uint32_t const& b3,
+      float const   & c0, float const   & c1, float const   & c2, float const   & c3)
+  {
+#if defined(__HGGC_ARCH__)
+    // Keep the canonical ppu001-only m8 instruction visible to every device
+    // compilation.  Unsupported targets must fail during intrinsic selection;
+    // asm volatile does not bypass that lowering and no tc02/m16 fallback is safe.
+asm volatile(
+    "ppu.mma.sync.aligned.m8n16k16.row.col.f32.f16.f16.f32  {%0,%1,%2,%3}, {%4,%5}, {%6,%7,%8,%9}, "
+        "{%10,%11,%12,%13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1),
+          "r"(b0), "r"(b1), "r"(b2), "r"(b3),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+#else
+      CUTE_INVALID_CONTROL_PATH("Attempting to use PPU0010_8x16x16_F32F16F16F32_TN without device ARCH");
+#endif
+  }
+};
+
 struct PPU0010_16x16x16_F32F16F16F32_TN
 {
   using DRegisters = float[8];
