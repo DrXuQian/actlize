@@ -212,7 +212,11 @@ class NamedBarrier {
   CUTLASS_DEVICE
   static void arrive_and_wait_internal(uint32_t num_threads, uint32_t barrier_id) {
 #if PPU_BARRIER_ENABLED || defined(__HGGCCC__)
-    asm volatile("ppu.bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads));
+    // A hardware barrier encoded in inline asm is opaque to the C++ compiler.
+    // Keep the upstream CUTLASS compiler-fence contract: ordinary workspace
+    // stores must not sink past a producer sync, and consumer loads must not
+    // rise above its acquire-side sync.
+    asm volatile("ppu.bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads) : "memory");
     cutlass::arch::synclog_emit_named_barrier_arrive_and_wait(__LINE__, num_threads, barrier_id);
 #endif
   }
@@ -220,7 +224,7 @@ class NamedBarrier {
   CUTLASS_DEVICE
   static void arrive_and_wait_internal_unaligned(uint32_t num_threads, uint32_t barrier_id) {
 #if PPU_BARRIER_ENABLED
-    asm volatile("ppu.bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads));
+    asm volatile("ppu.bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads) : "memory");
     cutlass::arch::synclog_emit_named_barrier_arrive_and_wait(__LINE__, num_threads, barrier_id);
 #endif
   }
@@ -229,7 +233,7 @@ class NamedBarrier {
   static void arrive_internal(uint32_t num_threads, uint32_t barrier_id) {
 #if PPU_BARRIER_ENABLED || defined(__HGGCCC__)
     cutlass::arch::synclog_emit_named_barrier_arrive(__LINE__, num_threads, barrier_id);
-    asm volatile("ppu.bar.arrive %0, %1;" : : "r"(barrier_id), "r"(num_threads));
+    asm volatile("ppu.bar.arrive %0, %1;" : : "r"(barrier_id), "r"(num_threads) : "memory");
 #endif
   }
 
@@ -237,7 +241,7 @@ class NamedBarrier {
   static void arrive_internal_unaligned(uint32_t num_threads, uint32_t barrier_id) {
 #if PPU_BARRIER_ENABLED
     cutlass::arch::synclog_emit_named_barrier_arrive(__LINE__, num_threads, barrier_id);
-    asm volatile("ppu.bar.arrive %0, %1;" : : "r"(barrier_id), "r"(num_threads));
+    asm volatile("ppu.bar.arrive %0, %1;" : : "r"(barrier_id), "r"(num_threads) : "memory");
 #endif
   }
 
