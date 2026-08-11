@@ -34,6 +34,7 @@
 
 #include "cutlass/gemm/kernel/ppu0015_tile_scheduler.hpp"
 #include "cutlass/gemm/kernel/ppu_tile_scheduler_stream_k.hpp"
+#include "cutlass/gemm/kernel/ppu_tile_scheduler_marlin.hpp"
 #include "cutlass/gemm/kernel/ppu_tile_scheduler_group.hpp"
 namespace cutlass::gemm {
 
@@ -43,6 +44,7 @@ namespace cutlass::gemm {
 
 struct PersistentScheduler { };
 struct StreamKScheduler { };
+struct MarlinScheduler { };
 struct GroupScheduler { }; // Only used for Grouped GEMMs
 
 struct SplitKSerialScheduler { };
@@ -99,6 +101,20 @@ struct TileSchedulerSelector<
   ClusterShape
   > {
   using Scheduler = PersistentTileSchedulerPPUStreamK<TileShape, ClusterShape>;
+};
+
+template <
+  typename Arch,
+  class TileShape,
+  class ClusterShape
+>
+struct TileSchedulerSelector<
+  MarlinScheduler,
+  Arch,
+  TileShape,
+  ClusterShape
+  > {
+  using Scheduler = PersistentTileSchedulerPPUMarlin<TileShape, ClusterShape>;
 };
 
 template <
