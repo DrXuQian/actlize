@@ -159,6 +159,26 @@ struct BlockStriped
     }
   }
 
+  /// Predicated load & add. Predicate is indexed in the same scalar-striped
+  /// register order as AccessT; barrier participation is owned by the caller.
+  template <class Predicate>
+  CUTLASS_DEVICE
+  static void load_add(ArrayT &data, ArrayT *ptr, int thread_idx, Predicate const& predicate)
+  {
+    AccessT *access_input = reinterpret_cast<AccessT*>(ptr);
+    AccessT *access_data = reinterpret_cast<AccessT*>(&data);
+
+    plus<AccessT> add;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kStripes; ++i)
+    {
+      if (predicate(i)) {
+        access_data[i] = add(access_data[i], access_input[(BlockThreads * i) + thread_idx]);
+      }
+    }
+  }
+
   /// Store
   CUTLASS_DEVICE
   static void store(ArrayT *ptr, const ArrayT &data, int thread_idx)
@@ -169,6 +189,22 @@ struct BlockStriped
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < kStripes; ++i) {
       access_output[(BlockThreads * i) + thread_idx] = access_data[i];
+    }
+  }
+
+  /// Predicated store in scalar-striped register order.
+  template <class Predicate>
+  CUTLASS_DEVICE
+  static void store(ArrayT *ptr, const ArrayT &data, int thread_idx, Predicate const& predicate)
+  {
+    AccessT *access_output = reinterpret_cast<AccessT*>(ptr);
+    const AccessT *access_data = reinterpret_cast<const AccessT*>(&data);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kStripes; ++i) {
+      if (predicate(i)) {
+        access_output[(BlockThreads * i) + thread_idx] = access_data[i];
+      }
     }
   }
 
@@ -204,6 +240,24 @@ struct BlockStripedReduce :
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < BlockStripedReduce::kStripes; ++i) {
       reduce(access_output + (BlockThreads * i) + thread_idx, access_data[i]);
+    }
+  }
+
+  /// Predicated scalar atomic reduction. The half2 specialization deliberately
+  /// has no such overload: one predicate bit must name exactly one accumulator.
+  template <class Predicate>
+  CUTLASS_DEVICE
+  static void reduce(ArrayT *ptr, const ArrayT &data, int thread_idx, Predicate const& predicate)
+  {
+    cutlass::atomic_add<ElementT> reduce;
+    ElementT *access_output = reinterpret_cast<ElementT*>(ptr);
+    const ElementT *access_data = reinterpret_cast<const ElementT*>(&data);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < BlockStripedReduce::kStripes; ++i) {
+      if (predicate(i)) {
+        reduce(access_output + (BlockThreads * i) + thread_idx, access_data[i]);
+      }
     }
   }
 };

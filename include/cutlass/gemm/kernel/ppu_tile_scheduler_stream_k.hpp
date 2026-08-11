@@ -414,6 +414,26 @@ public:
       params, work_tile_info, accumulators, num_barriers, barrier_idx);
   }
 
+  // Residue-aware overload.  The five-argument spelling above deliberately
+  // remains the full-tile fast path; only logical accumulator accesses are
+  // predicated here, never the lock wait/arrival protocol.
+  template <class FrgTensorC, class Predicate>
+  CUTLASS_DEVICE
+  static void
+  fixup(
+    Params const& params,
+    WorkTileInfo const& work_tile_info,
+    FrgTensorC& accumulators,
+    uint32_t num_barriers,
+    uint32_t barrier_idx,
+    Predicate const& predicate) {
+    static constexpr uint32_t Offset = static_cast<int>(cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
+    static constexpr uint32_t MaxNumNamedBarriers = 2;
+    using BarrierManager = NamedBarrierManager<FixupThreadCount, Offset, MaxNumNamedBarriers>;
+    return fixup_helper_predicated<FrgTensorC, BarrierManager>(
+      params, work_tile_info, accumulators, num_barriers, barrier_idx, predicate);
+  }
+
   // Helper for performing the reduction across splits for a given output tile.
   template <class FrgTensorC, class BarrierManager>
   CUTLASS_DEVICE
@@ -540,6 +560,90 @@ public:
       // The block computing the final split for the tile adds previously-reduced partials
       // to its accumulators and computes the epilogue.
       BlockStripedReduceT::load_add(*accumulator_array, reduction_workspace_array, barrier_group_thread_idx);
+    }
+  }
+
+  // The predicated path implements Marlin's effective-row guard while keeping
+  // Stream-K's FP32 workspace and ordered K_idx lock chain.  Separate
+  // reduction is not part of this API: Params currently disables it at
+  // decomposition time, and silently predicating only one side would be wrong.
+  template <class FrgTensorC, class BarrierManager, class Predicate>
+  CUTLASS_DEVICE
+  static void
+  fixup_helper_predicated(
+      Params const& params,
+      WorkTileInfo const& work_tile_info,
+      FrgTensorC& accumulators,
+      uint32_t num_barriers,
+      uint32_t barrier_idx,
+      Predicate const& predicate,
+      uint32_t num_accumulator_mtxs = 1) {
+    using ElementAccumulator = typename FrgTensorC::value_type;
+    if (!requires_fixup(params, work_tile_info)) {
+      return;
+    }
+
+    CUTLASS_ASSERT(!params.requires_separate_reduction());
+    CUTLASS_ASSERT(!work_tile_info.is_reduction_unit());
+    CUTLASS_ASSERT(num_accumulator_mtxs == 1);
+
+    uint64_t tile_idx = output_tile_index(params, work_tile_info);
+    uint64_t lock_idx = (tile_idx * num_barriers) + barrier_idx;
+    uint64_t reduction_offset =
+      (static_cast<uint64_t>(cute::size<0>(TileShape{})) *
+       static_cast<uint64_t>(cute::size<1>(TileShape{})) * tile_idx * num_accumulator_mtxs) +
+      (static_cast<uint64_t>(size(accumulators)) * barrier_idx * BarrierManager::ThreadCount);
+
+    ElementAccumulator* group_reduction_workspace =
+      reinterpret_cast<ElementAccumulator*>(params.reduction_workspace_) + reduction_offset;
+    using AccumulatorArrayT = Array<typename FrgTensorC::value_type, size(FrgTensorC{})>;
+    using BlockStripedReduceT = BlockStripedReduce<BarrierManager::ThreadCount, AccumulatorArrayT>;
+    static_assert(BlockStripedReduceT::kStripes == size(FrgTensorC{}),
+                  "one residue predicate must name exactly one scalar accumulator");
+
+    AccumulatorArrayT* reduction_workspace_array =
+      reinterpret_cast<AccumulatorArrayT*>(group_reduction_workspace);
+    AccumulatorArrayT* accumulator_array =
+      reinterpret_cast<AccumulatorArrayT*>(accumulators.data());
+    uint32_t barrier_group_thread_idx = threadIdx.x % BarrierManager::ThreadCount;
+
+    uint32_t reduction_tiles = params.divmod_splits_.divisor > 1
+      ? params.units_per_problem_ : params.sk_tiles_;
+    uint64_t reduction_workspace_size = Params::get_reduction_workspace_size(
+      reduction_tiles, to_gemm_coord(TileShape{}), sizeof_bits<ElementAccumulator>::value,
+      num_accumulator_mtxs);
+    BarrierType* lock_workspace = reinterpret_cast<BarrierType*>(
+      reinterpret_cast<uint8_t*>(params.reduction_workspace_) + reduction_workspace_size);
+
+    if (!compute_epilogue(work_tile_info, params)) {
+      if (work_tile_info.K_idx == 0) {
+        BlockStripedReduceT::store(
+          reduction_workspace_array, *accumulator_array, barrier_group_thread_idx, predicate);
+      }
+      else {
+        BarrierManager::wait_eq(
+          barrier_idx, lock_workspace, barrier_group_thread_idx, lock_idx, work_tile_info.K_idx);
+        BlockStripedReduceT::reduce(
+          reduction_workspace_array, *accumulator_array, barrier_group_thread_idx, predicate);
+      }
+
+      // Lock progress remains unconditional even for threads with no valid
+      // accumulator slots; otherwise a residue tile can deadlock its peers.
+      BarrierManager::arrive_inc(
+        barrier_idx, lock_workspace, barrier_group_thread_idx, lock_idx,
+        work_tile_info.k_tile_count);
+    }
+    else {
+      if (params.reduction_mode_ == ReductionMode::Deterministic) {
+        BarrierManager::wait_eq(
+          barrier_idx, lock_workspace, barrier_group_thread_idx, lock_idx, work_tile_info.K_idx);
+      }
+      else {
+        BarrierManager::wait_lt(
+          barrier_idx, lock_workspace, barrier_group_thread_idx, lock_idx, 1);
+      }
+      BlockStripedReduceT::load_add(
+        *accumulator_array, reduction_workspace_array, barrier_group_thread_idx, predicate);
     }
   }
 
