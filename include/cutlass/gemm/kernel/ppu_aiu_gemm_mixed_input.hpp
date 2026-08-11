@@ -140,6 +140,18 @@ public:
   // Methods
   //
 
+  template <class Mainloop, class Shape, class MainloopArgs>
+  static auto mainloop_can_implement(
+      Shape const& shape, MainloopArgs const& args, int)
+      -> decltype(Mainloop::can_implement(shape, args), bool()) {
+    return Mainloop::can_implement(shape, args);
+  }
+
+  template <class Mainloop, class Shape, class MainloopArgs>
+  static bool mainloop_can_implement(Shape const&, MainloopArgs const&, ...) {
+    return true;  // legacy actlize collectives predate the optional admission seam
+  }
+
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static Params
   to_underlying_arguments(Arguments const& args, void* workspace) {
@@ -160,7 +172,9 @@ public:
 
   static bool
   can_implement(Arguments const& args) {
-    return args.mode == GemmUniversalMode::kGemm;
+    return args.mode == GemmUniversalMode::kGemm &&
+           mainloop_can_implement<CollectiveMainloop>(
+               args.problem_shape, args.mainloop, 0);
   }
 
   static int
