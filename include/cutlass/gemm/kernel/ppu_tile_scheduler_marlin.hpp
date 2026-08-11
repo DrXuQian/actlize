@@ -37,6 +37,18 @@ public:
   using StripeCore = MarlinStripeSchedulerCore;
   using StripeParams = typename StripeCore::Params;
 
+  // This is a structural capability, not a list of benchmark cohorts and not
+  // a claim that every admitted kernel has positive occupancy on every PPU.
+  // The PPU builder launches whole 32-thread warps, while the shared tactic
+  // authority caps one CTA at 32 warps.  Exact accumulator coverage and the
+  // named-barrier arrival count are asserted independently below.
+  CUTLASS_HOST_DEVICE static constexpr bool fixup_thread_count_capable(
+      uint32_t thread_count) {
+    return thread_count >= uint32_t(cutlass::NumThreadsPerWarp) &&
+           thread_count <= 32u * uint32_t(cutlass::NumThreadsPerWarp) &&
+           thread_count % uint32_t(cutlass::NumThreadsPerWarp) == 0;
+  }
+
   static_assert(cute::is_static<TileShape>::value);
   static_assert(cute::is_static<ClusterShape>::value);
   static_assert(cute::size(ClusterShape{}) == 1,
@@ -46,9 +58,9 @@ public:
   // explicit value and assert it against their launch shape.  This prevents a
   // generic 64-thread caller from silently inheriting a default 128-thread
   // barrier cohort merely because TileSchedulerSelector cannot see TiledMma.
-  static_assert(FixupThreadCount == 0 || FixupThreadCount == 64 ||
-                FixupThreadCount == 128,
-                "Marlin cooperative supports only derived/exact 64/128-thread CTA cohorts");
+  static_assert(FixupThreadCount == 0 ||
+                fixup_thread_count_capable(FixupThreadCount),
+                "Marlin cooperative requires a warp-aligned 32..1024-thread CTA cohort");
 
   struct Arguments {};
 
@@ -255,10 +267,12 @@ private:
         uint32_t(TileElements / FragmentElements);
     static constexpr uint32_t Cohort =
         FixupThreadCount == 0 ? DerivedThreadCount : FixupThreadCount;
-    static_assert(Cohort == 64 || Cohort == 128,
-                  "Marlin cooperative derived an unsupported CTA cohort");
+    static_assert(fixup_thread_count_capable(Cohort),
+                  "Marlin cooperative derived a non-capable CTA cohort");
     static_assert(FixupThreadCount == 0 || FixupThreadCount == DerivedThreadCount,
                   "explicit Marlin cooperative cohort disagrees with the accumulator layout");
+    static_assert(Cohort == DerivedThreadCount,
+                  "Marlin cooperative cohort must equal the exact accumulator-derived CTA size");
     using BarrierManager = NamedBarrierManager<
         Cohort,
         static_cast<uint32_t>(cutlass::arch::ReservedNamedBarriers::StreamkBarrier0), 1>;
@@ -267,10 +281,15 @@ private:
     static_assert(
         uint64_t(Cohort) * FragmentElements == TileElements,
         "Marlin cooperative cohort must cover one exact FP32 output tile");
+    static_assert(BarrierManager::ThreadCount == Cohort,
+                  "Marlin named-barrier arrival count must equal the exact CTA cohort");
     static_assert(Striped::kStripes == cute::size(FrgTensorC{}),
                   "Marlin residue predicate must name each scalar accumulator");
 
-    uint32_t const thread = uint32_t(threadIdx.x) % Cohort;
+    // The kernel launches exactly Cohort threads.  A modulo here would hide a
+    // future launch/cooperative mismatch by aliasing surplus threads onto the
+    // same FP32 workspace stripes.
+    uint32_t const thread = uint32_t(threadIdx.x);
     uint64_t const tile_elements = uint64_t(cute::size<0>(TileShape{})) *
                                    uint64_t(cute::size<1>(TileShape{}));
     auto* tile_workspace = reduction_workspace<typename FrgTensorC::value_type>(p) +
