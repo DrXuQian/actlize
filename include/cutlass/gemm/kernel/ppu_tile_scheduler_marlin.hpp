@@ -23,10 +23,10 @@ namespace cutlass::gemm::kernel::detail {
 // Marlin's dispatcher is not Stream-K with a different partition heuristic.
 // It owns one equal-length stripe per launched CTA in the flattened (q, k)
 // space, with K as the fast dimension.  The launch count is part of that
-// decomposition: output tiles already filling the machine get exactly one CTA
-// each; only Q < CU enables cross-CTA K slices.  In particular, occupancy must
-// never multiply the CU count here -- doing so recreates Marlin's measured
-// long peer chains and their catastrophic lock contention.
+// decomposition.  The default launch policy retains classic Marlin's one CTA
+// per CU safety rail.  A host caller may explicitly sweep a larger
+// blocks-per-CU cohort; production must validate that cohort against the
+// instantiated kernel's occupancy before requesting it.
 template <class TileShape_, class ClusterShape_, uint32_t FixupThreadCount_ = 0>
 class PersistentTileSchedulerPPUMarlin {
 public:
@@ -65,7 +65,9 @@ public:
                 fixup_thread_count_capable(FixupThreadCount),
                 "Marlin cooperative requires a warp-aligned 32..1024-thread CTA cohort");
 
-  struct Arguments {};
+  struct Arguments {
+    uint32_t blocks_per_cu = 1;
+  };
 
   struct Params : StripeParams {
     void* workspace_ = nullptr;
@@ -110,10 +112,12 @@ public:
   // to_underlying_arguments and l126 both call this exact function.
   CUTLASS_HOST_DEVICE static constexpr Params make_params_for_tiles(
       uint64_t tiles_m, uint64_t tiles_n, uint64_t tiles_l,
-      uint64_t k_tiles, uint64_t cu_count, void* workspace = nullptr) {
+      uint64_t k_tiles, uint64_t cu_count, void* workspace = nullptr,
+      uint32_t blocks_per_cu = 1) {
     Params p;
     static_cast<StripeParams&>(p) = StripeCore::make_params_for_tiles(
-        tiles_m, tiles_n, tiles_l, k_tiles, cu_count);
+        tiles_m, tiles_n, tiles_l, k_tiles, cu_count,
+        uint64_t(blocks_per_cu));
     p.workspace_ = workspace;
     return p;
   }
@@ -125,7 +129,7 @@ public:
   template <class ProblemShape>
   CUTLASS_HOST_DEVICE static constexpr Params make_params_for_problem_shape(
       ProblemShape problem_shape, uint64_t cu_count,
-      void* workspace = nullptr) {
+      void* workspace = nullptr, uint32_t blocks_per_cu = 1) {
     auto shape = cute::append<4>(problem_shape, cute::Int<1>{});
     uint64_t const tm = uint64_t(cute::size<0>(TileShape{}));
     uint64_t const tn = uint64_t(cute::size<1>(TileShape{}));
@@ -136,19 +140,22 @@ public:
     uint64_t const l = uint64_t(cute::get<3>(shape));
     return make_params_for_tiles(
         StripeCore::ceil_div_u64(m, tm), StripeCore::ceil_div_u64(n, tn), l,
-        StripeCore::ceil_div_u64(k, tk), cu_count, workspace);
+        StripeCore::ceil_div_u64(k, tk), cu_count, workspace, blocks_per_cu);
   }
 
   template <class ProblemShape>
   CUTLASS_HOST_DEVICE static Params to_underlying_arguments(
       ProblemShape problem_shape, TileShape, ClusterShape,
-      KernelHardwareInfo const& hw_info, Arguments const&, void* workspace,
+      KernelHardwareInfo const& hw_info, Arguments const& args, void* workspace,
       uint32_t = 1, uint32_t = 1) {
     return make_params_for_problem_shape(
-        problem_shape, uint64_t(hw_info.cu_count), workspace);
+        problem_shape, uint64_t(hw_info.cu_count), workspace,
+        args.blocks_per_cu);
   }
 
-  static bool can_implement(Arguments const&) { return true; }
+  static bool can_implement(Arguments const& args) {
+    return args.blocks_per_cu > 0;
+  }
 
   template <class ProblemShape, class ElementAccumulator>
   static size_t get_workspace_size(

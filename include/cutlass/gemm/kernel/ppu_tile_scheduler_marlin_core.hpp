@@ -65,14 +65,14 @@ struct MarlinStripeSchedulerCore {
 
   CUTLASS_HOST_DEVICE static constexpr Params make_params_for_tiles(
       uint64_t tiles_m, uint64_t tiles_n, uint64_t tiles_l,
-      uint64_t k_tiles, uint64_t cu_count) {
+      uint64_t k_tiles, uint64_t cu_count, uint64_t blocks_per_cu = 1) {
     Params p;
     p.tiles_m_ = tiles_m;
     p.tiles_n_ = tiles_n;
     p.tiles_l_ = tiles_l;
     p.k_tiles_per_output_ = k_tiles;
     bool ok = tiles_m > 0 && tiles_n > 0 && tiles_l > 0 &&
-              k_tiles > 0 && cu_count > 0;
+              k_tiles > 0 && cu_count > 0 && blocks_per_cu > 0;
     ok = ok && tiles_m <= uint64_t(std::numeric_limits<int32_t>::max()) &&
          tiles_n <= uint64_t(std::numeric_limits<int32_t>::max()) &&
          tiles_l <= uint64_t(std::numeric_limits<int32_t>::max()) &&
@@ -92,8 +92,17 @@ struct MarlinStripeSchedulerCore {
       return p;
     }
 
-    // Classic Marlin's measured safety rail: never multiply CU by occupancy.
-    p.grid_blocks_ = p.output_tiles_ >= cu_count ? p.output_tiles_ : cu_count;
+    // blocks_per_cu is a host-side launch-policy input.  Its default of one
+    // preserves classic Marlin's measured safety rail byte-for-byte, while a
+    // caller may explicitly sweep a larger hardware-validated cohort.  Keep
+    // the product out of Params: the lowered grid/stripe fields are the sole
+    // device ABI, and an overflowing launch capacity must fail closed.
+    uint64_t launch_capacity = 0;
+    if (!mul_u64(cu_count, blocks_per_cu, launch_capacity)) {
+      return p;
+    }
+    p.grid_blocks_ = p.output_tiles_ >= launch_capacity
+        ? p.output_tiles_ : launch_capacity;
     if (p.grid_blocks_ > uint64_t(std::numeric_limits<unsigned>::max())) {
       return p;
     }
