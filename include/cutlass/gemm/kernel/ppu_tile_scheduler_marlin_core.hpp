@@ -46,8 +46,8 @@ struct MarlinStripeSchedulerCore {
     uint64_t linear_end = 0;
     bool valid = false;
 
-    CUTLASS_HOST_DEVICE bool is_valid() const { return valid; }
-    CUTLASS_HOST_DEVICE static WorkTileInfo invalid_work_tile() { return {}; }
+    CUTLASS_HOST_DEVICE constexpr bool is_valid() const { return valid; }
+    CUTLASS_HOST_DEVICE static constexpr WorkTileInfo invalid_work_tile() { return {}; }
   };
 
   CUTLASS_HOST_DEVICE static constexpr uint64_t ceil_div_u64(uint64_t x, uint64_t y) {
@@ -63,7 +63,7 @@ struct MarlinStripeSchedulerCore {
     return true;
   }
 
-  CUTLASS_HOST_DEVICE static Params make_params_for_tiles(
+  CUTLASS_HOST_DEVICE static constexpr Params make_params_for_tiles(
       uint64_t tiles_m, uint64_t tiles_n, uint64_t tiles_l,
       uint64_t k_tiles, uint64_t cu_count) {
     Params p;
@@ -105,7 +105,7 @@ struct MarlinStripeSchedulerCore {
   }
 
 private:
-  CUTLASS_HOST_DEVICE static WorkTileInfo make_work(
+  CUTLASS_HOST_DEVICE static constexpr WorkTileInfo make_work(
       Params const& p, uint64_t block_idx, uint64_t cursor, uint64_t stripe_end) {
     if (!p.valid_ || block_idx >= p.grid_blocks_ || cursor >= stripe_end ||
         cursor >= p.total_k_tiles_) {
@@ -143,7 +143,7 @@ private:
   }
 
 public:
-  CUTLASS_HOST_DEVICE static WorkTileInfo get_work_for_block(
+  CUTLASS_HOST_DEVICE static constexpr WorkTileInfo get_work_for_block(
       Params const& p, uint64_t block_idx) {
     if (!p.valid_ || block_idx >= p.grid_blocks_) {
       return WorkTileInfo::invalid_work_tile();
@@ -156,7 +156,7 @@ public:
     return make_work(p, block_idx, begin, end);
   }
 
-  CUTLASS_HOST_DEVICE static WorkTileInfo fetch_next_work(
+  CUTLASS_HOST_DEVICE static constexpr WorkTileInfo fetch_next_work(
       Params const& p, WorkTileInfo const& work) {
     return work.is_valid() && work.linear_next < work.linear_end
         ? make_work(p, work.block_idx, work.linear_next, work.linear_end)

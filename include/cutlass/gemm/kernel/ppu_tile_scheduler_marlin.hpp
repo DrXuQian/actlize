@@ -36,6 +36,9 @@ public:
   using BarrierType = typename NamedBarrierManager<1>::T;
   using StripeCore = MarlinStripeSchedulerCore;
   using StripeParams = typename StripeCore::Params;
+  static constexpr uint64_t OutputTileElements =
+      uint64_t(cute::size<0>(TileShape{})) *
+      uint64_t(cute::size<1>(TileShape{}));
 
   // This is a structural capability, not a list of benchmark cohorts and not
   // a claim that every admitted kernel has positive occupancy on every PPU.
@@ -76,10 +79,8 @@ private:
 
   template <class ElementAccumulator>
   CUTLASS_HOST_DEVICE static uint64_t reduction_workspace_bytes(Params const& p) {
-    uint64_t tile_elements = 0, all_elements = 0, bytes = 0;
-    bool ok = StripeCore::mul_u64(uint64_t(cute::size<0>(TileShape{})),
-                      uint64_t(cute::size<1>(TileShape{})), tile_elements) &&
-              StripeCore::mul_u64(tile_elements, p.output_tiles_, all_elements) &&
+    uint64_t all_elements = 0, bytes = 0;
+    bool ok = StripeCore::mul_u64(OutputTileElements, p.output_tiles_, all_elements) &&
               StripeCore::mul_u64(all_elements, sizeof(ElementAccumulator), bytes);
     return ok ? bytes : 0;
   }
@@ -101,13 +102,13 @@ private:
   }
 
 public:
-  CUTLASS_HOST_DEVICE PersistentTileSchedulerPPUMarlin() = default;
-  CUTLASS_HOST_DEVICE explicit PersistentTileSchedulerPPUMarlin(Params const& p)
+  CUTLASS_HOST_DEVICE constexpr PersistentTileSchedulerPPUMarlin() = default;
+  CUTLASS_HOST_DEVICE constexpr explicit PersistentTileSchedulerPPUMarlin(Params const& p)
       : scheduler_params_(p) {}
 
   // One shared host/device constructor is the oracle seam.  Production
   // to_underlying_arguments and l126 both call this exact function.
-  CUTLASS_HOST_DEVICE static Params make_params_for_tiles(
+  CUTLASS_HOST_DEVICE static constexpr Params make_params_for_tiles(
       uint64_t tiles_m, uint64_t tiles_n, uint64_t tiles_l,
       uint64_t k_tiles, uint64_t cu_count, void* workspace = nullptr) {
     Params p;
@@ -117,11 +118,14 @@ public:
     return p;
   }
 
+  // Raw-problem seam shared by production lowering and the generated-code
+  // oracle.  Keeping M/N/K -> tile ordinals here prevents a host proof from
+  // silently validating hand-computed tile counts while the shipping path
+  // lowers a different problem (the class of bug caught by expert-pitch).
   template <class ProblemShape>
-  CUTLASS_HOST_DEVICE static Params to_underlying_arguments(
-      ProblemShape problem_shape, TileShape, ClusterShape,
-      KernelHardwareInfo const& hw_info, Arguments const&, void* workspace,
-      uint32_t = 1, uint32_t = 1) {
+  CUTLASS_HOST_DEVICE static constexpr Params make_params_for_problem_shape(
+      ProblemShape problem_shape, uint64_t cu_count,
+      void* workspace = nullptr) {
     auto shape = cute::append<4>(problem_shape, cute::Int<1>{});
     uint64_t const tm = uint64_t(cute::size<0>(TileShape{}));
     uint64_t const tn = uint64_t(cute::size<1>(TileShape{}));
@@ -132,7 +136,16 @@ public:
     uint64_t const l = uint64_t(cute::get<3>(shape));
     return make_params_for_tiles(
         StripeCore::ceil_div_u64(m, tm), StripeCore::ceil_div_u64(n, tn), l,
-        StripeCore::ceil_div_u64(k, tk), uint64_t(hw_info.cu_count), workspace);
+        StripeCore::ceil_div_u64(k, tk), cu_count, workspace);
+  }
+
+  template <class ProblemShape>
+  CUTLASS_HOST_DEVICE static Params to_underlying_arguments(
+      ProblemShape problem_shape, TileShape, ClusterShape,
+      KernelHardwareInfo const& hw_info, Arguments const&, void* workspace,
+      uint32_t = 1, uint32_t = 1) {
+    return make_params_for_problem_shape(
+        problem_shape, uint64_t(hw_info.cu_count), workspace);
   }
 
   static bool can_implement(Arguments const&) { return true; }
@@ -192,44 +205,71 @@ public:
         ? dim3(unsigned(p.grid_blocks_), 1, 1) : dim3(0, 0, 0);
   }
 
-  CUTLASS_HOST_DEVICE static WorkTileInfo get_work_for_block(
+  CUTLASS_HOST_DEVICE static constexpr WorkTileInfo get_work_for_block(
       Params const& p, uint64_t block_idx) {
     return StripeCore::get_work_for_block(
         static_cast<StripeParams const&>(p), block_idx);
   }
 
-  CUTLASS_DEVICE WorkTileInfo get_current_work() const {
-    return get_work_for_block(scheduler_params_, uint64_t(blockIdx.x));
+  CUTLASS_HOST_DEVICE constexpr WorkTileInfo get_work_for_block_index(
+      uint64_t block_idx) const {
+    return get_work_for_block(scheduler_params_, block_idx);
   }
 
-  CUTLASS_HOST_DEVICE static WorkTileInfo fetch_next_work_for_params(
+  CUTLASS_DEVICE WorkTileInfo get_current_work() const {
+    return get_work_for_block_index(uint64_t(blockIdx.x));
+  }
+
+  CUTLASS_HOST_DEVICE static constexpr WorkTileInfo fetch_next_work_for_params(
       Params const& p, WorkTileInfo const& work) {
     return StripeCore::fetch_next_work(static_cast<StripeParams const&>(p), work);
   }
 
-  CUTLASS_DEVICE auto fetch_next_work(WorkTileInfo const& work) const {
-    return cute::make_tuple(fetch_next_work_for_params(scheduler_params_, work), true);
+  CUTLASS_HOST_DEVICE constexpr WorkTileInfo get_next_work(
+      WorkTileInfo const& work) const {
+    return fetch_next_work_for_params(scheduler_params_, work);
   }
 
-  CUTLASS_HOST_DEVICE static bool valid_warpgroup_in_work_tile(WorkTileInfo const& work) {
+  CUTLASS_DEVICE auto fetch_next_work(WorkTileInfo const& work) const {
+    return cute::make_tuple(get_next_work(work), true);
+  }
+
+  CUTLASS_HOST_DEVICE static constexpr bool valid_warpgroup_in_work_tile(WorkTileInfo const& work) {
     return work.is_valid();
   }
-  CUTLASS_HOST_DEVICE static uint32_t get_work_k_tile_start(WorkTileInfo const& work) {
+  CUTLASS_HOST_DEVICE static constexpr uint32_t get_work_k_tile_start(WorkTileInfo const& work) {
     return work.K_idx;
   }
+  template <class KTileShape>
+  CUTLASS_HOST_DEVICE static constexpr auto get_work_k_tile_coord(
+      WorkTileInfo const& work, KTileShape const& shape) {
+    // K_idx is a K-tile ordinal.  idx2crd consumes that ordinal directly;
+    // multiplying by tactic TileK here would repeat the expert-pitch class of
+    // logical-code/byte unit bugs at the scheduler/mainloop seam.
+    return cute::idx2crd(get_work_k_tile_start(work), shape);
+  }
   template <class ProblemShape>
-  CUTLASS_HOST_DEVICE static uint32_t get_work_k_tile_count(
+  CUTLASS_HOST_DEVICE static constexpr uint32_t get_work_k_tile_count(
       WorkTileInfo const& work, ProblemShape, TileShape) {
     return work.k_tile_count;
   }
-  CUTLASS_HOST_DEVICE static bool requires_fixup(Params const&, WorkTileInfo const& work) {
+  CUTLASS_HOST_DEVICE static constexpr bool requires_fixup(Params const&, WorkTileInfo const& work) {
     return work.is_valid() && work.slice_count > 1;
   }
-  CUTLASS_HOST_DEVICE static bool compute_epilogue(WorkTileInfo const& work, Params const&) {
+  CUTLASS_HOST_DEVICE static constexpr bool compute_epilogue(WorkTileInfo const& work, Params const&) {
     return work.is_valid() && work.slice_idx + 1 == work.slice_count;
   }
-  CUTLASS_HOST_DEVICE static uint64_t output_tile_index(Params const&, WorkTileInfo const& work) {
+  CUTLASS_HOST_DEVICE static constexpr uint64_t output_tile_index(Params const&, WorkTileInfo const& work) {
     return work.output_tile_idx;
+  }
+  CUTLASS_HOST_DEVICE static constexpr uint64_t reduction_workspace_element_offset(
+      WorkTileInfo const& work) {
+    // Typed FP32 pointer arithmetic consumes elements, never bytes.
+    return work.output_tile_idx * OutputTileElements;
+  }
+  CUTLASS_HOST_DEVICE static constexpr int barrier_lock_index(
+      WorkTileInfo const& work) {
+    return int(work.lock_idx);
   }
 
   template <class FrgTensorC>
@@ -258,8 +298,7 @@ private:
       return;
     }
     CUTLASS_ASSERT(num_barriers == 1 && barrier_idx == 0);
-    static constexpr uint64_t TileElements =
-        uint64_t(cute::size<0>(TileShape{})) * uint64_t(cute::size<1>(TileShape{}));
+    static constexpr uint64_t TileElements = OutputTileElements;
     static constexpr uint64_t FragmentElements = uint64_t(cute::size(FrgTensorC{}));
     static_assert(FragmentElements > 0 && TileElements % FragmentElements == 0,
                   "Marlin cooperative fragment must divide one output tile exactly");
@@ -290,14 +329,12 @@ private:
     // future launch/cooperative mismatch by aliasing surplus threads onto the
     // same FP32 workspace stripes.
     uint32_t const thread = uint32_t(threadIdx.x);
-    uint64_t const tile_elements = uint64_t(cute::size<0>(TileShape{})) *
-                                   uint64_t(cute::size<1>(TileShape{}));
     auto* tile_workspace = reduction_workspace<typename FrgTensorC::value_type>(p) +
-                           work.output_tile_idx * tile_elements;
+                           reduction_workspace_element_offset(work);
     auto* workspace_array = reinterpret_cast<AccumulatorArray*>(tile_workspace);
     auto* accumulator_array = reinterpret_cast<AccumulatorArray*>(accumulators.data());
     BarrierType* locks = lock_workspace<typename FrgTensorC::value_type>(p);
-    int const lock = int(work.lock_idx);
+    int const lock = barrier_lock_index(work);
 
     if (work.slice_idx == 0) {
       Striped::store(workspace_array, *accumulator_array, thread, predicate);
