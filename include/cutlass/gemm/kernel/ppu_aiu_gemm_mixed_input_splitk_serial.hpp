@@ -288,8 +288,10 @@ public:
     Tensor gB = get<1>(load_inputs);
 
     // Compute tile residues for predication
-    auto m_max_coord = M - size<0>(gA) * get<0>(blk_coord_mnkl);                             // M - BLK_M * m_coord
-    auto n_max_coord = N - size<0>(gB) * get<1>(blk_coord_mnkl);                             // N - BLK_N * n_coord
+    // load_init may widen/fold the physical A/B tensors.  Output residue advances by the
+    // logical CTA tile, not by those physical transfer extents (notably TM8 -> gA.M=16).
+    auto m_max_coord = M - size<0>(blk_shape) * get<0>(blk_coord_mnkl);                       // M - BLK_M * m_coord
+    auto n_max_coord = N - size<1>(blk_shape) * get<1>(blk_coord_mnkl);                       // N - BLK_N * n_coord
     auto k_residue   = K - size<1>(gA) * size<2>(gA);                                        // K - BLK_K * k_coord_max
     auto residue_mnk = make_tuple(m_max_coord, n_max_coord, k_residue);
 
