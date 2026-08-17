@@ -393,7 +393,12 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
     // Force a split-K decomposition. This should be paired with setting the `splits` parameter
     SplitK,
     // Force a stream-K decomposition
-    StreamK
+    StreamK,
+    // Preserve every complete data-parallel wave and use stream-K only for
+    // the residual output tiles in the final partial wave.  Appended after
+    // the vendor modes so their integral values and existing callers remain
+    // unchanged.
+    StreamKTail
   };
 
   using UnderlyingParams = PersistentTileSchedulerPPUParams;
@@ -847,6 +852,17 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
         groups = calculate_groups(underlying_params, reduction_mode, problem_blocks_m, problem_blocks_n, cluster_shape,
           cluster_size, sk_tiles, sk_cluster_tiles, sk_units, k_tiles_per_output_tile, do_separate_reduction);
 
+        if (decomposition_mode == DecompositionMode::StreamKTail) {
+          groups = cluster_size == 1 ? get_stream_k_tail_safe_groups(
+              groups, sk_tiles, sk_units, k_tiles_per_output_tile) : 0;
+          if (groups == 0) {
+            // Keep the new policy fail-closed.  The legacy StreamK mode and
+            // its two-wave decomposition retain their exact historical
+            // behavior.
+            return DecompositionMode::DataParallel;
+          }
+        }
+
         auto sk_units_per_group = sk_units / groups;
 
         // sk_tiles is guaranteed to be divisible by cluster_size because it is calculated as:
@@ -1029,6 +1045,16 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
       return 0;
     }
 
+    // The regular StreamK policy deliberately folds one complete wave into
+    // the Stream-K region alongside the residual wave.  StreamKTail is the
+    // strict DP-major alternative: complete waves remain data-parallel and
+    // only the residual tile count enters the existing flattened-K mapping.
+    // Tiled problem and wave extents are cluster-aligned by the caller, so
+    // their remainder is cluster-aligned as well.
+    if (decomposition_mode == DecompositionMode::StreamKTail) {
+      return static_cast<uint32_t>(output_tiles % ctas_per_wave);
+    }
+
     // If there is wave quantization, assign the first two waves worth of tiles to be
     // covered by stream-K work and the remainder to be data-parallel. Since we know
     // that full_waves == total_waves - 1 in this case, the number of data-parallel
@@ -1083,6 +1109,111 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
 
     uint64_t sk_units = platform::min(ctas_per_sk_wave, min_sized_sk_units);
     return sk_units;
+  }
+
+  // The device mapper repairs work-unit boundaries so no split contains fewer
+  // than min_iters_per_sk_unit_ K tiles.  For a very small tail, those repairs
+  // can collapse an initially nonempty unit.  StreamKTail is currently a dense
+  // 1x1-cluster policy, so prove on the host that every repaired interval is
+  // nonempty and that adjacent units still partition each group's flattened
+  // (tile,K) range exactly.  An unsafe tail falls back to data parallel before
+  // any device work is launched.
+  static bool
+  stream_k_tail_intervals_cover_exactly(
+      uint32_t groups,
+      uint32_t sk_tiles,
+      uint64_t sk_units,
+      uint32_t k_tiles_per_output_tile) {
+    if (groups == 0 || sk_tiles == 0 || sk_units == 0 ||
+        groups > sk_tiles || sk_units % groups != 0 ||
+        k_tiles_per_output_tile < min_iters_per_sk_unit_) {
+      return false;
+    }
+
+    uint64_t const units_per_group = sk_units / groups;
+    for (uint64_t group = 0; group < groups; ++group) {
+      uint64_t const tiles_in_group = sk_tiles / groups +
+          (group < (sk_tiles % groups) ? 1u : 0u);
+      uint64_t const group_k_tiles =
+          tiles_in_group * uint64_t(k_tiles_per_output_tile);
+      uint64_t const base = group_k_tiles / units_per_group;
+      uint64_t const big_units = group_k_tiles % units_per_group;
+      uint64_t previous_end = 0;
+
+      for (uint64_t unit = 0; unit < units_per_group; ++unit) {
+        uint64_t start = base * unit + platform::min(unit, big_units);
+        uint64_t count = base + (unit < big_units ? 1u : 0u);
+
+        uint64_t const start_in_tile = start % k_tiles_per_output_tile;
+        if (start_in_tile < min_iters_per_sk_unit_) {
+          start -= start_in_tile;
+          count += start_in_tile;
+        }
+        else if (start_in_tile >
+                 k_tiles_per_output_tile - min_iters_per_sk_unit_) {
+          uint64_t const adjustment =
+              k_tiles_per_output_tile - start_in_tile;
+          if (count < adjustment) {
+            return false;
+          }
+          start += adjustment;
+          count -= adjustment;
+        }
+
+        uint64_t const end_in_tile =
+            (start + count) % k_tiles_per_output_tile;
+        if (end_in_tile < min_iters_per_sk_unit_) {
+          if (count < end_in_tile) {
+            return false;
+          }
+          count -= end_in_tile;
+        }
+        else if (end_in_tile >
+                 k_tiles_per_output_tile - min_iters_per_sk_unit_) {
+          count += k_tiles_per_output_tile - end_in_tile;
+        }
+
+        if (count == 0 || start != previous_end ||
+            start + count > group_k_tiles) {
+          return false;
+        }
+        previous_end = start + count;
+      }
+      if (previous_end != group_k_tiles) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static uint32_t
+  get_stream_k_tail_safe_groups(
+      uint32_t preferred_groups,
+      uint32_t sk_tiles,
+      uint64_t sk_units,
+      uint32_t k_tiles_per_output_tile) {
+    if (stream_k_tail_intervals_cover_exactly(
+            preferred_groups, sk_tiles, sk_units,
+            k_tiles_per_output_tile)) {
+      return preferred_groups;
+    }
+
+    // Preserve the locality-oriented <=8-group choice whenever it is valid.
+    // Only an invalid boundary-repair geometry enters this bounded divisor
+    // search; choose the first exact alternative rather than silently launch
+    // an empty device unit.  Dense sweep domains have at most one physical
+    // wave of SK units, so this host-only search is tiny.
+    uint32_t const limit = static_cast<uint32_t>(
+        platform::min(uint64_t(sk_tiles), sk_units));
+    for (uint32_t candidate = 1; candidate <= limit; ++candidate) {
+      if (sk_units % candidate == 0 &&
+          stream_k_tail_intervals_cover_exactly(
+              candidate, sk_tiles, sk_units,
+              k_tiles_per_output_tile)) {
+        return candidate;
+      }
+    }
+    return 0;
   }
 
   // Calculates the size of the workspace needed for holding reduction barriers
