@@ -398,7 +398,14 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
     // the residual output tiles in the final partial wave.  Appended after
     // the vendor modes so their integral values and existing callers remain
     // unchanged.
-    StreamKTail
+    StreamKTail,
+    // Keep the same DP-major residual-wave extent as StreamKTail, but choose
+    // the largest exact locality-group count for which every repaired work
+    // unit remains inside one output tile.  Exact coverage then attains the
+    // lower bound peer_excess = sk_units - sk_tiles.  This is a separate
+    // opt-in policy so the measured StreamKTail mapping remains an unchanged
+    // A/B control.
+    StreamKTailMinPeers
   };
 
   using UnderlyingParams = PersistentTileSchedulerPPUParams;
@@ -852,9 +859,14 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
         groups = calculate_groups(underlying_params, reduction_mode, problem_blocks_m, problem_blocks_n, cluster_shape,
           cluster_size, sk_tiles, sk_cluster_tiles, sk_units, k_tiles_per_output_tile, do_separate_reduction);
 
-        if (decomposition_mode == DecompositionMode::StreamKTail) {
-          groups = cluster_size == 1 ? get_stream_k_tail_safe_groups(
-              groups, sk_tiles, sk_units, k_tiles_per_output_tile) : 0;
+        if (decomposition_mode == DecompositionMode::StreamKTail ||
+            decomposition_mode == DecompositionMode::StreamKTailMinPeers) {
+          groups = cluster_size != 1 ? 0 :
+              (decomposition_mode == DecompositionMode::StreamKTailMinPeers
+                ? get_stream_k_tail_min_peer_groups(
+                    sk_tiles, sk_units, k_tiles_per_output_tile)
+                : get_stream_k_tail_safe_groups(
+                    groups, sk_tiles, sk_units, k_tiles_per_output_tile));
           if (groups == 0) {
             // Keep the new policy fail-closed.  The legacy StreamK mode and
             // its two-wave decomposition retain their exact historical
@@ -1051,7 +1063,8 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
     // only the residual tile count enters the existing flattened-K mapping.
     // Tiled problem and wave extents are cluster-aligned by the caller, so
     // their remainder is cluster-aligned as well.
-    if (decomposition_mode == DecompositionMode::StreamKTail) {
+    if (decomposition_mode == DecompositionMode::StreamKTail ||
+        decomposition_mode == DecompositionMode::StreamKTailMinPeers) {
       return static_cast<uint32_t>(output_tiles % ctas_per_wave);
     }
 
@@ -1123,7 +1136,8 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
       uint32_t groups,
       uint32_t sk_tiles,
       uint64_t sk_units,
-      uint32_t k_tiles_per_output_tile) {
+      uint32_t k_tiles_per_output_tile,
+      bool require_tile_local = false) {
     if (groups == 0 || sk_tiles == 0 || sk_units == 0 ||
         groups > sk_tiles || sk_units % groups != 0 ||
         k_tiles_per_output_tile < min_iters_per_sk_unit_) {
@@ -1177,6 +1191,11 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
             start + count > group_k_tiles) {
           return false;
         }
+        if (require_tile_local &&
+            start / k_tiles_per_output_tile !=
+                (start + count - 1) / k_tiles_per_output_tile) {
+          return false;
+        }
         previous_end = start + count;
       }
       if (previous_end != group_k_tiles) {
@@ -1210,6 +1229,31 @@ struct PersistentTileSchedulerPPUStreamKParamsT {
           stream_k_tail_intervals_cover_exactly(
               candidate, sk_tiles, sk_units,
               k_tiles_per_output_tile)) {
+        return candidate;
+      }
+    }
+    return 0;
+  }
+
+  static uint32_t
+  get_stream_k_tail_min_peer_groups(
+      uint32_t sk_tiles,
+      uint64_t sk_units,
+      uint32_t k_tiles_per_output_tile) {
+    // Every nonempty work unit contributes at least one peer range.  Exact
+    // coverage of S output tiles by U units therefore has the lower bound
+    // peer_excess = U - S.  It is attained exactly when every repaired unit
+    // stays inside one output tile.  Search divisors from large to small: for
+    // equal peer count this preserves the production scheduler's preference
+    // for many locality groups, so concurrently issued units reuse identical
+    // K extents across different q tiles instead of forming one long group.
+    uint32_t const limit = static_cast<uint32_t>(
+        platform::min(uint64_t(sk_tiles), sk_units));
+    for (uint32_t candidate = limit; candidate > 0; --candidate) {
+      if (sk_units % candidate == 0 &&
+          stream_k_tail_intervals_cover_exactly(
+              candidate, sk_tiles, sk_units,
+              k_tiles_per_output_tile, true)) {
         return candidate;
       }
     }
