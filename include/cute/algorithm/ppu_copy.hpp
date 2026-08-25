@@ -57,7 +57,16 @@ copy_aiu(
   int &warp_idx
 ) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+#if defined(PPU_AIU_SINGLE_LOGICAL_ISSUER) && \
+    (PPU_AIU_SINGLE_LOGICAL_ISSUER != 0)
+  // PPU0010_AIU_LOAD has Copy_Traits::ThrID == Layout<_1>: one physical
+  // thread issues the opaque bulk copy.  Keep this diagnostic gate at the
+  // helper boundary so the descriptor, CuTe partitions and copy operation
+  // remain byte-for-byte the same.
+  if (warp_idx == 0 && int(threadIdx.x) == 0) {
+#else
   if (warp_idx == 0) {
+#endif
     copy(copy_policy_a, src_a, dst_a);
     copy(copy_policy_b, src_b, dst_b);
   }
@@ -124,7 +133,15 @@ copy_aiu(
   Tensor<DstEngineA, DstLayoutA>     && dst_a,
   int &warp_idx
 ) {
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100 && \
+    defined(PPU_AIU_SINGLE_LOGICAL_ISSUER) && \
+    (PPU_AIU_SINGLE_LOGICAL_ISSUER != 0)
+  // Match the one-thread PPU0010 AIU copy-atom contract.  The lvalue overload
+  // above is the independent FA split path and deliberately remains unchanged.
+  if (warp_idx == 0 && int(threadIdx.x) == 0) {
+#else
   if (warp_idx == 0) {
+#endif
     copy(copy_policy_a, src_a, dst_a);
   }
 }
