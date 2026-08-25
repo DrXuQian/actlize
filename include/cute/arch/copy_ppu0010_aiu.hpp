@@ -586,6 +586,30 @@ struct PPU0010_TSM_LD_SWZL_M8 {
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h,
        int cube_in_stage = 0, int stage = 0)
   {
+#if defined(PPU_M8_DIRECT_X4_PROJECTION) && \
+    (PPU_M8_DIRECT_X4_PROJECTION != 0)
+    // Diagnostic only: bind the two semantic x4 outputs directly to the m8
+    // fragment and keep only two scalar discards. The opcode, addresses and
+    // physical x4 read are unchanged; only the compiler-visible temporary and
+    // subsequent v0/v1 copies disappear.
+    uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
+    uint32_t discard2;
+    uint32_t discard3;
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    Element *stage_base = reinterpret_cast<Element*>(smem_base);
+    stage_base += kCubePitch * cube_in_stage + kStagePitch * stage;
+    int channel_bytes_offset = coord_w * sizeof(Element);
+    asm volatile(
+        "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 "
+        "{%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
+        : "=r"(logical[0]), "=r"(logical[1]),
+          "=r"(discard2), "=r"(discard3)
+        : "l"(stage_base), "r"(0), "r"(coord_h),
+          "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset));
+#else
+    CUTE_INVALID_CONTROL_PATH("Support for PPU0010_TSM_LD_SWZL_M8 has not been enabled");
+#endif
+#else
     uint32_t physical[kPhysicalRegisters];
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
     // CuTe exposes only the two registers consumed by m8, while the physical
@@ -606,6 +630,7 @@ struct PPU0010_TSM_LD_SWZL_M8 {
     uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
     logical[0] = physical[0];
     logical[1] = physical[1];
+#endif
   }
 };
 #undef DEBUG_PRINT
