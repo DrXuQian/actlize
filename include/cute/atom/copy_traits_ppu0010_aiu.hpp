@@ -187,12 +187,12 @@ struct Copy_Traits<PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans, Ins
 // PPU0010_TSM_LD_SWZL_M8 and must never enlarge or overwrite the m8 A
 // fragment.
 template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans,
-          int InstNum, int CubePitch>
+          int InstNum, int CubePitch, int StagePitch>
 struct Copy_Traits<PPU0010_TSM_LD_SWZL_M8<
-    Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch>>
+    Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch, StagePitch>>
 {
   using Operation = PPU0010_TSM_LD_SWZL_M8<
-      Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch>;
+      Element, CUBE_H, CUBE_W, Swap, Trans, InstNum, CubePitch, StagePitch>;
 
   using ThrID = Layout<_32>;
 

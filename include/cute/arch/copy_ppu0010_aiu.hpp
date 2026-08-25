@@ -564,7 +564,7 @@ struct PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, true, InstNum, CubePit
 // x4 atom.  The latter is used by every m16 mixed-input path and its four-value
 // contract must remain unchanged.
 template <typename Element, int CUBE_H, int CUBE_W, bool Swap, bool Trans,
-          int InstNum = 1, int CubePitch = 0>
+          int InstNum = 1, int CubePitch = 0, int StagePitch = 0>
 struct PPU0010_TSM_LD_SWZL_M8 {
   static_assert(is_same_v<Element, half_t>,
                 "PPU0010 m8 A projection is defined only for fp16 operands");
@@ -577,15 +577,31 @@ struct PPU0010_TSM_LD_SWZL_M8 {
 
   static constexpr int kPhysicalRegisters = 4;
   static constexpr int kLogicalRegisters = 2;
+  static constexpr int kCubePitch =
+      CubePitch > 0 ? CubePitch : CUBE_H * CUBE_W;
+  static constexpr int kStagePitch =
+      StagePitch > 0 ? StagePitch : kCubePitch * InstNum;
 
   CUTE_HOST_DEVICE static void
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h,
        int cube_in_stage = 0, int stage = 0)
   {
     uint32_t physical[kPhysicalRegisters];
-    PPU0010_TSM_LD_SWZL<Element, CUBE_H, CUBE_W, Swap, Trans,
-                        InstNum, CubePitch>::copy(
-        physical, smem_base, coord_w, coord_h, cube_in_stage, stage);
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    // CuTe exposes only the two registers consumed by m8, while the physical
+    // opcode reads x4.  Packed cube bases may overlap those discarded rows,
+    // but a concurrently-written pipeline stage may not.  Keep cube and stage
+    // pitches independent so the logical x2 atom retains a truthful lifetime
+    // boundary for the physical x4 read.
+    Element *stage_base = reinterpret_cast<Element*>(smem_base);
+    stage_base += kCubePitch * cube_in_stage + kStagePitch * stage;
+    int channel_bytes_offset = coord_w * sizeof(Element);
+    PPU0010_TSM_LD_SWZL_IMPL<Element, false>()(
+        reinterpret_cast<int *>(physical), stage_base, coord_h, CUBE_H,
+        channel_bytes_offset);
+#else
+    CUTE_INVALID_CONTROL_PATH("Support for PPU0010_TSM_LD_SWZL_M8 has not been enabled");
+#endif
 
     uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
     logical[0] = physical[0];
