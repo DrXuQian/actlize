@@ -294,6 +294,35 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
     coord_w /= 2;
     // desc.print(smem_ptr, gmem_ptr, coord_w, coord_h, coord_n);
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
+    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
+    // Diagnostic contract for Q4's ordinary B producer. This bulk operation
+    // writes shared memory just like the fp16-A specialization above. Leaving
+    // it out made the earlier asm-memory counterfactual incomplete: the B
+    // writer still had no compiler-visible side effect while its swizzle
+    // reader did.
+    if constexpr(Swzl) {
+      asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b8 [%0], [%1], "
+        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
+        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 1),
+          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
+          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
+          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
+        : "memory"
+      );
+    } else {
+      asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.2d.b8 [%0], [%1], "
+        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
+        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 1),
+          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
+          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
+          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
+        : "memory"
+      );
+    }
+#else
     if constexpr(Swzl) {
       asm volatile(
         "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b8 [%0], [%1], "
@@ -313,6 +342,7 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
           "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
       );
     }
+#endif
 #else
     CUTE_INVALID_CONTROL_PATH("Support for AIU_LOAD has not been enabled for Trans=false,b4");
 #endif
