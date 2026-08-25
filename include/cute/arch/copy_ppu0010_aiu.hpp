@@ -451,12 +451,23 @@ template <typename Element>
 struct PPU0010_TSM_LD_SWZL_IMPL<Element, false> {
   CUTE_HOST_DEVICE void operator()(int *vreg, Element *stage_base, int coord_h, int CUBE_H, int channel_bytes_offset) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
+    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
+asm volatile(
+    "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 {%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
+      : "=r"(vreg[0]), "=r"(vreg[1]), "=r"(vreg[2]), "=r"(vreg[3])
+      : "l"(stage_base), "r"(0), "r"(coord_h),
+        "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset)
+      : "memory"
+    );
+#else
 asm volatile(
     "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 {%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
       : "=r"(vreg[0]), "=r"(vreg[1]), "=r"(vreg[2]), "=r"(vreg[3])
       : "l"(stage_base), "r"(0), "r"(coord_h),
         "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset)
     );
+#endif
 #else
     CUTE_INVALID_CONTROL_PATH("Support for TSM_LD_SWZL has not been enabled for Trans=false");
 #endif
@@ -635,32 +646,7 @@ struct PPU0010_TSM_LD_SWZL_M8 {
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h,
        int cube_in_stage = 0, int stage = 0)
   {
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-    // Diagnostic only: keep the shipping physical x4 instruction and
-    // fragment projection, but declare its shared-memory read to the compiler.
-    // The matching packed-A cp.async, commit and wait operations carry the
-    // same contract in copy_ppu.hpp.
-    uint32_t physical[kPhysicalRegisters];
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-    Element *stage_base = reinterpret_cast<Element*>(smem_base);
-    stage_base += kCubePitch * cube_in_stage + kStagePitch * stage;
-    int channel_bytes_offset = coord_w * sizeof(Element);
-    asm volatile(
-        "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 "
-        "{%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
-        : "=r"(physical[0]), "=r"(physical[1]),
-          "=r"(physical[2]), "=r"(physical[3])
-        : "l"(stage_base), "r"(0), "r"(coord_h),
-          "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset)
-        : "memory");
-#else
-    CUTE_INVALID_CONTROL_PATH("Support for PPU0010_TSM_LD_SWZL_M8 has not been enabled");
-#endif
-    uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
-    logical[0] = physical[0];
-    logical[1] = physical[1];
-#elif defined(PPU_M8_LOGICAL_X2_SCALAR_LOAD) && \
+#if defined(PPU_M8_LOGICAL_X2_SCALAR_LOAD) && \
     (PPU_M8_LOGICAL_X2_SCALAR_LOAD != 0)
     // Diagnostic only: remove the physical m8n8.x4 swizzle instruction
     // completely while preserving its two semantic outputs.  L186 derives
