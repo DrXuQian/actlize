@@ -316,22 +316,10 @@ struct PPU_CP_ASYNC_CACHEGLOBAL
   {
     TS const* gmem_ptr    = &gmem_src;
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_dst);
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-    // Diagnostic contract for packed Q4 scale/zero metadata.  This path uses
-    // the non-zfill CACHEGLOBAL atom, whereas packed A uses the zfill atom
-    // below; both are shared-memory producers in the same committed group.
-    asm volatile("ppu.cp.async.cg.shared.global.LLC::128B [%0], [%1], %2;\n"
-        :: "r"(smem_int_ptr),
-           "l"(gmem_ptr),
-           "n"(sizeof(TS))
-        : "memory");
-#else
     asm volatile("ppu.cp.async.cg.shared.global.LLC::128B [%0], [%1], %2;\n"
         :: "r"(smem_int_ptr),
            "l"(gmem_ptr),
            "n"(sizeof(TS)));
-#endif
   }
 };
 
@@ -383,24 +371,11 @@ struct PPU_CP_ASYNC_CACHEGLOBAL_ZFILL
     TS const* gmem_ptr    = &gmem_src;
     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_dst);
     int src_size = pred ? sizeof(TS) : 0;
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-    // Diagnostic contract for the frozen packed-A producer.  The instruction
-    // writes shared memory even though shared bytes cannot be named as an
-    // ordinary C++ output operand.  Tell the compiler about that side effect.
-    asm volatile("ppu.cp.async.cg.shared.global.LLC::128B [%0], [%1], %2, %3;\n"
-        :: "r"(smem_int_ptr),
-           "l"(gmem_ptr),
-           "n"(sizeof(TS)),
-           "r"(src_size)
-        : "memory");
-#else
     asm volatile("ppu.cp.async.cg.shared.global.LLC::128B [%0], [%1], %2, %3;\n"
         :: "r"(smem_int_ptr),
            "l"(gmem_ptr),
            "n"(sizeof(TS)),
            "r"(src_size));
-#endif
   }
 };
 
@@ -411,12 +386,7 @@ CUTE_HOST_DEVICE
 void
 cp_async_fence()
 {
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-  asm volatile("ppu.cp.async.commit_group;\n" ::: "memory");
-#else
   asm volatile("ppu.cp.async.commit_group;\n" ::);
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -427,20 +397,11 @@ CUTE_HOST_DEVICE
 void
 cp_async_wait()
 {
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-  if constexpr (N == 0) {
-    asm volatile("ppu.cp.async.wait_all;\n" ::: "memory");
-  } else {
-    asm volatile("ppu.cp.async.wait_group %0;\n" :: "n"(N) : "memory");
-  }
-#else
   if constexpr (N == 0) {
     asm volatile("ppu.cp.async.wait_all;\n" ::);
   } else {
     asm volatile("ppu.cp.async.wait_group %0;\n" :: "n"(N));
   }
-#endif
 }
 
 template <int N>

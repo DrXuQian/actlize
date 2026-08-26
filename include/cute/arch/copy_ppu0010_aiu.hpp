@@ -60,33 +60,6 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
   {
     // desc.print(smem_ptr, gmem_ptr, coord_w, coord_h, coord_n);
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-    // Diagnostic contract for the ordinary fp16-A producer paired with the
-    // m8 shared reader below.  The bulk AIU instruction writes shared memory
-    // but otherwise exposes only pointer-valued asm inputs.
-    if constexpr (Swzl) {
-      asm volatile(
-        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b16 [%0], [%1], "
-        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
-        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 2),
-          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
-          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
-          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
-        : "memory"
-      );
-    } else {
-      asm volatile(
-        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.2d.b16 [%0], [%1], "
-        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
-        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 2),
-          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
-          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
-          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
-        : "memory"
-      );
-    }
-#else
     if constexpr (Swzl) {
       asm volatile(
         "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b16 [%0], [%1], "
@@ -106,7 +79,6 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
           "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
       );
     }
-#endif
 #else
     CUTE_INVALID_CONTROL_PATH("Support for AIU_LOAD has not been enabled for Trans=false,b16");
 #endif
@@ -294,35 +266,6 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
     coord_w /= 2;
     // desc.print(smem_ptr, gmem_ptr, coord_w, coord_h, coord_n);
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-    // Diagnostic contract for Q4's ordinary B producer. This bulk operation
-    // writes shared memory just like the fp16-A specialization above. Leaving
-    // it out made the earlier asm-memory counterfactual incomplete: the B
-    // writer still had no compiler-visible side effect while its swizzle
-    // reader did.
-    if constexpr(Swzl) {
-      asm volatile(
-        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b8 [%0], [%1], "
-        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
-        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 1),
-          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
-          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
-          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
-        : "memory"
-      );
-    } else {
-      asm volatile(
-        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.2d.b8 [%0], [%1], "
-        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
-        :: "r"(smem_ptr), "l"(gmem_ptr - desc.offset_w * 1),
-          "r"(1), "r"(desc.dim_h), "r"(desc.dim_w),
-          "r"(0), "r"(coord_h), "r"(coord_w + desc.offset_w),
-          "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
-        : "memory"
-      );
-    }
-#else
     if constexpr(Swzl) {
       asm volatile(
         "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.2d.b8 [%0], [%1], "
@@ -342,7 +285,6 @@ struct PPU0010_AIU_LOAD<NumBitsPerTMA, Element, false, Swzl, cute::enable_if_t<s
           "r"(1), "r"(desc.cube_h), "r"(desc.cube_w), "r"(1)
       );
     }
-#endif
 #else
     CUTE_INVALID_CONTROL_PATH("Support for AIU_LOAD has not been enabled for Trans=false,b4");
 #endif
@@ -481,23 +423,12 @@ template <typename Element>
 struct PPU0010_TSM_LD_SWZL_IMPL<Element, false> {
   CUTE_HOST_DEVICE void operator()(int *vreg, Element *stage_base, int coord_h, int CUBE_H, int channel_bytes_offset) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-#if defined(PPU_PACKED_A_ASM_MEMORY_CONTRACT) && \
-    (PPU_PACKED_A_ASM_MEMORY_CONTRACT != 0)
-asm volatile(
-    "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 {%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
-      : "=r"(vreg[0]), "=r"(vreg[1]), "=r"(vreg[2]), "=r"(vreg[3])
-      : "l"(stage_base), "r"(0), "r"(coord_h),
-        "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset)
-      : "memory"
-    );
-#else
 asm volatile(
     "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 {%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
       : "=r"(vreg[0]), "=r"(vreg[1]), "=r"(vreg[2]), "=r"(vreg[3])
       : "l"(stage_base), "r"(0), "r"(coord_h),
         "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset)
     );
-#endif
 #else
     CUTE_INVALID_CONTROL_PATH("Support for TSM_LD_SWZL has not been enabled for Trans=false");
 #endif
@@ -676,62 +607,6 @@ struct PPU0010_TSM_LD_SWZL_M8 {
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h,
        int cube_in_stage = 0, int stage = 0)
   {
-#if defined(PPU_M8_LOGICAL_X2_SCALAR_LOAD) && \
-    (PPU_M8_LOGICAL_X2_SCALAR_LOAD != 0)
-    // Diagnostic only: remove the physical m8n8.x4 swizzle instruction
-    // completely while preserving its two semantic outputs.  L186 derives
-    // this lane/vreg address map independently from the calibrated PPU0010
-    // swizzle model.  Each lane loads exactly the two b32 words consumed by
-    // m8n16k16; there are no hidden v2/v3 destinations or physical reads.
-    //
-    // This arm deliberately keeps the packed bytes, cube/stage bases, CuTe
-    // Copy_Traits, destination fragment, prepare cadence and MMA order
-    // unchanged.  It is a causal probe for the x4 opcode/scoreboard contract,
-    // not a proposed shipping implementation.
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-    Element *stage_base = reinterpret_cast<Element*>(smem_base);
-    stage_base += kCubePitch * cube_in_stage + kStagePitch * stage;
-    uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
-    uint32_t const *stage_words =
-        reinterpret_cast<uint32_t const *>(stage_base);
-
-    int const lane = int(threadIdx.x) % 32;
-    int const word0 = logical_word_offset(lane, 0, coord_w, coord_h);
-    int const word1 = logical_word_offset(lane, 1, coord_w, coord_h);
-    uint32_t const addr0 = cute::cast_smem_ptr_to_uint(stage_words + word0);
-    uint32_t const addr1 = cute::cast_smem_ptr_to_uint(stage_words + word1);
-    asm volatile(
-        "ppu.ld.shared.u32 %0, [%2];\n"
-        "ppu.ld.shared.u32 %1, [%3];\n"
-        : "=r"(logical[0]), "=r"(logical[1])
-        : "r"(addr0), "r"(addr1));
-#else
-    CUTE_INVALID_CONTROL_PATH("Support for PPU0010_TSM_LD_SWZL_M8 has not been enabled");
-#endif
-#elif defined(PPU_M8_DIRECT_X4_PROJECTION) && \
-    (PPU_M8_DIRECT_X4_PROJECTION != 0)
-    // Diagnostic only: bind the two semantic x4 outputs directly to the m8
-    // fragment and keep only two scalar discards. The opcode, addresses and
-    // physical x4 read are unchanged; only the compiler-visible temporary and
-    // subsequent v0/v1 copies disappear.
-    uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
-    uint32_t discard2;
-    uint32_t discard3;
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-    Element *stage_base = reinterpret_cast<Element*>(smem_base);
-    stage_base += kCubePitch * cube_in_stage + kStagePitch * stage;
-    int channel_bytes_offset = coord_w * sizeof(Element);
-    asm volatile(
-        "ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 "
-        "{%0, %1, %2, %3}, [%4], {%5, %6, %7, %8, %9, %10};"
-        : "=r"(logical[0]), "=r"(logical[1]),
-          "=r"(discard2), "=r"(discard3)
-        : "l"(stage_base), "r"(0), "r"(coord_h),
-          "r"(1), "r"(CUBE_H), "r"(1), "r"(channel_bytes_offset));
-#else
-    CUTE_INVALID_CONTROL_PATH("Support for PPU0010_TSM_LD_SWZL_M8 has not been enabled");
-#endif
-#else
     uint32_t physical[kPhysicalRegisters];
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
     // CuTe exposes only the two registers consumed by m8, while the physical
@@ -752,7 +627,6 @@ struct PPU0010_TSM_LD_SWZL_M8 {
     uint32_t *logical = reinterpret_cast<uint32_t *>(frag_ptr);
     logical[0] = physical[0];
     logical[1] = physical[1];
-#endif
   }
 };
 #undef DEBUG_PRINT
