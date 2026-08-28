@@ -200,8 +200,22 @@ struct PPU0010_16x16x16_F16F16F16F16_TN
       uint32_t const& b0, uint32_t const& b1, uint32_t const& b2, uint32_t const& b3,
       uint32_t const& c0, uint32_t const& c1, uint32_t const& c2, uint32_t const& c3)
   {
-#ifdef __HGGC_ARCH__
-    assert(0);
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
+    float *d = reinterpret_cast<float *>(&d0);
+    float const *a = reinterpret_cast<float const *>(&a0);
+    float const *b = reinterpret_cast<float const *>(&b0);
+    float const *c = reinterpret_cast<float const *>(&c0);
+asm volatile(
+    "ppu.mma.sync.aligned.m16n16k16.row.col.f16.f16.f16.f16 "
+    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9, %10, %11}, "
+    "{%12, %13, %14, %15};\n"
+    : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+    : "f"(a[0]), "f"(a[1]), "f"(a[2]), "f"(a[3]),
+      "f"(b[0]), "f"(b[1]), "f"(b[2]), "f"(b[3]),
+      "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    CUTE_INVALID_CONTROL_PATH(
+        "Attempting to use PPU0010_16x16x16_F16F16F16F16_TN without ppu0010 device ARCH");
 #endif
   }
 };
@@ -390,4 +404,3 @@ asm volatile(
 };
 
 } // namespace cute
-
