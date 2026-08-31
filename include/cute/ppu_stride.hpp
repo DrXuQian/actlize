@@ -71,7 +71,9 @@ struct SplitkCoordIterator
   bool operator!=(SplitkCoordIterator const& other) const { return coord != other.coord; }
 
   Coord coord;
-  Shape const& shape;
+  // See ForwardCoordIterator: shape projections are commonly temporaries, so
+  // retaining a reference here would leave the iterator dangling.
+  Shape shape;
   int step;
   int idx;
 };

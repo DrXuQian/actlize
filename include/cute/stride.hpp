@@ -550,7 +550,10 @@ struct ForwardCoordIterator
   bool operator!=(ForwardCoordIterator const& other) const { return coord != other.coord; }
 
   Coord coord;
-  Shape const& shape;
+  // Factories accept shape expressions by const reference.  Keep an owned
+  // copy so iterators constructed from temporary projections (for example,
+  // shape<2>(tensor)) remain valid after the factory call returns.
+  Shape shape;
 };
 
 // A forward iterator for a coordinate that starts from a provided coordinate and increments in a prescribed order
