@@ -201,18 +201,35 @@ struct PPU0010_16x16x16_F16F16F16F16_TN
       uint32_t const& c0, uint32_t const& c1, uint32_t const& c2, uint32_t const& c3)
   {
 #if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
-    float *d = reinterpret_cast<float *>(&d0);
-    float const *a = reinterpret_cast<float const *>(&a0);
-    float const *b = reinterpret_cast<float const *>(&b0);
-    float const *c = reinterpret_cast<float const *>(&c0);
+    // These are independent references, not an array contract.  In
+    // particular callers legitimately pass the same zero object as c0..c3;
+    // pointer arithmetic from &c0 then reads three unrelated neighboring
+    // objects and leaves most of the hardware accumulator live.  Bind every
+    // operand independently, exactly like the device-proven raw spelling.
+    float       & fd0 = reinterpret_cast<float       &>(d0);
+    float       & fd1 = reinterpret_cast<float       &>(d1);
+    float       & fd2 = reinterpret_cast<float       &>(d2);
+    float       & fd3 = reinterpret_cast<float       &>(d3);
+    float const & fa0 = reinterpret_cast<float const &>(a0);
+    float const & fa1 = reinterpret_cast<float const &>(a1);
+    float const & fa2 = reinterpret_cast<float const &>(a2);
+    float const & fa3 = reinterpret_cast<float const &>(a3);
+    float const & fb0 = reinterpret_cast<float const &>(b0);
+    float const & fb1 = reinterpret_cast<float const &>(b1);
+    float const & fb2 = reinterpret_cast<float const &>(b2);
+    float const & fb3 = reinterpret_cast<float const &>(b3);
+    float const & fc0 = reinterpret_cast<float const &>(c0);
+    float const & fc1 = reinterpret_cast<float const &>(c1);
+    float const & fc2 = reinterpret_cast<float const &>(c2);
+    float const & fc3 = reinterpret_cast<float const &>(c3);
 asm volatile(
     "ppu.mma.sync.aligned.m16n16k16.row.col.f16.f16.f16.f16 "
     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9, %10, %11}, "
     "{%12, %13, %14, %15};\n"
-    : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-    : "f"(a[0]), "f"(a[1]), "f"(a[2]), "f"(a[3]),
-      "f"(b[0]), "f"(b[1]), "f"(b[2]), "f"(b[3]),
-      "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+    : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3)
+    : "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3),
+      "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
+      "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3));
 #else
     CUTE_INVALID_CONTROL_PATH(
         "Attempting to use PPU0010_16x16x16_F16F16F16F16_TN without ppu0010 device ARCH");
