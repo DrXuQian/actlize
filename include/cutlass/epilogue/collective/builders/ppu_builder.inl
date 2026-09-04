@@ -288,15 +288,55 @@ private:
   using InstM = cute::conditional_t<UseM8, Int<8>, Int<16>>;
   static constexpr int ThreadNum = WarpOnM() * WarpOnN() * 32;
   static constexpr int FragmentSize = BlockM * BlockN / ThreadNum;
-  static constexpr int Alignment = platform::min(AlignmentC, AlignmentD);
+  static_assert(FragmentSize > 0 && BlockM * BlockN % ThreadNum == 0,
+                "PPU epilogue requires an integral, non-empty output fragment per thread");
+  // One epilogue step redistributes only SmemM x BlockN accumulator values.
+  // This can be smaller than the full CTA tile when WarpM spans more than one
+  // MMA instruction.  Derive the per-thread capacity from that exact logical
+  // shared extent before constructing DefaultGemm_Epilogue_Configuration; this
+  // is equivalent to size(SmemLayoutO) / ThreadNum without making the
+  // configuration type circular.
+  static constexpr int SmemM = WarpOnM() * InstM();
+  static_assert(SmemM * BlockN % ThreadNum == 0,
+                "PPU epilogue shared tile must divide evenly across CTA threads");
+  static constexpr int SharedFragmentSize = SmemM * BlockN / ThreadNum;
+  static constexpr int RequestedAlignment = platform::min(AlignmentC, AlignmentD);
+  // The copy value width may not exceed the fragment actually owned by one
+  // CTA thread.  In particular TM8/TN64/WN16 has 512 outputs over 128
+  // threads, hence four values per thread even when C/D advertise alignment
+  // eight.  Using eight made GmemTiledCopyO cover a virtual 16x64 tile while
+  // SmemLayoutO and the MMA accumulator cover only 8x64; the first CTA then
+  // admitted virtual row 8 through an M=9 residue and raced the real second
+  // CTA.  Capping here keeps the S2R thread map and R2G vector atom on the
+  // same exact logical ownership contract.
+  static constexpr int EffectiveAlignment =
+      platform::min(RequestedAlignment,
+                    platform::min(FragmentSize, SharedFragmentSize));
+  static_assert(EffectiveAlignment > 0 &&
+                    FragmentSize % EffectiveAlignment == 0 &&
+                    SharedFragmentSize % EffectiveAlignment == 0 &&
+                    BlockN % EffectiveAlignment == 0,
+                "PPU epilogue effective vector width must tile the CTA "
+                "fragment, shared fragment, and N");
 
   using EpilogueCopyInst = AutoVectorizingCopyWithAssumedAlignment<128>;
   using GemmEpilogueConfiguration = gemm::config::DefaultGemm_Epilogue_Configuration<
-      EpilogueCopyInst, ElementAccumulator, Alignment, Int<BlockM>, Int<BlockN>,
+      EpilogueCopyInst, ElementAccumulator, EffectiveAlignment, Int<BlockM>, Int<BlockN>,
       WarpOnM, ThreadNum, InstM>;
   static_assert(cute::size<0>(typename GemmEpilogueConfiguration::SmemLayoutO{}) ==
-                    int(WarpOnM()) * int(InstM()),
+                    SmemM,
                 "PPU modern epilogue layout must carry the selected instruction M");
+  static_assert(cute::size(typename GemmEpilogueConfiguration::SmemLayoutO{}) ==
+                    SmemM * BlockN &&
+                    SharedFragmentSize ==
+                        cute::size(typename GemmEpilogueConfiguration::SmemLayoutO{}) /
+                            ThreadNum,
+                "PPU epilogue shared-capacity derivation must match its concrete layout");
+  static_assert(GemmEpilogueConfiguration::EpiThreadM <=
+                    cute::size<0>(typename GemmEpilogueConfiguration::SmemLayoutO{}) &&
+                    ThreadNum * EffectiveAlignment <=
+                    cute::size(typename GemmEpilogueConfiguration::SmemLayoutO{}),
+                "PPU epilogue output copy must not exceed its logical shared tile");
   using EpilogueDispatchPolicy = cute::conditional_t<(cute::is_same_v<Schedule, EpiloguePtrArraySimtVectorized> || detail::ppu_is_ptr_array_tma_v<Schedule>),
                                                      EpiloguePtrArraySimtVectorized,
                                                      cutlass::epilogue::EpilogueSimtVectorized>;
@@ -322,7 +362,7 @@ public:
     typename GemmEpilogueConfiguration::SmemLayoutO,
     Copy_Atom<EpilogueCopyInst,ElementAccumulator>,
     typename GemmEpilogueConfiguration::GmemTiledCopyO,
-    Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(ElementD) * AlignmentD * 8>,ElementD>,
+    Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(ElementD) * EffectiveAlignment * 8>,ElementD>,
     EpilogueDispatchPolicy
   >;
 };
